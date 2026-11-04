@@ -1,0 +1,45 @@
+# 中转站通道配置（迁移自 C:\Users\00\.dsh\settings.yaml）
+# key 不落本文件：key_env 引用环境变量名；网关运行时从环境变量或
+# C:\Users\00\.dsh\.credentials.yaml 解析真实 key。
+channels:
+  aaa:
+    display_name: aaa
+    base_url: https://api.hlyrouter.top/v1/
+    key_env: AAA_API_KEY
+    models:
+      - id: deepseek-v4.1-flash
+        context_size: 128000
+        max_tokens: 8192
+  dddddd:
+    display_name: dddddd
+    base_url: https://api.hlyrouter.top/v1/
+    key_env: DDDDDD_API_KEY
+    models:
+      - id: deepseek-ai/deepseek-v4.1-flash-1017
+        context_size: 128000
+        max_tokens: 8192
+      - id: u-deepseek-v4.1-flash-1017
+        context_size: 128000
+        max_tokens: 8192
+      - id: kimi-k3
+        context_size: 128000
+        max_tokens: 8192
+  ggg:
+    display_name: ggg
+    base_url: https://api.hlyrouter.top/v1
+    key_env: GGG_API_KEY
+    models:
+      - id: deepseek-v4.1-flash
+        context_size: 128000
+        max_tokens: 8192
+  mf:
+    display_name: mf
+    base_url: https://atmorouter.dev/v1
+    key_env: MF_API_KEY
+    models:
+      - id: ali/deepseek-v4.1-flash
+        context_size: 1000000
+        max_tokens: 393216
+      - id: cb/deepseek-v4.1-flash
+        context_size: 1000000
+        max_tokens: 393216

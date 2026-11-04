@@ -1,0 +1,16 @@
+#!/bin/sh
+# 提交前快检：只跑「wheel 与源码一致 + selfcheck 回归」，约 20~60 秒。
+# ★ 为什么只有快集：全量套件 240s，挂在每次提交上会让人绕过钩子；
+#   全量交给 tools/ci.py（或 --fast 之外的模式）在提交后跑。
+# ★ 模型链在钩子里显式跳过（ORCH_SELFCHECK_MODEL=0）：钩子不该等上游模型。
+set -e
+根=$(git rev-parse --show-toplevel)
+子="$根/多智能体编排/agentscope_orchestrator"
+# 只在这个子树被改时才跑（本仓父目录有大量无关文件）
+if git diff --cached --name-only | grep -q '^多智能体编排/agentscope_orchestrator/'; then
+  cd "$子"
+  PY=".venv/Scripts/python.exe"
+  [ -x "$PY" ] || PY=".venv/bin/python"
+  [ -x "$PY" ] || { echo "[pre-commit] 找不到 venv python，跳过快检（交付前请手动跑 tools/ci.py）"; exit 0; }
+  ORCH_SELFCHECK_MODEL=0 ORCH_STATE_DIR="$子/.orchestrator-state" "$PY" tools/ci.py --fast
+fi

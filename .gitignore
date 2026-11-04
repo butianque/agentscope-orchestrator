@@ -1,0 +1,118 @@
+# 运行期产物与临时目录 —— 不进仓
+# 理由：这些目录由测试/自检**在仓内 cwd 下**临时创建（`tempfile.mkdtemp(dir='.')`），
+# 每跑一次就多几个，混进 `git status` 会淹没真改动（交付前实测：115 条里 60+ 是这类残留）。
+
+# 虚拟环境
+.venv/
+_clean_venv_*/
+_clean_state_*/
+
+# 运行期状态根（ORCH_STATE_DIR 未显式指定时会落在工具根，即本目录）
+.orchestrator/
+.orchestrator-state/
+.data/
+cache/
+jobs/
+products/
+work/
+_smoke_state/
+tests/_run_all_state/
+
+# 测试临时目录（maturity 的 repack/budget/breaker/xlang 探针、socket/子进程探针）
+maturity_*/
+tmp[0-9a-z_]*/
+tmp_*/
+
+# 各测试自己的临时工作目录/状态根（0.12.6 补：跑一次就多几个，会把真改动淹掉）
+_probe*/
+# 判据门族夹具（tests/gate_family.py：差分/属性各一档）
+gfam_*/
+# 跨进程占槽夹具（tests/global_gate.py：6 个真进程各一个独立状态根）
+gg_*/
+# SQLite/迁移夹具（tests/g3_sqlite.py：旧库、孤儿件、续跑状态根）
+taixu_g3_*/
+# maturity 判据的临时状态根（显式 ORCH_STATE_DIR 时用）
+_mat_state/
+# 探针输出（临时抓的输出文件，不是交付物）
+_g3.out
+_mat*.out
+_probe_*.out
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 打包中间物（wheel 本体在 dist/ 里，属于交付物，**不**忽略）
+packaging/build/
+*.egg-info/
+
+# 自检/判据引擎在被测仓 cwd 下造的临时目录（`%TEMP%` 不可写时会回落到 cwd）
+orch-selfcheck-*/
+orch-judge-*/
+orch-live-*/
+# 测试曾经误建过的路径（留一条以防再犯）
+不存在的盘/
+# 状态根不可写时产品会回落到 cwd 下的默认状态根
+orch-state/
+# 判据用例的临时目录前缀（%TEMP% 不可用时会回落 cwd）
+selfcheck-test-*/
+selfcheck-badcwd-*/
+
+
+# CI 运行日志（receipts 下的临时件）
+receipts/ci-*-*.log
+
+# 基准/诊断自己造的临时目录（正常会被 rmtree；崩溃路径可能留下）
+bench-selftest-*/
+bench-a-*/
+bench-b-*/
+diag-*/
+
+# 知识库基准的临时 KB
+tests/_kbbench/
+
+# ★ 外挂知识库（kb_seed/）的索引：**只是缓存，不提交**。
+#   知识本体是人写的 `kb_seed/items/*.md`（那些**要**进 git，人可改、随时改）。
+#   索引按「源指纹」自动重建（见 project_kb._读索引），所以缺了不影响正确性，
+#   提交它只会让每次改知识都多出一份机器生成的 diff 噪声。
+#   ★ 2026-11-03 修正：原来写 `kb_seed/_index.json`，而**带斜杠的模式是锚定的**
+#     ⇒ 只匹配仓根那一处。种子搬进 `src/agentscope_orchestrator/kb_seed/` 之后
+#     这条就**失配**了，索引差点被提交进去（又一次"改了规则但没生效"）。
+#     用 `**/` 明确跨目录匹配，且顺带挡住任何位置的同名缓存。
+**/kb_seed/_index.json
+
+# A/B 跑手的**工作副本**（夹具的运行期产物，跑完即弃）。
+#   ★ 必须落在产品树内：deploy 解释器只有产品树可写（%TEMP% / E:\Temp 全 PermissionError）。
+#   ★ 不提交：它每次都由夹具重开，提交只会让 wheel 与源不一致（真吃过这个亏）。
+tests/fixtures_ab/_run/
+
+# memory8 判据的临时库
+tests/mem8-test-*/
+
+# 标定/自证用例在包根开的临时仓（u_<rand>/）
+au_*/
+
+# fixloop 基准夹具的状态根（bc_<rand>/：每实例一个仓副本 + 状态）
+# 理由同文件头：跑一次多几个，属运行期残留；基准结论在 receipts/bench-*.md
+bc_*/
+# 判据门围栏夹具（每跑一次一个）
+fence_*/
+# 检索桥开的临时外部项目 / 一次性实验项目与脚本输出
+sem-link-*/
+sem-dbg*-*/
+_semg1/
+_semprobe*/
+*.out
+# 判据在包根造的一次性临时目录（`%TEMP%` 不可用时 mkdtemp 回落到 cwd）
+# ★ 2026-11-04：实测这三条漏了（包根攒过 85 个）。新判据要新前缀就加在这里；
+#   但**别把这里当唯一防线** —— tests/selfcheck.py 的残留门用 git 兜住漏加的情况。
+bl_*/
+kbgp_*/
+eol_*/
+gpw_*/
+jenv_*/
+leanprobe_*/
+ls_lock_*/
+kb判据-*/
+_pV_*/

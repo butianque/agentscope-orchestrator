@@ -1,0 +1,7 @@
+{
+  "名": "t2_count_misparse",
+  "门命令": ["E:/基础设施/orch-deploy/.venv/Scripts/python.exe", "run_tests.py"],
+  "门": [],
+  "轮数": 2,
+  "备注": "单次约 0.05 s；run_tests.py 是仓内自带 runner，无第三方依赖，输出 pytest 式汇总行。"
+}

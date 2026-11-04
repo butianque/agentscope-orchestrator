@@ -1,0 +1,12 @@
+# 统一行尾：源码/脚本一律 LF 入库；Windows 专属脚本保持可执行语义
+* text=auto
+*.py    text eol=lf
+*.sh    text eol=lf
+*.ps1   text eol=crlf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.toml  text eol=lf
+*.whl   binary
+*.png   binary

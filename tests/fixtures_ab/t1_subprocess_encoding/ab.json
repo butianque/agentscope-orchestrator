@@ -1,0 +1,7 @@
+{
+  "名": "t1_subprocess_encoding",
+  "门命令": ["E:/基础设施/orch-deploy/.venv/Scripts/python.exe", "run_ci.py"],
+  "门": [],
+  "轮数": 2,
+  "备注": "单次约 0.1 s；无 sleep、无联网、无第三方依赖，门在仓根直接跑。"
+}

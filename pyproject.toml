@@ -1,0 +1,54 @@
+[project]
+name = "agentscope-orchestrator"
+version = "0.13.11"
+description = "通用工程开发多智能体编排器：自然语言目标 → 机器计划 → 真模型产内容 → 机器判据门裁决（判据不由模型评）"
+requires-python = ">=3.12"
+
+# ★★★★★ 运行期依赖只有三个（2026-10-29 交付形态）：
+#   原先硬依赖 `agentscope==2.0.9`（它会拉 numpy），在全新 venv 里实测装不上：
+#     ERROR: No matching distribution found for numpy (from agentscope)
+#   ⇒ 「一键部署」名不副实。编排器真正需要的只有"消息 + Chat 客户端"两样，
+#     已用 httpx 自带实现（`msgs.py`）替掉，框架降为可选后端。
+#   真验证：屏蔽 `agentscope` 后，11 个核心模块全部可导入。
+dependencies = [
+    "pyyaml",
+    "httpx",
+    # ★ 直接 import 的包必须直接声明（2026-10-13 修）。
+    #   `taixu_mcp.py` 里 `from mcp.server.fastmcp import FastMCP`，
+    #   但此前 mcp 只是 **agentscope 的传递依赖**（`mcp<2.0.0`）。
+    #   ⇒ agentscope 哪天不再拉它，MCP 服务器就**静默装不上**。
+    #   直接依赖直接声明，是打包正确性，不是冗余。
+    "mcp<2.0.0",
+]
+
+[project.optional-dependencies]
+# ★ 只有想用 agent 框架自带模型客户端时才需要（会拉 numpy 等重依赖）
+agentscope = ["agentscope==2.0.9"]
+
+[project.scripts]
+# ★ 第三方 `pip install` 后要知道敲什么命令（2026-10-13 补）。
+#   此前无 console_scripts ⇒ 装完只能靠读源码找入口。
+orch-goal = "agentscope_orchestrator.generic_goal:main"
+orch-run = "agentscope_orchestrator.unattended:main"
+# 装完先敲这个：一条命令告诉你能不能干活（自检 ≠ 全量回归）
+orch-check = "agentscope_orchestrator.selfcheck:main"
+orch-plan = "agentscope_orchestrator.auto_goal:main"
+orch-mcp = "agentscope_orchestrator.taixu_mcp:main"
+# ★ 登记缺口源（2026-10-14 补）：无人值守的**活源**。
+#   原活源（Lean 产物库未闭合声明）实测为空 ⇒ --watch 立刻退出 ⇒ 无人值守不成立。
+#   本入口扫工程源码里项目自己登记的缺口，是「无人值守」真正能跑起来的前提。
+orch-gaps = "agentscope_orchestrator.gap_source:_cli"
+# ★ 运行总账（2026-10-16 补）：无人值守跑一夜，第二天要能**一眼查到**
+#   「成没成、改了哪些文件、有没有回灌、隔离树在哪」。
+#   原状只有引擎内部几千行 jsonl 与控制台 ⇒ 无人值守的价值恰恰在跑完能查。
+orch-log = "agentscope_orchestrator.runlog:main"
+# ★ 隔离工作树（2026-10-16 补）：`orch-run` 默认已隔离；本入口用于
+#   查看/清理遗留的隔离树（`--list` / `--clean <标签>`）。
+orch-tree = "agentscope_orchestrator.workspace:main"
+orch-doctor = "agentscope_orchestrator.doctor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+[tool.setuptools.package-data]
+agentscope_orchestrator = ["*.json"]
+
