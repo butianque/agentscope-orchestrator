@@ -329,6 +329,9 @@ class 识别结果:
     排除: frozenset[str] = frozenset()
     冻结候选: list[dict] = field(default_factory=list)
     跳过冻结: list[str] = field(default_factory=list)
+    # ★ 2026-11-09：`memory:` 段的候选（**项目资产范围**）。此前自举不推这一段，
+    #   于是"换项目零配置"只到判据门为止 —— 常驻索引里仍然没有项目本体。
+    记忆候选: list[dict] = field(default_factory=list)
     备注: list[str] = field(default_factory=list)
 
     @property
@@ -444,6 +447,9 @@ def 识别(root: Path) -> 识别结果:
         r.备注.append("**未找到任何验收判据区域** ⇒ 档案不写 `frozen`。"
                       "这意味着「判据不得由被判方改动」这条保证**本工程没有**"
                       "（R23 的洞仍然敞着），请人工确认测试放在哪里。")
+    # ★ 2026-11-09：推 `memory:` 候选（项目资产范围）—— 与门/冻结区同级的一部分，
+    #   同样"只做能机器确定的部分"：按目录结构与后缀推，不猜语义。
+    r.记忆候选 = _扫记忆候选(r)
     return r
 
 
@@ -486,6 +492,78 @@ def 探跑(r: 识别结果, timeout: int) -> dict:
     if r.验收:
         报["验收"] = {"cmd": list(r.验收), **探命令(r.验收, r.root, timeout)}
     return 报
+
+
+#: 递归声明为「文档/回执」的目录 —— **只在真存在时**才写进档案（表是数据，通路读表）
+文档目录 = ("docs", "doc", "receipts", ".audit_trail", "spec", "specs", "wiki", "交接报告")
+
+
+def _后缀到kind(图样: str) -> str:
+    """`**/*.rs` → `rs`；`pkg/*.py` → `py`；取不到后缀 ⇒ `misc`。"""
+    尾 = 图样.split("/")[-1].lstrip("*")
+    if 尾.startswith("."):
+        尾 = 尾[1:]
+    return 尾 or "misc"
+
+
+def _去包含(根们) -> list[str]:
+    """去掉**被别的根包含**的根（谱系表里 python 是 `("src", ".")`
+
+    `src` ⊂ `.` ⇒ 同一批文件会被两个条目各数一遍，而「命中数自己解释不了自己」
+    正是本项目对账时抓出的老病（2026-11-04：1888 对不上 1784）。
+    ★ 这是**纯集合运算**（路径包含），不猜语义：`.gitignore` 那套照旧各写各的。
+    """
+    出: list[str] = []
+    for a in 根们:
+        na = a.replace("\\", "/").strip("./") or "."
+        for b in 根们:
+            if b == a:
+                continue
+            nb = b.replace("\\", "/").strip("./") or "."
+            if na != nb and (nb == "." or na.startswith(nb + "/")):
+                break
+        else:
+            出.append(a)
+    return 出
+
+
+def _扫记忆候选(r: 识别结果) -> list[dict]:
+    """自动推 `memory:` 段：**项目资产范围**（`auto_scan` 按这里扫）。
+
+    为什么必须有这一段（R230 真流程取证）：`memory:` 不声明时，`auto_scan`
+    的常驻索引里**只剩产物库一类**，项目本体的源码/文档一份都不进 ——
+    「它本来就知道」是缺的。此前自举不推这一段 ⇒ "换项目零配置"只到门为止。
+
+    ★ 三条口径，都是本项目自己踩出来的（照抄，不重新发明）：
+      1. **每个 (kind, root) 单独一条**：合成一条时 `auto_scan.逐条` 只报合并数，
+         「某个根到底进了多少」从声明里拆不出来（2026-11-04 对账抓出）。
+      2. **仓库根只扫一层**（`*.md` 不递归）：从根 `**/*.md` 会走进构建产物
+         （本项目实测 20 万文件）；深目录各列一条、各自声明递归。
+      3. **只写仓库里真存在的目录**：不存在的根写进去 ⇒ `scan_declared`
+         每轮都报「声明了却没扫到」，噪声会淹掉真缺口。
+
+    ★ 诚实边界：这里**只按目录结构与后缀推**（数据），不猜语义 ——
+      哪些目录"算知识资产"仍是项目自己的事，推不到的类型档案里留 `# ★ 待人工`。
+    """
+    出: list[dict] = []
+    排除 = sorted(r.排除)
+    for 根 in _去包含(list(r.源码根 or ())):
+        for 图样 in (r.后缀 or ()):
+            条: dict = {"kind": _后缀到kind(图样), "roots": [根], "globs": [图样]}
+            if 排除:
+                条["skip"] = 排除
+            出.append(条)
+    根层: dict = {"kind": "doc", "roots": ["."], "globs": ["*.md"]}
+    if 排除:
+        根层["skip"] = 排除
+    出.append(根层)
+    for 名 in 文档目录:
+        if (r.root / 名).is_dir():
+            条 = {"kind": "doc", "roots": [名], "globs": ["**/*.md"]}
+            if 排除:
+                条["skip"] = 排除
+            出.append(条)
+    return 出
 
 
 def _可入档(探: dict | None) -> bool:
@@ -631,6 +709,30 @@ def 生成档案(r: 识别结果, 探: dict, timeout: int, *, 已探跑: bool = 
         A("# ★ 待人工：未确定源码根。")
         A("# source:")
         A('#   roots: ["src"]')
+    A("")
+
+    A("# ── 记忆索引范围：**项目资产**（`auto_scan` 按这里扫）──────────────")
+    A("# ★ R230 真流程取证：**不声明**这一段 ⇒ 常驻索引里只有产物库一类，")
+    A("#   项目本体的源码/文档**一份都不进** —— 「它本来就知道」是缺的。")
+    A("# ★ 口径：每个 (kind, root) **单独一条**（合成一条就拆不出「某个根进了多少」）；")
+    A("#   仓库根只扫一层（`*.md` 不递归），深目录各列一条、各自声明递归。")
+    if r.记忆候选:
+        A("memory:")
+        for m in r.记忆候选:
+            A("  - kind: " + _yaml_str(m["kind"]))
+            A("    roots: [" + ", ".join(_yaml_str(x) for x in m["roots"]) + "]")
+            A("    globs: [" + ", ".join(_yaml_str(x) for x in m["globs"]) + "]")
+            if m.get("skip"):
+                A("    skip: [" + ", ".join(_yaml_str(x) for x in m["skip"]) + "]")
+        A("  # ★ 待人工：以上是**按目录结构推的**资产范围。若本项目还有别的资产类型")
+        A("  #   （证明库 / 规格 / 回执子目录 / 别的语言），在此各追加一条；")
+        A("  #   推不到的它**不猜**（推不准的资产范围比不写更坏：会让人以为声明齐了）。")
+        A("  #     - kind: <类别>")
+        A("  #       roots: [<相对仓库根的目录>]")
+        A('  #       globs: ["**/*.<后缀>"]')
+    else:
+        A("# ★ 待人工：未推出任何资产范围（没有确定源码根）⇒ 请人工写 memory: 段，")
+        A("#   否则 `auto_scan` 会明确告警、常驻索引里没有项目本体。")
     A("")
 
     A("# ── 主树锚点：跑工程级门时锚定哪个单元（**必填**，自动生成填最可能的一个）──")
@@ -812,6 +914,12 @@ def main(argv=None) -> int:
         for x in r.跳过冻结:
             print("  （跳过）" + x)
         print(f"建议锚点：{_猜锚点(r) or '（无）'}")
+        print(f"记忆候选（{len(r.记忆候选)}）—— 项目资产范围（`auto_scan` 按这里扫）：")
+        for m in r.记忆候选:
+            print("  · " + str(m.get("kind")) + "  roots=" + ",".join(m["roots"])
+                  + "  globs=" + ",".join(m["globs"]))
+        if not r.记忆候选:
+            print("  （无 —— 没有确定源码根；`memory:` 段要人工写）")
         for x in r.备注:
             print("备注：" + x)
         return 0 if r.可自举 else 1
@@ -829,7 +937,7 @@ def _selftest() -> int:
     import tempfile
 
     fails: list[str] = []
-    N = 33
+    N = 39
 
     def 造(文件: dict[str, str]) -> Path:
         d = Path(tempfile.mkdtemp(prefix="boot_"))
@@ -882,6 +990,11 @@ def _selftest() -> int:
             fails.append(f"③ pytest 命令不对：{r.验收}")
         if not any(f.get("whole") and "test_x.py" in f["path"] for f in r.冻结候选):
             fails.append(f"③ 独立测试文件未整文件冻结：{r.冻结候选}")
+        # ★ 2026-11-09：谱系表 python 的源码根是 `("src", ".")` —— `src` ⊂ `.`，
+        #   两个条目会把同一批文件各数一遍 ⇒ 记忆候选必须**去包含**后再声明。
+        py根 = [m["roots"] for m in r.记忆候选 if m.get("kind") == "py"]
+        if py根 and py根 != [["."]]:
+            fails.append(f"③ 记忆候选的源码根未去包含（应为 [['.']]）：{py根}")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -985,6 +1098,20 @@ def _selftest() -> int:
                         fails.append(f"⑧ 门无命令：{g}")
                 if not p.frozen:
                     fails.append("⑧ 生成的档案缺 frozen（`#[cfg(test)]` 明明存在）")
+                # ★ 2026-11-09：记忆索引范围必须随档案一起生成（否则"零配置"只到门）
+                if not p.memory:
+                    fails.append("⑧ 生成的档案缺 `memory:`（R230：不声明 ⇒ 常驻索引里"
+                                 "只剩产物库，项目本体一份都不进）")
+                else:
+                    种 = {str(m.get("kind")) for m in p.memory}
+                    if "rs" not in 种:
+                        fails.append(f"⑧ `memory:` 里没有源码类别 rs：{sorted(种)}")
+                    if "doc" not in 种:
+                        fails.append(f"⑧ `memory:` 里没有文档类别 doc：{sorted(种)}")
+                    if not any(m.get("roots") == ["src"]
+                               and "**/*.rs" in (m.get("globs") or [])
+                               for m in p.memory):
+                        fails.append(f"⑧ `memory:` 未按 (kind, root) 声明源码：{p.memory}")
             finally:
                 prof_mod.set_profile(old)
     finally:
@@ -1057,6 +1184,20 @@ def _selftest() -> int:
         if "skip:" not in 文 or ".orchestrator" not in 文:
             fails.append("⑪ 排除集**未写进档案**的 `source.skip` ⇒ 索引侧仍会把"
                          "备份目录当源码")
+        # ★ 2026-11-09：`memory:` 条目也必须带同一份 `skip` —— 否则索引侧
+        #   （`auto_scan`）仍会把工具自己的备份目录当**项目资产**收进去。
+        old = prof_mod.get_profile()
+        try:
+            p = prof_mod.load_profile(rec["档案"])
+            漏 = [m for m in p.memory
+                  if m.get("skip") and ".orchestrator" not in m["skip"]]
+            if not any(".orchestrator" in (m.get("skip") or []) for m in p.memory):
+                fails.append("⑪ `memory:` 条目未带 `skip` ⇒ auto_scan 会把"
+                             "工具自己的备份目录当项目资产")
+            elif 漏:
+                fails.append(f"⑪ 有 `memory:` 条目的 `skip` 不含 .orchestrator：{漏}")
+        finally:
+            prof_mod.set_profile(old)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

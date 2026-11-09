@@ -44,6 +44,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+# ★ 2026-11-09：本文件 docstring 的用法里有**脚本式**调用
+#   （`python src/agentscope_orchestrator/generic_goal.py --selftest`），
+#   但脚本模式下 `__package__` 是空 ⇒ 下面所有相对导入（`.msgs` 等）全部
+#   `ImportError: attempted relative import with no known parent package`。
+#   后果不是"少个入口"：`checks/自举齿探针.py` 的反自证基线（未改时应绿）
+#   因此**一直红**，而那条红被当成"探针自身有问题"放过了 ——
+#   于是这个探针**整年不带齿**（红错地方就没人再追）。
+#   修法只在**脚本模式**下补包名与搜索路径：不碰任何语义、不影响 `-m` 调用。
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+    __package__ = "agentscope_orchestrator"
+
 from .msgs import UserMsg
 from agentscope_orchestrator import chief as chief_mod
 from agentscope_orchestrator import 只读探针 as probe_mod
