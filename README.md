@@ -1,5 +1,8 @@
 # 通用工程开发多智能体编排器
 
+> **当前版本：0.13.21（2026-11-20）** —— **47 条验收判据全绿**；离线装实测 40.7 s；`orch-check` 自检 8/8；`tools/齿咬验证_生产阻断.py` 变异咬合 6/6。
+> 判据清单与逐条读数见 [交付章程.md](交付章程.md)，目标清单与「已达成/拿不到」的分界见 [目标与进度.md](目标与进度.md)，自验用 `python tools/交付验收.py`。
+
 **给它一句自然语言目标，它在你的真实工程里改代码、跑构建、跑测试，直到机器判据全绿。**
 
 ```bash
@@ -67,13 +70,27 @@ orch-goal --goal "实现 src/queue.rs 里的环形队列：推入/取出/长度�
 
 ---
 
-## 安装
+## 安装（**不联网也能装**）
 
 ```bash
+python -m venv .venv
+
+# ① 离线装（推荐）：从仓里的发布包装，依赖轮子全在里面，全程 --no-index
+.venv/Scripts/python -m pip install --no-index --find-links dist/orchestrator-0.13.21/wheels `
+    dist/orchestrator-0.13.21/wheels/agentscope_orchestrator-0.13.21-py3-none-any.whl
+
+# ② 或从源码装（开发用）
 pip install -e .
 ```
 
-需要 Python ≥ 3.12。装完有五个命令：`orch-goal` / `orch-run` / `orch-plan` / `orch-mcp` / `orch-gaps`。
+Windows 也可直接跑 `dist/orchestrator-0.13.21/install.ps1`（Linux/macOS 用 `install.sh`），
+装完自动跑 `orch-doctor`，看到 `✓ 可以开工` 即可。
+
+需要 Python ≥ 3.12。装完有 **11 个命令**：
+`orch-doctor` `orch-check` `orch-init` `orch-kb` `orch-goal` `orch-plan`
+`orch-run` `orch-gaps` `orch-log` `orch-tree` `orch-mcp`。
+
+**自验**：`python tools/交付验收.py`（43 条判据；退出码 0 = 全部达成）。
 
 ### 接上模型通道
 
@@ -1584,3 +1601,8 @@ $ python -m agentscope_orchestrator.entry --project work/rust工程样例 \
   **argparse 缩写把 `--n` 悄悄吃掉**、延迟导入、`_emit` 目录缺失崩整趟、
   以及**「无自检」掩盖「读不了」**（⇒ 新增全称语法门）。
 
+---
+
+## 许可证
+
+MIT License —— 见 [LICENSE](LICENSE)。
