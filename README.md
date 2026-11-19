@@ -1601,3 +1601,8 @@ $ python -m agentscope_orchestrator.entry --project work/rust工程样例 \
   **argparse 缩写把 `--n` 悄悄吃掉**、延迟导入、`_emit` 目录缺失崩整趟、
   以及**「无自检」掩盖「读不了」**（⇒ 新增全称语法门）。
 
+---
+
+## 许可证
+
+MIT License —— 见 [LICENSE](LICENSE)。
