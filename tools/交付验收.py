@@ -176,10 +176,10 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     #   每次全量跑完重跑一次即可看是否退化。它**明确不答**"比外部强"（输出里写着边界）。
     dict(id="52", 名="仓内生产力（判据数/绿率/墙钟/区分力/交互点，机判趋势）",
          argv=["python", "tools/仓内生产力.py"], expect="zero",
-         must=["判定=OK", "人工交互点 = 0", "无外部效度"], max_s=300),
-    dict(id="51", 名="门区分力（14 条机械变异 × 9 个门具 × 4 类产物）",
+         must=["判定=OK", "人工交互点 = 0", "无外部效度", "趋势"], max_s=300),
+    dict(id="51", 名="门区分力（17 条机械变异 × 9 个门具 × 4 类产物）",
          argv=["python", "tools/门区分力.py"], expect="zero",
-         must=["判定=OK", "区分力 = 抓住 14/14", "门具 9 个"], max_s=1800),
+         must=["判定=OK", "区分力 = 抓住 17/17", "门具 9 个"], max_s=1800),
     dict(id="50", 名="公仓可编译可导入（clone → compileall → 逐模块 import）",
          argv=["python", "tools/公仓可编译.py"], expect="zero",
          must=["判定=OK", "模块数", "导入失败 = 0"], max_s=900),

@@ -96,6 +96,22 @@ def main() -> int:
     明细 = sorted([x for x in (读.get("明细") or []) if x.get("用时")],
                   key=lambda x: float(x["用时"]), reverse=True)[:3]
 
+    # ★ 2026-11-19 #51 抓到洞（第二批）：把 交付验收_最近.json 的「条数」改成 999，指标仍判 OK ——
+    #   它连"条数 == PASS+FAIL+未验"都不查。读数坏了不能当趋势基线。
+    环0: list[str] = []
+    if 条数 <= 0:
+        环0.append("条数 = 0（没有一趟有效读数）")
+    if 过 + 败 + 未 != 条数:
+        环0.append(f"PASS+FAIL+未验 = {过 + 败 + 未} != 条数 {条数}")
+    if len(读.get("明细") or []) > 条数:
+        环0.append(f"明细 {len(读.get('明细') or [])} 条 > 条数 {条数}")
+    if 墙钟 <= 0:
+        环0.append(f"总墙钟 = {墙钟}（应 > 0）")
+    if 环0:
+        print("   ✗ 交付验收读数自相矛盾：" + "；".join(环0))
+        print("   判定=不达标（读数坏了不能当趋势基线）")
+        return 1
+
     区 = {}
     if 区分.is_file():
         区 = json.loads(区分.read_text(encoding="utf-8"))
@@ -146,12 +162,55 @@ def main() -> int:
         print("   判定=未验（缺门区分力读数）")
         return 3
     输出.parent.mkdir(parents=True, exist_ok=True)
-    输出.write_text(json.dumps(dict(
+    本次 = dict(
         时间=读.get("时间"), 判据条数=条数, PASS=过, FAIL=败, 未验=未, 总墙钟秒=墙钟,
         平均每条秒=round(平均, 2), 门区分力=f"{区.get('抓住')}/{区.get('注入成功')}",
         门具数=len(区.get("门具") or []), 人工交互点=交互数, 真事故标记=len(事故),
         边界="无外部效度：不构成通用生产力结论（N3 仍 UNVERIFIABLE）；只作交付趋势指标",
-    ), ensure_ascii=False, indent=2), encoding="utf-8")
+    )
+
+    # ── ⑥ 趋势：与**上一趟**比，退化就判红 ──
+    #   为什么要趋势而不是绝对值：绝对值只能说明"现在多少"，说明不了"有没有在退化"。
+    #   判据工具体本身也会腐坏（本轮就腐坏了 5 处）⇒ 退化必须机器看得见。
+    史 = 包根 / "work" / "仓内生产力_历史.jsonl"
+    上 = None
+    if 史.is_file():
+        for 行 in 史.read_text(encoding="utf-8").splitlines():
+            if 行.strip():
+                try:
+                    上 = json.loads(行)
+                except Exception:              # noqa: BLE001
+                    continue
+    退化: list[str] = []
+    if 上:
+        比 = [("判据条数", -1), ("PASS", -1), ("FAIL", 1), ("未验", 1),
+              ("人工交互点", 1), ("门具数", -1)]
+        for 键, 方向 in 比:
+            try:
+                旧 = int(上.get(键) or 0); 新 = int(本次.get(键) or 0)
+            except (TypeError, ValueError):
+                continue
+            if (方向 > 0 and 新 > 旧) or (方向 < 0 and 新 < 旧):
+                退化.append(f"{键} {旧}→{新}")
+        try:
+            旧抓, 旧注 = (上.get("门区分力") or "0/0").split("/")
+            新抓, 新注 = (本次.get("门区分力") or "0/0").split("/")
+            if int(新注) > 0 and int(旧注) > 0 and int(新抓) / int(新注) < int(旧抓) / int(旧注):
+                退化.append(f"门区分力 {上.get('门区分力')}→{本次.get('门区分力')}")
+        except (ValueError, ZeroDivisionError):
+            pass
+        print(f"   ⑥ 趋势：与上一趟（{上.get('时间')}）比 ⇒ "
+              f"{'**退化** ' + '；'.join(退化) if 退化 else '无退化'}")
+    else:
+        print("   ⑥ 趋势：首趟（本次记为基线，下一次起比退化）")
+
+    # ★ 退化时**不写历史**：否则坏读数会成为下一趟的基线，退化被自己吞掉。
+    if 退化:
+        print("   判定=退化（趋势指标倒退，先查是不是判据/工具体腐坏）")
+        return 1
+    输出.write_text(json.dumps(本次, ensure_ascii=False, indent=2), encoding="utf-8")
+    with 史.open("a", encoding="utf-8") as _f:
+        _f.write(json.dumps(本次, ensure_ascii=False) + "\n")
     print("   判定=OK")
     print("   边界=无外部效度：以上是**仓内趋势指标**，不构成「比人类/外部智能体更强」的结论"
           "（N3 仍 UNVERIFIABLE）")
