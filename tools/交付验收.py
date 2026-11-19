@@ -170,9 +170,16 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     #   workspace.py）；现扩到 **6 条 × 4 个门具 × 3 类产物**（源码 / 打包件 / 公仓提交）。
     #   ★ 它第一次跑就抓到一个**真洞**：变异「去掉 --clean 防误删护栏」此前**存活**
     #     （④ 只测占用/释放，没测"任意路径"）⇒ 探针补 ⑤ 后才 6/6。
-    dict(id="51", 名="门区分力（6 条机械变异 × 4 个门具 × 3 类产物）",
+    # ★ #52 仓内生产力（2026-11-19 加）：N3「通用生产力」的**可机判替代**。
+    #   N3 要分母（人类基线/外部基准），本机没有 ⇒ 永远 UNVERIFIABLE。但「不可判」≠「不记账」：
+    #   把交付机器的**趋势指标**机判化（判据数/绿率/墙钟/区分力/人工交互点/台账真事故数），
+    #   每次全量跑完重跑一次即可看是否退化。它**明确不答**"比外部强"（输出里写着边界）。
+    dict(id="52", 名="仓内生产力（判据数/绿率/墙钟/区分力/交互点，机判趋势）",
+         argv=["python", "tools/仓内生产力.py"], expect="zero",
+         must=["判定=OK", "人工交互点 = 0", "无外部效度"], max_s=300),
+    dict(id="51", 名="门区分力（10 条机械变异 × 6 个门具 × 3 类产物）",
          argv=["python", "tools/门区分力.py"], expect="zero",
-         must=["判定=OK", "区分力 = 抓住 6/6", "门具 4 个"], max_s=1800),
+         must=["判定=OK", "区分力 = 抓住 10/10", "门具 6 个"], max_s=1800),
     dict(id="50", 名="公仓可编译可导入（clone → compileall → 逐模块 import）",
          argv=["python", "tools/公仓可编译.py"], expect="zero",
          must=["判定=OK", "模块数", "导入失败 = 0"], max_s=900),
@@ -445,6 +452,25 @@ def main() -> int:
     败 = sum(1 for r in 结果 if r[2] == "FAIL")
     未 = sum(1 for r in 结果 if r[2] == "未验")
     print(f"══ 结果：PASS {过} · FAIL {败} · 未验 {未}（共 {len(结果)} 条；另有 P3 干净装由 verifier 独立复现）")
+
+    # ── 机器可读的「最近一趟」读数（供 #52 仓内生产力指标读；**只写全量跑**）──
+    #   为什么不写 --只 的跑：那会把"2 条用例"当成一次交付读数，指标立刻失真（口径 375）。
+    try:
+        if not _只:
+            import json as _json
+            import time as _time
+            件 = 包根 / "work" / "交付验收_最近.json"
+            件.parent.mkdir(parents=True, exist_ok=True)
+            件.write_text(_json.dumps(dict(
+                时间=_time.strftime("%Y-%m-%d %H:%M:%S"),
+                条数=len(结果), PASS=过, FAIL=败, 未验=未,
+                总墙钟秒=round(sum(float(r[4] or 0) for r in 结果), 1),
+                明细=[dict(id=r[0], 名=r[1], 态=r[2], 用时=r[4]) for r in 结果],
+            ), ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"   · 读数已存 work/交付验收_最近.json（{len(结果)} 条 · "
+                  f"墙钟 {sum(float(r[4] or 0) for r in 结果):.0f}s，供 #52 读）")
+    except Exception as _e:                    # noqa: BLE001
+        print(f"   ⚠ 写最近读数失败（不影响判定）：{_e}")
     if 败:
         print("   ⇒ **未达成交付条件**（见下面 FAIL 行）")
         for r in 结果:

@@ -143,6 +143,26 @@ def main() -> int:
     if 环:
         坏.append(f"发布物自相矛盾：{环[:4]}")
 
+    # ── 判据 6：**仓库里的交付包**自洽（dist/orchestrator-<版本>）──
+    #   为什么补（2026-11-19 #51 门区分力抓到的洞）：此前只查**部署根**的 VERSION.txt，
+    #   仓库 dist/ 里那份 VERSION.txt 被改成别版本**没有任何门看**（部署根不在本机时更甚）。
+    仓包 = _包根 / "dist" / f"orchestrator-{版本}"
+    包坏: list[str] = []
+    if not 仓包.is_dir():
+        包坏.append(f"仓库交付包不存在（dist/{仓包.name}）—— 版本 {版本} 没打包")
+    else:
+        包版 = 仓包 / "VERSION.txt"
+        if not 包版.is_file():
+            包坏.append("dist 里缺 VERSION.txt")
+        elif 包版.read_text(encoding="utf-8").strip() != 版本:
+            包坏.append(f"dist VERSION.txt={包版.read_text(encoding='utf-8').strip()!r} != 仓库 {版本!r}")
+        包轮 = sorted((仓包 / "wheels").glob(f"agentscope_orchestrator-{版本}-*.whl"))
+        if not 包轮:
+            包坏.append(f"dist wheels/ 里没有 {版本} 主轮子")
+    print(f"仓库交付包：{仓包.name} · {'自洽' if not 包坏 else '不自洽 ' + str(包坏[:3])}")
+    if 包坏:
+        坏.append("仓库交付包不自洽：" + "；".join(包坏))
+
     if 坏:
         for x in 坏:
             print(f"✗ {x}")

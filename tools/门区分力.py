@@ -83,6 +83,30 @@ _任一源 = 包根 / "src" / "agentscope_orchestrator" / "_winutf8.py"
          旧=None, 新=None,
          门=[sys.executable, "-B", str(包根 / "tools" / "公仓可编译.py")],
          门名="公仓可编译"),
+    # ── 2026-11-19 第二批：从「4 门具」扩到「8 门具」，覆盖 #33/#46/#48/#49 ──
+    dict(名="src 多出一个 .py（装入目录没有）⇒ 已装出现「缺」",
+         靶=None, 动作="新增文件",
+         路径=包根 / "src" / "agentscope_orchestrator" / "_门区新增.py",
+         内容="X = 1\n",
+         旧=None, 新=None,
+         门=[sys.executable, "-B", str(包根 / "tools" / "已装一致性.py")],
+         门名="已装一致性"),
+    dict(名="发货包里缺主轮子 ⇒ 离线装装不上",
+         靶=None, 动作="移走文件",
+         路径=包根 / "dist" / "orchestrator-0.13.20" / "wheels" / "agentscope_orchestrator-0.13.20-py3-none-any.whl",
+         旧=None, 新=None,
+         门=[sys.executable, "-B", str(包根 / "tools" / "离线装可用.py")],
+         门名="离线装可用"),
+    dict(名="代码行里出现项目名词（太虚元道_泄漏 = 1）⇒ 阶段分离棘轮升了",
+         靶=_任一源, 动作="追加", 追加="\n太虚元道_泄漏 = 1\n",
+         旧=None, 新=None,
+         门=[sys.executable, "-B", str(包根 / "tools" / "阶段分离棘轮.py")],
+         门名="阶段分离棘轮"),
+    dict(名="dist VERSION.txt 被改 ⇒ 部署三方不一致",
+         靶=包根 / "dist" / "orchestrator-0.13.20" / "VERSION.txt", 动作="替换",
+         旧="0.13.20", 新="0.13.21",
+         门=[sys.executable, "-B", str(包根 / "tools" / "部署一致性.py")],
+         门名="部署一致性"),
 ]
 
 
@@ -114,9 +138,15 @@ def main() -> int:
     门基线: dict[str, bool] = {}
     原件: dict[pathlib.Path, bytes] = {}
     原哈希: dict[pathlib.Path, str] = {}
-    for p in (_工作区, _任一源):
+    for p in (_工作区, _任一源, 包根 / "dist" / "orchestrator-0.13.20" / "VERSION.txt"):
         原件[p] = p.read_bytes()
         原哈希[p] = hashlib.sha256(原件[p]).hexdigest()
+    # 新增/移走类靶的"原位字节"（存在才记）
+    for t in 靶们:
+        if t["动作"] in ("新增文件", "移走文件"):
+            p: pathlib.Path = t["路径"]
+            原件[p] = p.read_bytes() if p.exists() else b""
+            原哈希[p] = hashlib.sha256(原件[p]).hexdigest()
 
     try:
         # ① 基线：每条门在正确产物上必须先绿，否则量的是"门本来就不行"
@@ -146,33 +176,66 @@ def main() -> int:
                 结果.append(dict(序=i, 名=t["名"], 门=t["门名"], 态=r))
                 if r == "抓住":
                     抓 += 1
+                    print(f"      ✓ {i}. {t['名']}：抓住（门「{t['门名']}」变红）")
                 elif r == "存活":
                     存 += 1
+                    print(f"      ✗ {i}. {t['名']}：**存活**（门「{t['门名']}」还绿 ⇒ 门有洞）")
                 else:
                     无 += 1
+                    print(f"      ○ {i}. {t['名']}：**无从注入**（{r}）")
                 continue
 
             靶: pathlib.Path = t["靶"]
-            文 = 原件[靶].decode("utf-8")
             动作 = t["动作"]
-            if 动作 == "替换":
-                if t["旧"] not in 文:
+            if 动作 in ("新增文件", "移走文件"):
+                路径: pathlib.Path = t["路径"]
+                原 = 原件[路径]
+                if 动作 == "新增文件" and 原:
                     无 += 1
-                    print(f"      ○ {i}. {t['名']}：**无从注入**（原文没这段）")
+                    print(f"      ○ {i}. {t['名']}：**无从注入**（文件已存在）")
                     结果.append(dict(序=i, 名=t["名"], 门=t["门名"], 态="无从注入"))
                     continue
-                新文 = 文.replace(t["旧"], t["新"], 1)
+                if 动作 == "移走文件" and not 原:
+                    无 += 1
+                    print(f"      ○ {i}. {t['名']}：**无从注入**（文件本来就没有）")
+                    结果.append(dict(序=i, 名=t["名"], 门=t["门名"], 态="无从注入"))
+                    continue
+                try:
+                    if 动作 == "新增文件":
+                        路径.write_bytes(t["内容"].encode("utf-8"))
+                    else:
+                        路径.unlink()
+                    绿, 尾 = _跑门(t["门"], env={"ORCH_PUB": str(公仓)} if t["门名"] == "公仓可编译" else None)
+                finally:
+                    if 动作 == "新增文件":
+                        if 路径.exists():
+                            路径.unlink()
+                    else:
+                        路径.write_bytes(原)          # ★ 原字节写回
+                复核 = hashlib.sha256(路径.read_bytes() if 路径.exists() else b"").hexdigest()
+                if 复核 != 原哈希[路径]:
+                    print(f"      ✗✗ 产物没能还原！{路径.name} 必须人工介入")
+                    return 4
             else:
-                新文 = 文 + t["追加"]
-            try:
-                靶.write_bytes(新文.encode("utf-8"))
-                绿, 尾 = _跑门(t["门"], env={"ORCH_PUB": str(公仓)} if t["门名"] == "公仓可编译" else None)
-            finally:
-                靶.write_bytes(原件[靶])          # ★ 无论成败立刻还原
-            复核 = hashlib.sha256(靶.read_bytes()).hexdigest()
-            if 复核 != 原哈希[靶]:
-                print(f"      ✗✗ 产物没能还原！{靶.name} 必须人工介入")
-                return 4
+                文 = 原件[靶].decode("utf-8")
+                if 动作 == "替换":
+                    if t["旧"] not in 文:
+                        无 += 1
+                        print(f"      ○ {i}. {t['名']}：**无从注入**（原文没这段）")
+                        结果.append(dict(序=i, 名=t["名"], 门=t["门名"], 态="无从注入"))
+                        continue
+                    新文 = 文.replace(t["旧"], t["新"], 1)
+                else:
+                    新文 = 文 + t["追加"]
+                try:
+                    靶.write_bytes(新文.encode("utf-8"))
+                    绿, 尾 = _跑门(t["门"], env={"ORCH_PUB": str(公仓)} if t["门名"] == "公仓可编译" else None)
+                finally:
+                    靶.write_bytes(原件[靶])          # ★ 无论成败立刻还原
+                复核 = hashlib.sha256(靶.read_bytes()).hexdigest()
+                if 复核 != 原哈希[靶]:
+                    print(f"      ✗✗ 产物没能还原！{靶.name} 必须人工介入")
+                    return 4
             if 绿:
                 存 += 1
                 态 = "存活"

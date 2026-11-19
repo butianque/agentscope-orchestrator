@@ -32,21 +32,36 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 包根 = Path(__file__).resolve().parent.parent
 
 
-def _最新轮(包根: Path) -> tuple[Path | None, Path | None]:
-    包们 = sorted((包根 / "dist").glob("orchestrator-*"),
-                 key=lambda p: [int(x) if x.isdigit() else 0 for x in p.name.split("-")[-1].split(".")])
-    for 包 in reversed(包们):
-        轮们 = sorted((包 / "wheels").glob("agentscope_orchestrator-*.whl"))
-        if 轮们:
-            return 包, 轮们[-1]
-    return None, None
+def _版本(包根: Path) -> str:
+    import tomllib
+    with (包根 / "pyproject.toml").open("rb") as f:
+        return str(tomllib.load(f)["project"]["version"])
+
+
+def _本轮包(包根: Path) -> tuple[Path | None, Path | None]:
+    """返回 (交付包目录, 主轮子)。
+
+    ★ 为什么按**仓库当前版本**选（2026-11-19 #51 抓到真洞）：原来从最新的 dist 目录往回找，
+      第一个有主轮子的就算 ⇒ 把 0.13.20 的主轮子删掉后，它会**回落到 0.13.19 照样装成功**，
+      门仍然绿 —— 那测的是"某个旧包能装"，不是"**要发的这个包**能装"。这正是假绿的形状。
+    """
+    期 = _版本(包根)
+    包 = 包根 / "dist" / f"orchestrator-{期}"
+    if not 包.is_dir():
+        return None, None
+    轮们 = sorted((包 / "wheels").glob(f"agentscope_orchestrator-{期}-*.whl"))
+    return 包, (轮们[-1] if 轮们 else None)
 
 
 def main() -> int:
-    包, 轮 = _最新轮(包根)
+    包, 轮 = _本轮包(包根)
     if not 轮:
-        print("   ③ 未验：dist/ 里没有交付包（先跑 tools/make_dist.py）")
-        return 3
+        if 包 is None:
+            print(f"   ③ 未验：dist/ 里没有与仓库版本一致的交付包（先跑 tools/make_dist.py）")
+            return 3
+        print(f"   ③ 回归：交付包 `{包.name}` 在，但 wheels/ 里**没有主轮子**（发货包自相矛盾）")
+        print("判定=不达标")
+        return 1
     轮们 = sorted((包 / "wheels").glob("*.whl"))
     依赖数 = len([w for w in 轮们 if not w.name.startswith("agentscope_orchestrator-")])
     print(f"   交付包 = {包.name} · wheel = {轮.name} · wheels/ 共 {len(轮们)} 个（依赖 {依赖数}）")
