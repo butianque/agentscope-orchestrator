@@ -4879,6 +4879,116 @@ def _冻结区未取到(specs) -> list[dict]:
     return out
 
 
+# ════════════════════════════════════════════════════════════════
+# R539：交付前**落地** —— 「保留在工作树」≠「主树真被改了」
+# ════════════════════════════════════════════════════════════════
+def _该走哪种编辑(rel: str, 原文: str, 退过: bool,
+                  cap: int | None = None) -> str:
+    """本文件这一轮该**整份重写** / **补丁模式** / **拒绝编辑**？返回三值之一。
+
+    ★★★★★ R539b（2026-11-20 生产阻断修复）：**小文件不该被补丁模式锁死。**
+
+      真证据（本机部署 venv 真跑）：`src/calc.py` 只有 **32 字符**，
+      只因上一轮被回退过（`_退过179` 为真）就进补丁模式，而目标里没有行号焦点
+      ⇒ 返回 `__ORCH_CANNOT_EDIT__` ⇒ **之后每轮连改都改不了**，
+      而模型那份内容其实是对的 —— 一个 32 字符的文件被永久锁死。
+
+      ★ 补丁模式的本意是「大文件整份重写必然改坏」（R179 的真证据是 19696 字符
+        的文件）。**文件不大时这个理由不成立** ⇒ 退回整文件重写，而不是拒绝编辑。
+
+    ★ 为什么提成函数：它原来内联在 prompt 组装分支里，自检**够不到** ——
+      而「够不到的修复」等于没有修复。
+    """
+    _cap = _REPO_TARGET_CAP if cap is None else int(cap)
+    if not 退过:
+        return "whole"                    # 没被回退过 ⇒ 整文件重写（老行为）
+    if len(原文) <= _cap:
+        return "whole"                    # ★ R539b：小文件 ⇒ 退回整文件重写
+    return "patch"                        # 大文件且退过 ⇒ 补丁模式（R179 的本意）
+
+
+def _空读数不许达标(results: dict, 达标本: bool) -> bool:
+    """本轮**一个门都没观测到** ⇒ 达标必为假。
+
+    ★★★★★ R539c（2026-11-20 生产阻断修复）：**「没量到」≠「量到了且全绿」。**
+
+      真证据（本机部署 venv 真跑）：第 2–6 轮 `门=` 全空，R210 把 `verdict`
+      降成 `no_anchor`（这条齿是对的），但真正决定 `done_ok` 的是 `_达标本`
+      —— 它走 R73b「相对基线严格变小」：空读数 ⇒ 现 0 处违规 ⇒ 1 → 0 ⇒ **True**
+      ⇒ `action=deliver` ⇒ **R210 的判定被绕过**，一路空转到 `--max-work`。
+
+      ⇒ 口径：空读数时达标**强制为假**。非空时原样返回（不改变任何既有判定）。
+    """
+    if not results:
+        return False
+    return bool(达标本)
+
+
+def _落地保留文件(自己, work: int) -> list[dict]:
+    """把**保留在工作树里的**文件落到主树（先备份主树）。返回**真落地**的备份列表。
+
+    ★★★★★ R539（2026-11-20 生产阻断修复）：**「保留」≠「落地」。**
+
+      真证据（本机部署 venv 真跑，三趟复现，`git status` 与 3 秒一次的文件采样
+      双向确认）：档案声明 `gates` 后
+
+        `✓ src/calc.py：判据全绿 ⇒ 保留` / `保留 1 个` / `项目验收门 gate_ok=红`
+        ⇒ R238 判部分交付 rc=1 —— 而**主树一个字节都没改**。
+
+      ★ 根因：增量裁决路径（`_增量应用`）把候选写进 `round_root` 并在**那里**判门
+        （`file_root=round_root`），主树从未被写。而交付这一步的项目验收门跑在
+        `REPO_ROOT` 上 ⇒ 它永远看不到本轮改动 ⇒ **恒红** ⇒ R238
+        「项目门红不许叫交付」⇒ **永不交付**（死锁）。
+        同时 R48 那句「主树已被改动」是**假话**。
+
+      ★ 口径：交付前把**保留的文件**从工作树落到主树（先备份主树），
+        之后项目门 / 冻结区 / R235 全部按「主树真被改了」的**真事实**判；
+        真落地 0 个 ⇒ R235 照旧判「一个文件都没落地」（**不谎称**）。
+
+    ★ 只搬**确实落在 `round_root` 里的**那些备份 —— 主树工程任务里
+      `_backup_file(rel)`（默认根 REPO_ROOT）产生的备份本来就在主树上，
+      再搬一遍会把自己覆盖自己。
+    """
+    工作树 = Path(str(getattr(自己, "round_root", "") or "")).resolve()
+    if not str(工作树) or not 工作树.is_dir():
+        return []
+    候选: list[dict] = []
+    for bk in list(getattr(自己, "_active_backups", None) or []):
+        try:
+            Path(str(bk.get("path") or "")).resolve().relative_to(工作树)
+        except (ValueError, OSError):
+            continue
+        候选.append(bk)
+    if not 候选:
+        return []
+    落地: list[dict] = []
+    for bk in 候选:
+        rel = str(Path(bk["path"]).resolve().relative_to(工作树))
+        src = 工作树 / rel
+        if not src.is_file():
+            continue
+        mbk = _backup_file(rel)                 # 主树备份（默认根 REPO_ROOT）
+        try:
+            (REPO_ROOT / rel).parent.mkdir(parents=True, exist_ok=True)
+            (REPO_ROOT / rel).write_bytes(src.read_bytes())   # ★ R22：字节级
+            落地.append(mbk)
+        except 并发改动错 as e:                  # noqa: F821 - 同模块内定义
+            _log(f"[generic] ★ R539 落地跳过 {rel}：{e}")
+        except Exception as e:                  # noqa: BLE001
+            _log(f"[generic] ★ R539 落地失败 {rel}"
+                 f"（{type(e).__name__}: {e}）⇒ 不落地这一个")
+    _log(f"[generic] ★ R539 落地：把保留的 {len(落地)}/{len(候选)} 个文件"
+         f"从工作树写进**主树**（此前主树一个字节都没动）")
+    try:
+        自己._emit({"kind": "kept_files_landed", "work": work,
+                    "landed": [bk["path"] for bk in 落地],
+                    "not_landed": [bk["path"] for bk in 候选 if bk not in 落地],
+                    "reason": "增量裁决只在工作树里判门 ⇒ 交付前必须真落地"})
+    except Exception:                            # noqa: BLE001 - 记账失败不影响落地
+        pass
+    return 落地
+
+
 def _冻结区违反(快照) -> list[dict]:
     """比对快照与当前；返回违反列表（空 = 未改动）。**字节级**。"""
     vio = []
@@ -7082,13 +7192,27 @@ class GoalRunner:
                     #   `路径:行号`。两者都没有 ⇒ 如实报"改不了"（不猜）。
                     焦点 = int(d.get("focus") or 0) or (_focus_line(d["path"], self.goal) or 0)
                     if 焦点 <= 0:
-                        # 没有行号焦点 ⇒ 不知道改哪 ⇒ **如实失败**，不猜。
-                        files[d["path"]] = (
-                            f"__ORCH_CANNOT_EDIT__: {d['path']} 共 {len(原文)} 字符，"
-                            f"超出整文件阈值，而目标里**没有给出行号焦点**（如 "
-                            f"`{d['path']}:123`）⇒ 无法确定改动点。"
-                            f"请把目标拆成带行号的具体改动，或改用小文件。")
-                        continue
+                        # ★★★★★ R539b（2026-11-20 生产阻断修复）：**小文件不该被补丁模式锁死。**
+                        #   真证据（本机部署 venv 真跑）：`src/calc.py` 只有 **32 字符**，
+                        #   只因上一轮被回退过（`_退过179` 为真）就进补丁模式，
+                        #   而目标里没有行号焦点 ⇒ 返回 `__ORCH_CANNOT_EDIT__`
+                        #   ⇒ **之后每轮连改都改不了**，而模型那份内容其实是对的。
+                        #   ★ 补丁模式的本意是「大文件整份重写必然改坏」（R179 的真证据是
+                        #     19696 字符的文件）——文件**不大**时这个理由不成立
+                        #   ⇒ 退回整文件重写，而不是拒绝编辑。
+                        # ★ R539b：小文件**不该**被补丁模式锁死（判据见 `_该走哪种编辑`）。
+                        if _该走哪种编辑(d["path"], 原文, True) == "whole":
+                            _log(f"[generic] ★ R539b {d['path']} 只有 {len(原文)} 字符"
+                                 f"（≤ 整文件阈值 {_REPO_TARGET_CAP}）且无行号焦点 ⇒"
+                                 f"**退回整文件重写**（不因「退过」就把小文件锁死）")
+                        else:
+                            # 没有行号焦点 ⇒ 不知道改哪 ⇒ **如实失败**，不猜。
+                            files[d["path"]] = (
+                                f"__ORCH_CANNOT_EDIT__: {d['path']} 共 {len(原文)} 字符，"
+                                f"超出整文件阈值，而目标里**没有给出行号焦点**（如 "
+                                f"`{d['path']}:123`）⇒ 无法确定改动点。"
+                                f"请把目标拆成带行号的具体改动，或改用小文件。")
+                            continue
                     # ★★★★★ R70（真跑抓出 · 2026-10-16）：**行号不是身份，是坐标。**
                     #   缺口扫描时登记 `…mod.rs:10571`，而这里读文件是 **31 分钟后**
                     #   —— 这期间**另一个进程在改同一个文件**（长了 22 行）⇒ 行号整体
@@ -8341,6 +8465,17 @@ class GoalRunner:
             #   下面所有"原来问 `verdict == "converged"`"的地方一律改问它 ——
             #   否则会出现**两把尺子**：一处说达标、另一处说没达标。
             _达标本 = self._达标(cur_ids)
+            # ★★★★★ R539c（2026-11-20 生产阻断修复）：**空门集不许算达标。**
+            #   真证据（本机部署 venv 真跑）：第 2–6 轮 `门=` 全空，
+            #   R210 把 `verdict` 降成 `no_anchor`（这条齿是对的），
+            #   但真正决定 `done_ok` 的是 **`_达标本`** —— 它走 R73b
+            #   「相对基线严格变小」：空读数 ⇒ 现 0 处违规 ⇒ 1 → 0 ⇒ **True**
+            #   ⇒ `action=deliver` ⇒ **R210 的判定被绕过**，一路空转到 max_work。
+            #   ★ 口径：**本轮一个门都没观测到 ⇒ 达标必为假**（「没量到」≠「量到了且全绿」）。
+            _达标本 = _空读数不许达标(results, _达标本)
+            if not results:
+                _log("[generic] ★ R539c 本轮**零读数** ⇒ 达标强制为假"
+                     "（R210 判了 no_anchor，但 R73b 的「严格变小」会把它翻成 True ⇒ 这里堵死）")
             # ★★★★★ R206：**项目验收门翻绿 ⇒ 目标达成；不许让代理判据否决它。**
             #   真证据（第 102 次真跑第 1 轮，原文）：
             #     `✓ 示例工程/基础集/算子选择器.rs：判据全绿 ⇒ 保留`
@@ -9684,6 +9819,27 @@ class GoalRunner:
         self.product_dir = out
         if self.repo_scope:
             backups = list(self._active_backups or [])
+            # ★★★★★ R539（2026-11-20 生产阻断修复）：**「保留」≠「落地」。**
+            #
+            #   真证据（本机部署 venv 真跑，三趟复现）：档案声明 `gates` 后
+            #     `orch-goal --goal "修好 src/calc.py 的 add"` ⇒
+            #     日志 `✓ src/calc.py：判据全绿 ⇒ 保留` / `保留 1 个` /
+            #     `项目验收门 gate_ok=红` ⇒ R238 判部分交付 rc=1，
+            #     而 `git status` 显示**主树一个字节都没改**。
+            #
+            #   ★ 根因：增量裁决路径（`_增量应用`）把候选写进 `round_root`，
+            #     并在**那里**判门（`file_root=round_root`）。主树从未被写。
+            #     而交付这一步的项目验收门跑在 `REPO_ROOT` 上 ⇒ 它永远看不到本轮改动
+            #     ⇒ **恒红** ⇒ R238「项目门红不许叫交付」⇒ **永不交付**（死锁）。
+            #     同时 R48 那句「主树已被改动」是**假话**（R235 记下的正是这个形状）。
+            #
+            #   ⇒ 交付前把**保留的文件**从 `round_root` 落到主树（先备份主树），
+            #     之后项目门 / 冻结区 / R235 全部按「主树真被改了」的**真事实**判。
+            # ★ R539：交付前**落地**（把保留在工作树里的文件写进主树）。
+            #   函数本体见模块级 `_落地保留文件`（提成函数是为了**能被自检驱动**）。
+            _落地539 = _落地保留文件(self, work)
+            if _落地539:
+                backups = _落地539
             # ★★★★★ R21：**主树交付前必须过项目自己的验收门**（档案声明·人写的）。
             #   原来这里「不再重判门」，而它信的门**全是模型自己写的**
             #   ⇒ 模型写弱门就能让**主树被改坏还报成功交付**（真工程跑出的缺口）。
@@ -15894,6 +16050,154 @@ def _selftest() -> int:
     except Exception as _e48:
         fails.append("【R48】主树改动如实报告门自身异常：%s: %s"
                      % (type(_e48).__name__, _e48))
+
+    # ════════════════════════════════════════════════════════════════
+    # ★★★★★ R539 / R539b / R539c：2026-11-20 **生产阻断**修复的齿
+    # ════════════════════════════════════════════════════════════════
+    # 三条都是「静默」型缺陷：不报错、日志看着正常、结论全反。
+    # 证据全部来自**部署 venv 真跑**（不是构造出来的）：
+    #   · 声明 `gates` 后 `保留 1 个` 而主树一字节未改 ⇒ 项目门恒红 ⇒ 永不交付；
+    #   · 32 字符的文件因「退过」被锁进补丁模式 ⇒ 之后每轮连改都改不了；
+    #   · 空门集 ⇒ 「相对基线严格变小」恒真 ⇒ 绕过 R210 的 no_anchor 一路空转。
+    try:
+        _源539 = (Path(__file__)).read_text(encoding="utf-8", errors="ignore")
+        # ★ 接线齿**必须用 AST**：字符串版会自比恒真（本项目第 2 次犯同一个病）。
+        #   `齿咬验证_生产阻断.py` 读数：字符串版 3/3 **全部存活**（缺陷版本仍绿）。
+        import ast as _ast539
+        _树539 = _ast539.parse(_源539)
+
+        def _遍历539(节点):
+            """遍历 AST，但**跳过 `_selftest` 整棵子树**（齿自己不许当证据）。"""
+            for 子 in _ast539.iter_child_nodes(节点):
+                if isinstance(子, (_ast539.FunctionDef, _ast539.AsyncFunctionDef)) \
+                        and 子.name == "_selftest":
+                    continue
+                yield 子
+                yield from _遍历539(子)
+
+        _节点539 = list(_遍历539(_树539))
+        _调用名539 = set()
+        for _n539 in _节点539:
+            if isinstance(_n539, _ast539.Call):
+                _f539 = _n539.func
+                _调用名539.add(getattr(_f539, "id", None)
+                              or getattr(_f539, "attr", None) or "")
+        # `_达标本 = _空读数不许达标(...)` 这条要连**赋值目标**一起判
+        _赋值达标539 = False
+        for _n539 in _节点539:
+            if isinstance(_n539, _ast539.Assign):
+                _t539 = [getattr(x, "id", "") for x in _n539.targets]
+                _v539 = _n539.value
+                if ("_达标本" in _t539 and isinstance(_v539, _ast539.Call)
+                        and getattr(_v539.func, "id", "") == "_空读数不许达标"):
+                    _赋值达标539 = True
+        # ── 【R539】落地：保留在工作树 ⇒ 交付前必须真写进主树 ──────────
+        import tempfile as _tf539
+        _根539 = Path(_tf539.mkdtemp(prefix="r539_", dir=str(WORKDIR)))
+        _工539 = _根539 / "工作树"
+        _主539 = _根539 / "主树"
+        (_工539 / "src").mkdir(parents=True, exist_ok=True)
+        (_主539 / "src").mkdir(parents=True, exist_ok=True)
+        _旧主539 = (_主539 / "src" / "calc.py")
+        _旧主539.write_bytes(b"def add(a, b):\n    return a - b\n")
+        (_工539 / "src" / "calc.py").write_bytes(b"def add(a, b):\n    return a + b\n")
+
+        class _自539:
+            round_root = _工539
+            _active_backups = [{"path": str(_工539 / "src" / "calc.py"),
+                                "backup": None, "existed": True}]
+
+            def _emit(self, _ev):
+                pass
+
+        _真根539 = globals().get("REPO_ROOT")
+        try:
+            globals()["REPO_ROOT"] = _主539
+            _落539 = _落地保留文件(_自539(), 1)
+            _主文539 = _旧主539.read_bytes()
+        finally:
+            globals()["REPO_ROOT"] = _真根539
+        if len(_落539) != 1:
+            fails.append(f"【R539】★ 保留在工作树的文件**没有落地**"
+                         f"（落地 {len(_落539)} 个）⇒ 项目验收门跑在主树上永远看不到"
+                         f"本轮改动 ⇒ 恒红 ⇒ R238 永不交付（真跑实测的死锁）")
+        elif _主文539 != (b"def add(a, b):\n    return a + b\n"):
+            fails.append(f"【R539】★ 落地后的主树字节不对：{_主文539!r}"
+                         f" ⇒ 「落地」是假的")
+        elif not (_落539[0].get("backup") and
+                  Path(str(_落539[0]["backup"])).is_file() and
+                  Path(str(_落539[0]["backup"])).read_bytes()
+                  == b"def add(a, b):\n    return a - b\n"):
+            fails.append("【R539】★ 落地**没有先备份主树**（或备份内容不是原字节）"
+                         " ⇒ 判红时无法逐字回滚")
+        # 反向①：备份不在工作树里（= 主树自己产生的备份）⇒ 不许重复搬
+        class _自539b:
+            round_root = _工539
+            _active_backups = [{"path": str(_主539 / "src" / "calc.py"),
+                                "backup": None, "existed": True}]
+
+            def _emit(self, _ev):
+                pass
+
+        try:
+            globals()["REPO_ROOT"] = _主539
+            _落539b = _落地保留文件(_自539b(), 1)
+        finally:
+            globals()["REPO_ROOT"] = _真根539
+        if _落539b:
+            fails.append(f"【R539】★ 主树自己的备份被当成工作树文件重复落地"
+                         f"（{len(_落539b)} 个）⇒ 自己覆盖自己")
+        # 反向②：工作树里根本没有那个文件 ⇒ 必须报 0（R235 才判得出"没落地"）
+        class _自539c:
+            round_root = _根539 / "空工作树"
+            _active_backups = [{"path": str(_工539 / "src" / "calc.py"),
+                                "backup": None, "existed": True}]
+
+            def _emit(self, _ev):
+                pass
+
+        (_根539 / "空工作树").mkdir(parents=True, exist_ok=True)
+        try:
+            globals()["REPO_ROOT"] = _主539
+            _落539c = _落地保留文件(_自539c(), 1)
+        finally:
+            globals()["REPO_ROOT"] = _真根539
+        if _落539c:
+            fails.append("【R539】★ 工作树里没有该文件却报「已落地」⇒ 假成功")
+        # 接线齿（AST）：`_deliver` 必须**真的调用**它（否则修复是死码）
+        if "_落地保留文件" not in _调用名539:
+            fails.append("【R539】★ **没有调用** `_落地保留文件`"
+                         " ⇒ 函数写好了但没接线（本项目已立的口径：没接线的等于没有）")
+        shutil.rmtree(_根539, ignore_errors=True)
+
+        # ── 【R539b】小文件不许被补丁模式锁死 ────────────────────────
+        _小539 = "x" * 32
+        if _该走哪种编辑("src/calc.py", _小539, True) != "whole":
+            fails.append("【R539b】★ 32 字符的文件只因「退过」就进补丁模式"
+                         " ⇒ 无行号焦点时返回 __ORCH_CANNOT_EDIT__ ⇒ 之后每轮都改不了")
+        if _该走哪种编辑("src/big.rs", "x" * (int(_REPO_TARGET_CAP) + 1), True) != "patch":
+            fails.append("【R539b】★ 反向过头：大文件且退过**也不走补丁模式**"
+                         " ⇒ 撤销了 R179（大文件整份重写必然改坏）")
+        if _该走哪种编辑("src/big.rs", "x" * (int(_REPO_TARGET_CAP) + 1), False) != "whole":
+            fails.append("【R539b】★ 反向过头：没退过的文件也被塞进补丁模式")
+        if "_该走哪种编辑" not in _调用名539:
+            fails.append("【R539b】★ **没有调用** `_该走哪种编辑` ⇒ 没接线"
+                         "（小文件仍会被「退过」锁进补丁模式）")
+
+        # ── 【R539c】空读数不许算达标 ────────────────────────────────
+        if _空读数不许达标({}, True) is not False:
+            fails.append("【R539c】★ 空门集仍被算成达标 ⇒ R210 的 no_anchor 被绕过，"
+                         "空读数会一路空转到 --max-work")
+        if _空读数不许达标({"a@b": True}, True) is not True:
+            fails.append("【R539c】★ 反向过头：有读数且达标也被判否")
+        if _空读数不许达标({}, False) is not False:
+            fails.append("【R539c】★ 反向：本来就否的仍应为否")
+        if not _赋值达标539:
+            fails.append("【R539c】★ **没有** `_达标本 = _空读数不许达标(...)` 这个赋值"
+                         " ⇒ 没接线（或调用点被后面的 `_达标本 = self._达标(...)` 覆盖）")
+    except Exception as _e539:
+        fails.append("【R539】落地/小文件/空读数 门自身异常：%s: %s"
+                     % (type(_e539).__name__, _e539))
 
     # ════════════════════════════════════════════════════════════════
     # ★★★★★ R52：同一文件的多个区域必须分得开（5 条）
