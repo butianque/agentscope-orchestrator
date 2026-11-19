@@ -70,13 +70,27 @@ orch-goal --goal "实现 src/queue.rs 里的环形队列：推入/取出/长度�
 
 ---
 
-## 安装
+## 安装（**不联网也能装**）
 
 ```bash
+python -m venv .venv
+
+# ① 离线装（推荐）：从仓里的发布包装，依赖轮子全在里面，全程 --no-index
+.venv/Scripts/python -m pip install --no-index --find-links dist/orchestrator-0.13.20/wheels `
+    dist/orchestrator-0.13.20/wheels/agentscope_orchestrator-0.13.20-py3-none-any.whl
+
+# ② 或从源码装（开发用）
 pip install -e .
 ```
 
-需要 Python ≥ 3.12。装完有五个命令：`orch-goal` / `orch-run` / `orch-plan` / `orch-mcp` / `orch-gaps`。
+Windows 也可直接跑 `dist/orchestrator-0.13.20/install.ps1`（Linux/macOS 用 `install.sh`），
+装完自动跑 `orch-doctor`，看到 `✓ 可以开工` 即可。
+
+需要 Python ≥ 3.12。装完有 **11 个命令**：
+`orch-doctor` `orch-check` `orch-init` `orch-kb` `orch-goal` `orch-plan`
+`orch-run` `orch-gaps` `orch-log` `orch-tree` `orch-mcp`。
+
+**自验**：`python tools/交付验收.py`（43 条判据；退出码 0 = 全部达成）。
 
 ### 接上模型通道
 
