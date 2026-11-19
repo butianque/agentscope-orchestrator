@@ -161,6 +161,13 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     dict(id="49", 名="离线装可用（全新 venv + --no-index 装 + 握手）",
          argv=["python", "tools/离线装可用.py"], expect="zero",
          must=["判定=OK", "离线装 rc=0", "工具"], max_s=900),
+    # ★ #50 公仓可编译可导入（2026-11-19 加入）：**发布出去的那份字节**没人测过。
+    #   真事故：公仓推到 0.13.20，本地 43 条全绿，但公仓 HEAD 里有一份未完成的 WIP 编辑
+    #   （bootstrap 第 574 行未闭合 + 字符串嵌双引号）⇒ clone 下来 `import bootstrap` 直接 SyntaxError。
+    #   本判据只回答一个问题：**把公仓 clone 下来，能不能编译、能不能 import、版本对不对。**
+    dict(id="50", 名="公仓可编译可导入（clone → compileall → 逐模块 import）",
+         argv=["python", "tools/公仓可编译.py"], expect="zero",
+         must=["判定=OK", "模块数", "导入失败 = 0"], max_s=900),
     dict(id="48", 名="部署一致性（部署目录 == 仓库版本 == 源码内容）",
          argv=["python", "tools/部署一致性.py"], expect="zero",
          must=["判定=OK", "部署包 vs 仓库源码"], max_s=180),
