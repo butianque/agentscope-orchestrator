@@ -193,10 +193,28 @@ _真差 = [x for x in _不一致 if str(x.get("类") or "").startswith("真差")
 仓.mkdir(parents=True, exist_ok=True)
 (仓 / "ast对账.json").write_text(json.dumps(果, ensure_ascii=False, indent=1), encoding="utf-8")
 print(f"   ★ 落盘 {仓 / 'ast对账.json'}")
-_判 = _守恒 and not _真差
+# ★ 2026-11-19 #51 抓到洞：原来语法错算作「源文件本身有错，不算我的 bug」⇒ 门仍绿。
+#   统计口径可以这么分，但**判据门**不行：仓库里有一个语法坏 .py，交付物就已经坏了
+#   （连 import 都过不去）⇒ 语法错 > 0 一律判不达标；适配器侧结论（不一致/真差）仍单列。
+# ★ 2026-11-19 #51 抓到洞：原来语法错被算作「源文件本身有错，不算我的 bug」⇒ 门仍绿，
+#   于是**本包自己的源码**里塞一个语法坏文件也能过门。统计口径可以这么分，判据门不行。
+#   ★ 但「全仓」里有 8 个**包外**语法错（py2 的 Jython 脚本、历史快照…，2026-11-19 实测）
+#     —— 拿它们判产品红是假红（口径 311：假红比漏报更坏）。
+#   ⇒ 只对 **本包 src/tools** 判红；包外的单列、不判。
+_自家语法错 = [x for x in _语法错
+               if "agentscope_orchestrator" in str(x.get("文件") or "")
+               and ("\\src\\" in str(x["文件"]) or "/src/" in str(x["文件"])
+                    or "\\tools\\" in str(x["文件"]) or "/tools/" in str(x["文件"]))]
+_判 = _守恒 and not _真差 and not _自家语法错
 print(f"判定={'OK' if _判 else '不达标'}")
 if not _守恒:
     print("   ⇒ 守恒不平：报表有一桶没交代（不许把'没数到'当成'没问题'）")
+if _自家语法错:
+    print(f"   ⇒ 本包 src/tools 里有 {len(_自家语法错)} 个语法坏文件："
+          "**产品交付物已坏**（门必须红）")
+elif _语法错:
+    print(f"   ○ 另有 {len(_语法错)} 个语法错文件在**本包之外**（py2/历史快照/第三方）"
+          "—— 不算产品缺陷，单列不判红（假红比漏报更坏）")
 if _真差:
     print(f"   ⇒ 真差 {len(_真差)} 处：绑定的名字对不上，是适配器/接线的问题")
 sys.exit(0 if _判 else 1)

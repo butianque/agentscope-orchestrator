@@ -107,6 +107,33 @@ _任一源 = 包根 / "src" / "agentscope_orchestrator" / "_winutf8.py"
          旧="0.13.20", 新="0.13.21",
          门=[sys.executable, "-B", str(包根 / "tools" / "部署一致性.py")],
          门名="部署一致性"),
+    # ── 2026-11-19 第三批：靶扩到「仓库整体 / 契约数据 / 发货脚本」──
+    #   为什么加这三类：前两批只打"代码/打包件/公仓提交"，而**台账与契约数据**坏了没人看；
+    #   发货脚本 install.ps1 的承诺（--no-index）此前也只有"真装一次"兜着，没有静态断言。
+    dict(名="src 里一个 .py 语法坏 ⇒ 全仓 ast 对账必须红",
+         靶=None, 动作="新增文件",
+         路径=包根 / "src" / "agentscope_orchestrator" / "_门区坏语法.py",
+         内容="def 坏(:\n",
+         旧=None, 新=None,
+         门=[sys.executable, "-B", str(包根 / "tools" / "全仓ast对账.py")],
+         门名="全仓ast对账"),
+    dict(名="契约 JSON 少一个工具名 ⇒ 工具面契约覆盖不符",
+         靶=包根 / "work" / "工具面契约.json", 动作="替换",
+         旧='"name": "audit_delivery"',
+         新='"name": "audit_delivery_被改名"',
+         门=[sys.executable, "-B", str(包根 / "tools" / "工具面契约.py")],
+         门名="工具面契约"),
+    dict(名="门区分力.json 把「抓住」改小 ⇒ 仓内指标必须发现自相矛盾",
+         靶=包根 / "work" / "门区分力.json", 动作="正则替换",
+         正则=r'"抓住": \d+', 新='"抓住": 1',  # ★ 数值会变，正则锚才不脆
+         门=[sys.executable, "-B", str(包根 / "tools" / "仓内生产力.py")],
+         门名="仓内生产力"),
+    dict(名="install.ps1 去掉 --no-index ⇒ 离线装承诺被改成联网装",
+         靶=包根 / "packaging" / "install.ps1", 动作="替换",
+         旧="--disable-pip-version-check --no-index --find-links",
+         新="--disable-pip-version-check --find-links",
+         门=[sys.executable, "-B", str(包根 / "tools" / "离线装可用.py")],
+         门名="离线装可用"),
 ]
 
 
@@ -129,6 +156,28 @@ def _sha(p: pathlib.Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def _写回(p: pathlib.Path, 字节: bytes, *, 次数: int = 10, 间隔: float = 0.4) -> None:
+    """写 + 逐字节校验 + **瞬时失败重试**；彻底失败就抛（调用方必须硬停，不许留残）。
+
+    ★ 为什么必须有（2026-11-19 真事故）：本工具跑第 11~14 条变异时，
+      `workspace.py` 的**还原写盘**抛了 `OSError [Errno 22] Invalid argument`（瞬时，
+      随后同一文件连写 3 次全 OK）—— 而当时异常让流程提前跳出，
+      **注入版 `return 0` 就留在了源码里**（下一轮门全靠人工 git checkout 救回）。
+      ⇒ 「还原」不能是裸 `write_bytes`：要重试 + 校验 + 失败就硬停。
+    """
+    import time
+    末: Exception | None = None
+    for i in range(次数):
+        try:
+            p.write_bytes(字节)
+            if p.read_bytes() == 字节:
+                return
+        except OSError as e:                    # noqa: PERF203
+            末 = e
+        time.sleep(间隔)
+    raise RuntimeError(f"{p.name} 写不回（{末}）—— 产物可能仍是变异版，必须人工介入")
+
+
 def main() -> int:
     if not (公仓 / ".git").exists():
         print(f"○ 未验：公共仓不在 `{公仓}` —— 环境没就绪，不是产品缺陷（口径 375）")
@@ -138,15 +187,29 @@ def main() -> int:
     门基线: dict[str, bool] = {}
     原件: dict[pathlib.Path, bytes] = {}
     原哈希: dict[pathlib.Path, str] = {}
-    for p in (_工作区, _任一源, 包根 / "dist" / "orchestrator-0.13.20" / "VERSION.txt"):
-        原件[p] = p.read_bytes()
-        原哈希[p] = hashlib.sha256(原件[p]).hexdigest()
+    # 所有「替换/追加」类靶：先把原位字节记下来（靶不一定落在 _工作区/_任一源 里，
+    # 也可能是 work/ 的契约数据或 packaging/ 的发货脚本）
+    for t in 靶们:
+        p = t.get("靶")
+        if t["动作"] in ("替换", "追加", "正则替换") and p is not None:
+            原件[p] = p.read_bytes()
+            原哈希[p] = hashlib.sha256(原件[p]).hexdigest()
     # 新增/移走类靶的"原位字节"（存在才记）
     for t in 靶们:
         if t["动作"] in ("新增文件", "移走文件"):
             p: pathlib.Path = t["路径"]
             原件[p] = p.read_bytes() if p.exists() else b""
             原哈希[p] = hashlib.sha256(原件[p]).hexdigest()
+
+    # ①′ 写盘预检：这些靶待会儿要「写坏 → 写回」，先证明**此刻可写**；
+    #    否则量到一半写不回去会留下变异版（2026-11-19 真事故就出在这）。
+    for _p, _b in 原件.items():
+        if _p.exists():
+            try:
+                _写回(_p, _b)
+            except RuntimeError as _e:
+                print(f"○ 未验：{_e}")
+                return 3
 
     try:
         # ① 基线：每条门在正确产物上必须先绿，否则量的是"门本来就不行"
@@ -211,14 +274,22 @@ def main() -> int:
                         if 路径.exists():
                             路径.unlink()
                     else:
-                        路径.write_bytes(原)          # ★ 原字节写回
+                        _写回(路径, 原)               # ★ 钝化：重试 + 校验
                 复核 = hashlib.sha256(路径.read_bytes() if 路径.exists() else b"").hexdigest()
                 if 复核 != 原哈希[路径]:
                     print(f"      ✗✗ 产物没能还原！{路径.name} 必须人工介入")
                     return 4
             else:
                 文 = 原件[靶].decode("utf-8")
-                if 动作 == "替换":
+                if 动作 == "正则替换":
+                    import re as _re
+                    新文 = _re.sub(t["正则"], t["新"], 文, count=1)
+                    if 新文 == 文:
+                        无 += 1
+                        print(f"      ○ {i}. {t['名']}：**无从注入**（正则没匹配到）")
+                        结果.append(dict(序=i, 名=t["名"], 门=t["门名"], 态="无从注入"))
+                        continue
+                elif 动作 == "替换":
                     if t["旧"] not in 文:
                         无 += 1
                         print(f"      ○ {i}. {t['名']}：**无从注入**（原文没这段）")
@@ -228,10 +299,10 @@ def main() -> int:
                 else:
                     新文 = 文 + t["追加"]
                 try:
-                    靶.write_bytes(新文.encode("utf-8"))
+                    _写回(靶, 新文.encode("utf-8"))
                     绿, 尾 = _跑门(t["门"], env={"ORCH_PUB": str(公仓)} if t["门名"] == "公仓可编译" else None)
                 finally:
-                    靶.write_bytes(原件[靶])          # ★ 无论成败立刻还原
+                    _写回(靶, 原件[靶])               # ★ 钝化：重试 + 校验
                 复核 = hashlib.sha256(靶.read_bytes()).hexdigest()
                 if 复核 != 原哈希[靶]:
                     print(f"      ✗✗ 产物没能还原！{靶.name} 必须人工介入")
@@ -248,7 +319,7 @@ def main() -> int:
     finally:
         for p, b in 原件.items():
             if p.exists() and hashlib.sha256(p.read_bytes()).hexdigest() != 原哈希[p]:
-                p.write_bytes(b)
+                _写回(p, b)
                 print(f"      ⚠ 强制还原 {p.name}")
 
     # ③ 收口：分母只算注得进的，未验与无从注入如实单列

@@ -100,6 +100,27 @@ def main() -> int:
     if 区分.is_file():
         区 = json.loads(区分.read_text(encoding="utf-8"))
 
+    # ★ 2026-11-19 #51 抓到洞：把 门区分力.json 的「抓住」从 10 改成 1，指标仍判 OK ——
+    #   它只是**照抄**字段，从不检查字段之间自洽。读数坏了就不能当趋势基线。
+    if 区:
+        环: list[str] = []
+        try:
+            抓儿 = int(区.get("抓住")); 注儿 = int(区.get("注入成功"))
+        except (TypeError, ValueError):
+            抓儿 = 注儿 = -1
+        if 注儿 <= 0:
+            环.append(f"注入成功 = {注儿}（分母不成立）")
+        if 抓儿 < 0 or 抓儿 > max(注儿, 0):
+            环.append(f"抓住 = {抓儿} 不在 0..{注儿}")
+        if 注儿 > 0 and 抓儿 >= 0 and abs(float(区.get("区分力") or 0) - 抓儿 / 注儿) > 1e-6:
+            环.append(f"区分力字段 {区.get('区分力')} != 抓住/注入成功 = {抓儿 / 注儿:.4f}")
+        if not (区.get("门具") or []):
+            环.append("门具为空")
+        if 环:
+            print("   ✗ 门区分力读数自相矛盾：" + "；".join(环))
+            print("   判定=不达标（读数坏了不能当趋势基线）")
+            return 1
+
     交互数, 交互行, stdin引 = _扫交互点()
     事故 = _真事故()
 

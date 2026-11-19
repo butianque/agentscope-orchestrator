@@ -69,6 +69,15 @@ def 生成() -> dict:
 
 
 def main() -> int:
+    # ★ 2026-11-19 #51 抓到洞：原来「生成 → 写盘 → 与内存里的果比覆盖」是**恒真**，
+    #   契约文件被改成旧名字/过期 sha 也照样绿。契约是**交付物**：外部 agent 读的是
+    #   仓库里那份文件 ⇒ 必须先读**已落盘**那份再比。
+    旧 = None
+    if 契约.is_file():
+        try:
+            旧 = json.loads(契约.read_text(encoding="utf-8"))
+        except Exception:                  # noqa: BLE001
+            旧 = None
     果 = 生成()
     契约.parent.mkdir(parents=True, exist_ok=True)
     契约.write_text(json.dumps(果, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -94,6 +103,15 @@ def main() -> int:
         缺 = set(活名) - set(契约名)
         多 = set(契约名) - set(活名)
         print(f"      缺 {sorted(缺)[:5]} · 多 {sorted(多)[:5]}")
+
+    # ②′ **已落盘**契约 == 注册表（防「发出去的那份是旧的/被改过的」）
+    if 旧 is None:
+        判(False, "②′ 契约文件缺失或不可解析（交付物本身不合格）")
+    else:
+        旧名 = sorted(str(t.get("name")) for t in (旧.get("工具") or []))
+        判(旧名 == 活名, f"②′ 已落盘契约 == 注册表（文件 {len(旧名)} · 活 {len(活名)}）")
+        判(str(旧.get("源sha256_12") or "") == str(果["源sha256_12"]),
+           f"②″ 契约里的源 sha == 当前源码（旧 {旧.get('源sha256_12')} · 现 {果['源sha256_12']}）")
 
     # ③ 每个工具三件套齐全
     缺三 = [t["name"] for t in 果["工具"]

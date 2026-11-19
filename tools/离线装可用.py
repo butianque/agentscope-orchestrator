@@ -54,6 +54,34 @@ def _本轮包(包根: Path) -> tuple[Path | None, Path | None]:
 
 
 def main() -> int:
+    # ── ⓪ 发货脚本的**静态承诺**（2026-11-19 #51 抓到洞：原来只「真装一次」，
+    #    install.ps1 被改成联网装也没人看 ⇒ 承诺与脚本脱钩）──
+    脚本坏: list[str] = []
+    for n in ("install.ps1", "install.sh"):
+        f = 包根 / "packaging" / n
+        if not f.is_file():
+            脚本坏.append(f"packaging/{n} 缺失")
+            continue
+        文 = f.read_text(encoding="utf-8", errors="replace")
+        # ★ 只看**真正执行的 `pip install` 行**（2026-11-19 实测：整文搜会被注释行骗过 ——
+        #   install.ps1 第 71 行注释里就写着 `--no-index --find-links`，把命令行的删掉仍能过门）
+        # ★ 只判「**指向本地 wheels 的**安装行」：凡含 `--find-links` 就必须同时含 `--no-index`
+        #   （2026-11-19 两处实测：整文搜会被注释行骗过；而"所有 pip install 行"又会把
+        #   `pip install --upgrade pip` 和"修法提示"算进来 ⇒ 假红。契约只针对本地轮子那条路径。）
+        命 = [ln for ln in 文.splitlines()
+              if "--find-links" in ln and "pip install" in ln
+              and not ln.lstrip().startswith("#")]
+        if not 命:
+            脚本坏.append(f"{n} 里没有「pip install --find-links」行（离线装承诺不见了）")
+        for ln in 命:
+            if "--no-index" not in ln:
+                脚本坏.append(f"{n} 的本地轮子安装行缺 `--no-index`（离线装承诺被改成联网装）")
+    print(f"   ⓪ 发货脚本静态承诺（install.ps1/sh 必含 --no-index + --find-links）："
+          f"{'齐' if not 脚本坏 else '缺 ' + str(脚本坏[:3])}")
+    if 脚本坏:
+        print("判定=不达标")
+        return 1
+
     包, 轮 = _本轮包(包根)
     if not 轮:
         if 包 is None:
