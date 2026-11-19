@@ -527,6 +527,55 @@ def _去包含(根们) -> list[str]:
     return 出
 
 
+#: 二进制/产物后缀 —— 不进记忆索引（**数据表**，不是语义猜测）
+二进制后缀 = frozenset((
+    "png jpg jpeg gif webp ico bmp pdf zip gz tgz tar xz bz2 7z rar "
+    "exe dll so dylib lib a o obj class jar war wasm pyc pyd "
+    "bin dat db sqlite sqlite3 mdb "
+    "ttf otf woff woff2 eot "
+    "mp3 mp4 mov avi mkv wav flac ogg webm "
+    "lock sha256 sha1 md5").split())
+
+
+def _扫后缀分布(r: 识别结果, *, 跳过: frozenset[str], 上限文件: int = 20000,
+                 上限种类: int = 12) -> tuple[list[str], int]:
+    """真盘后缀分布 → **还要额外声明哪些类别**（数文件，不猜语义）。
+
+    ★ 为什么需要：`source:` 只声明「**源码**在哪」，**不是**「项目有哪些知识资产」。
+      本项目实测：`memory:` 段漏了 22,838 个 `.lean` ⇒ 常驻状态里"形式化验证"
+      一个符号都没有 —— 两者混着看，就会以为声明齐了。
+    ★ 边界：只数后缀、只剪**排除集**里的目录；二进制/产物后缀按表剔除；
+      文件数或类别数超上限就**如实截断**并把余量报出来，不假装列全。
+    """
+    计数: dict[str, int] = {}
+    看 = 0
+    截断 = False
+    for 目录, 子目录s, 文件s in os.walk(r.root):
+        子目录s[:] = sorted(d for d in 子目录s if d not in r.排除 and d != ".git")
+        for 名 in sorted(文件s):
+            尾 = 名.rsplit(".", 1)
+            if len(尾) != 2 or not 尾[1]:
+                continue
+            ext = 尾[1].lower()
+            if ext in 二进制后缀 or ext in 跳过:
+                continue
+            计数[ext] = 计数.get(ext, 0) + 1
+            看 += 1
+            if 看 >= 上限文件:
+                截断 = True
+                break
+        if 截断:
+            break
+    排 = sorted(计数.items(), key=lambda kv: (-kv[1], kv[0]))
+    超出 = max(0, len(排) - 上限种类)
+    if 超出:
+        截断 = True
+    if 截断 and not 超出:
+        r.备注.append(f"记忆候选的后缀统计在上限 {上限文件} 个文件处截断"
+                      "（类别可能不全，别把它当"已经列全了"）。")
+    return [k for k, _ in 排[:上限种类]], 超出
+
+
 def _扫记忆候选(r: 识别结果) -> list[dict]:
     """自动推 `memory:` 段：**项目资产范围**（`auto_scan` 按这里扫）。
 

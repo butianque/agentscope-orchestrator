@@ -1,0 +1,106 @@
+# ═══════════════════════════════════════════════════════════════════
+# 通用工程开发编排器 · 项目档案模板
+# ═══════════════════════════════════════════════════════════════════
+#
+# 用法：把本文件复制到你**项目根目录**，改名为 `orchestrator.profile.yml`，
+#       然后按下面注释填。编排器会自动向上查找这个文件名并加载。
+#
+#   cp orchestrator.profile.example.yml  <你的项目根>/orchestrator.profile.yml
+#
+# ⇒ 本文件属于【你的项目】，不属于编排器工具。
+#   编排器源码内**不含任何项目信息**；一切项目专有知识都在这里。
+# ⇒ 换项目 = 换本文件。
+# ⇒ 本文件内的相对路径以**本文件所在目录**为基准解析。
+#
+# 最小可用 = 只需填 `repo_root` 和 `source`（两行）。
+# 其余都有合理默认值；不填 `gates` 会告警并**拒绝用恒真占位门冒充**。
+# ═══════════════════════════════════════════════════════════════════
+
+name: my-project
+
+# 被开发项目的仓库根（. 表示本档案所在目录）
+repo_root: .
+
+# ── 工具运行期目录（可省略，用默认）─────────────────────────────
+# audit_dir: .audit_trail
+# work_dir: .orchestrator/work
+# products_dir: .orchestrator/products
+
+# ── 源码索引：告诉编排器"你的代码在哪"────────────────────────────
+# unit_id 锚定用这个索引：锚不到 → 拒跑（防多智能体把任务派到不存在的文件）。
+source:
+  roots:
+    - src
+  globs:
+    - "**/*.rs"          # 换语言就换这里：**/*.py / **/*.go / **/*.ts …
+  skip:
+    - target
+    - node_modules
+    - .venv
+
+# ── 锚点：跑工程级门时锚定的入口单元 ─────────────────────────────
+anchors:
+  main: src.lib         # 例：Cargo 工程的 src/lib.rs
+
+# ── 记忆索引范围：告诉编排器"哪些文件算你的项目资产"────────────────
+# ★ 这一段**必须声明**（2026-11-05 跨项目验证的教训）：
+#   不声明 ⇒ 记忆索引只扫产物库 ⇒ 普通工程（没有 Lean 库）什么都不会进索引，
+#   于是"写过的代码不知道、证过的数学不拿来用"。工具会告警，但告警容易被忽略。
+# ★ 形状是 **list[dict]**（每项一个 dict），写成 mapping 会被静默忽略：
+#     memory:
+#       roots: [src]        # ✗ 错（解析后为空）
+#   每项字段：
+#     kind:  索引成哪一类（`rs` / `py` / `doc` / `task`…；分类名由你自己定，供检索时按类查）
+#     roots: 相对**仓库根**的目录（`.` = 仓库根）
+#     globs: glob；含 `**` 的递归，否则只扫那一层
+#     skip:  额外剪掉的目录名（前缀匹配）
+#     require: 可选，文件头部必须命中的关键词（任务书一类用）
+memory:
+  - kind: py
+    roots: [src, tests]
+    globs: ["**/*.py"]
+    skip: [__pycache__, .venv]
+  - kind: doc
+    roots: [.]
+    globs: ["*.md"]
+# 形式化产物库（若本仓有 Lean/Coq 一类产物）再加一项：
+#   - kind: formal
+#     roots: [formal_proof]
+#     globs: ["**/*.lean"]
+
+# ── 产物库（可选）──────────────────────────────────────────────
+# 只有"产物要写回某个库"时才需要（如形式化证明库）。
+# 纯工程开发通常**不需要**，留空即可 —— 产物写到 products_dir。
+# artifact:
+#   root: proofs
+#   glob: "**/*.lean"
+#   key_prefix: MyProofs
+
+# ── 判据门白名单追加（可选）────────────────────────────────────
+# ★ 编排器会**自动识别**你工程自带的构建工具：
+#     Cargo.toml ⇒ cargo · go.mod ⇒ go · package.json ⇒ npm/npx/yarn/pnpm
+#     pyproject.toml ⇒ python/pytest/uv · Makefile ⇒ make · pom.xml ⇒ mvn …
+#   ⇒ 绝大多数工程**不用在这里写任何东西**。
+#   只有用自研/罕见构建工具时才需要显式追加：
+# gate_cmd_whitelist:
+#   - my-custom-builder
+
+# ── 默认任务提示词（可选）──────────────────────────────────────
+# 不填则用内置通用提示。填了会覆盖。
+# default_task:
+#   prompt: |
+#     完成下面的实现，把占位替换为真实实现。
+#     只输出完整文件内容，前后不要解释文字、不要代码块围栏。
+#     ```{TEMPLATE}```
+
+# ── 项目级判据门（可选）────────────────────────────────────────
+# 不填 ⇒ 编排器按目标**现场规划**判据门（推荐，通用性最好）。
+# 填了 ⇒ 作为项目固定门叠加。
+# 门类型：compile / grep_forbidden / grep_required / scan_output /
+#         whole_reading / axiom_footprint / kernel_statement
+# gates:
+#   - name: build_ok
+#     type: compile
+#     cmd: ["cargo", "build"]
+#     cwd: "{repo}"
+#     expect_exit: 0
