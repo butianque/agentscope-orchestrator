@@ -383,6 +383,40 @@ def _并发预检() -> str:
             f"⇒ **本趟墙钟不可作数**（抢 target 锁）；退出码与读数仍有效")
 
 
+# 读「最近一趟读数」的那三条 ⇒ 必须最后跑，**且按依赖方向排**：
+#   #51 写 work/门区分力.json → #52 读它 → #53 读两者。
+#   ★ 不能只写成集合：`[x for x in 表 if x.id in 集合]` 只挪位置、**保留表内顺序**
+#     （表里是 53/52/51 ⇒ 会跑成 53→52→51，等于又读上一趟 ⇒ 同一个死锁换个方向）。
+_元判据 = ("51", "52", "53")
+
+
+def _写读数(结果: list, *, 完成: bool) -> None:
+    """把**当前已跑到的**结果写进 `work/交付验收_最近.json`（增量落盘）。
+
+    ★ 为什么必须增量（2026-11-20，真读数）：原来只在整趟结束时写 ⇒ 同一趟里
+      #51/#52/#53 读到的是**上一趟**的读数 ⇒ 上一趟红则这一趟也红 ⇒
+      **判据套件没有不动点**（一趟红，永远红）。
+      实测：04:43 那趟 FAIL 2 之后，`仓内生产力` 直接报「退化 PASS 47→45」rc=1。
+
+    ★ `完成=False` 的含义是「本趟还没跑完」，不是「跑完了但少了」——
+      所以消费方（仓内生产力）**不许拿部分读数的条数去比大小**。
+    """
+    import json as _json
+    import time as _time
+    件 = 包根 / "work" / "交付验收_最近.json"
+    件.parent.mkdir(parents=True, exist_ok=True)
+    过 = sum(1 for r in 结果 if r[2] == "PASS")
+    败 = sum(1 for r in 结果 if r[2] == "FAIL")
+    未 = sum(1 for r in 结果 if r[2] == "未验")
+    件.write_text(_json.dumps(dict(
+        时间=_time.strftime("%Y-%m-%d %H:%M:%S"),
+        完成=bool(完成),
+        条数=len(结果), PASS=过, FAIL=败, 未验=未,
+        总墙钟秒=round(sum(float(r[4] or 0) for r in 结果), 1),
+        明细=[dict(id=r[0], 名=r[1], 态=r[2], 用时=r[4]) for r in 结果],
+    ), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def main() -> int:
     快 = "--快" in sys.argv
     # ★ `--只 11,38,45`：只跑指定用例。本轮三条红要逐条复验，
@@ -413,7 +447,12 @@ def main() -> int:
 
     结果: list[tuple[str, str, str, str, float]] = []
     本趟: list[str] = []          # ★ #32：本趟真跑过的用例标（只扫这些的 .err）
-    for 项 in 底线表:
+    # ★ 元判据（读「最近一趟读数」的那三条）**排到最后**：这样它们读到的是
+    #   **本趟**已经跑完的那些用例的读数，而不是上一趟的（自指死锁的根源）。
+    _按id = {x["id"]: x for x in 底线表}
+    _排 = ([x for x in 底线表 if x["id"] not in _元判据]
+           + [_按id[i] for i in _元判据 if i in _按id])
+    for 项 in _排:
         if _只 and 项["id"] not in _只:
             continue
         if 快 and 项["id"] in 慢的:
@@ -423,6 +462,12 @@ def main() -> int:
         if 标:
             本趟.append(标)
         结果.append((项["id"], 项["名"], 判定, 摘要, 秒))
+        # ★ 增量落盘：后面读「最近一趟」的判据必须看得到**本趟**的读数
+        if not _只:
+            try:
+                _写读数(结果, 完成=False)
+            except Exception as _ew:              # noqa: BLE001
+                print(f"   ⚠ 增量写读数失败（不影响判定）：{_ew}")
         print(f"  {'✓' if 判定 == 'PASS' else ('✗' if 判定 == 'FAIL' else '○')} {项['id']:<4}{项['名']:<34} {判定:<4} {秒:7.1f}s  {摘要}")
 
     if not 快 and not _只:
@@ -463,18 +508,9 @@ def main() -> int:
     #   为什么不写 --只 的跑：那会把"2 条用例"当成一次交付读数，指标立刻失真（口径 375）。
     try:
         if not _只:
-            import json as _json
-            import time as _time
-            件 = 包根 / "work" / "交付验收_最近.json"
-            件.parent.mkdir(parents=True, exist_ok=True)
-            件.write_text(_json.dumps(dict(
-                时间=_time.strftime("%Y-%m-%d %H:%M:%S"),
-                条数=len(结果), PASS=过, FAIL=败, 未验=未,
-                总墙钟秒=round(sum(float(r[4] or 0) for r in 结果), 1),
-                明细=[dict(id=r[0], 名=r[1], 态=r[2], 用时=r[4]) for r in 结果],
-            ), ensure_ascii=False, indent=2), encoding="utf-8")
+            _写读数(结果, 完成=True)
             print(f"   · 读数已存 work/交付验收_最近.json（{len(结果)} 条 · "
-                  f"墙钟 {sum(float(r[4] or 0) for r in 结果):.0f}s，供 #52 读）")
+                  f"墙钟 {sum(float(r[4] or 0) for r in 结果):.0f}s · 完成=True，供 #52 读）")
     except Exception as _e:                    # noqa: BLE001
         print(f"   ⚠ 写最近读数失败（不影响判定）：{_e}")
     if 败:

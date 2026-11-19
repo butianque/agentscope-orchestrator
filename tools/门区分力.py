@@ -47,6 +47,35 @@ Q = '"'
 _工作区 = 包根 / "src" / "agentscope_orchestrator" / "workspace.py"
 _任一源 = 包根 / "src" / "agentscope_orchestrator" / "_winutf8.py"
 
+
+def _当前版本() -> str:
+    """从 `pyproject.toml` **现读**版本（单一源）。
+
+    ★ 2026-11-20：原来变异表把 `0.13.20` 写死在靶路径与替换串里，版本一升
+      ⇒ 三条变异打的是**过时产物** ⇒ 门不红 ⇒ 被记成「洞」。
+      读数：`抓住 12/14 · 判定=门有洞`，而**门是好的**（假红，比漏报更坏）。
+    """
+    import tomllib
+    try:
+        d = tomllib.loads((包根 / "pyproject.toml").read_text(encoding="utf-8"))
+        return str(d["project"]["version"])
+    except Exception:
+        return "0.0.0"
+
+
+def _下一版本(v: str) -> str:
+    """末位 +1（用来造「版本单一源被改坏」的变异）。取不到就退一个固定串。"""
+    try:
+        a, b, c = (int(x) for x in v.split(".")[:3])
+        return f"{a}.{b}.{c + 1}"
+    except Exception:
+        return "9.9.9"
+
+
+_版 = _当前版本()
+_新版 = _下一版本(_版)
+_发货包 = 包根 / "dist" / f"orchestrator-{_版}"
+
 # ── 靶表 ───────────────────────────────────────────────────────────
 # 每条：名 / 靶文件（None = 公共仓）/ 动作 / 旧 / 新 / 门具 argv
 靶们 = [
@@ -93,7 +122,7 @@ _任一源 = 包根 / "src" / "agentscope_orchestrator" / "_winutf8.py"
          门名="已装一致性"),
     dict(名="发货包里缺主轮子 ⇒ 离线装装不上",
          靶=None, 动作="移走文件",
-         路径=包根 / "dist" / "orchestrator-0.13.20" / "wheels" / "agentscope_orchestrator-0.13.20-py3-none-any.whl",
+         路径=_发货包 / "wheels" / f"agentscope_orchestrator-{_版}-py3-none-any.whl",
          旧=None, 新=None,
          门=[sys.executable, "-B", str(包根 / "tools" / "离线装可用.py")],
          门名="离线装可用"),
@@ -103,8 +132,8 @@ _任一源 = 包根 / "src" / "agentscope_orchestrator" / "_winutf8.py"
          门=[sys.executable, "-B", str(包根 / "tools" / "阶段分离棘轮.py")],
          门名="阶段分离棘轮"),
     dict(名="dist VERSION.txt 被改 ⇒ 部署三方不一致",
-         靶=包根 / "dist" / "orchestrator-0.13.20" / "VERSION.txt", 动作="替换",
-         旧="0.13.20", 新="0.13.21",
+         靶=_发货包 / "VERSION.txt", 动作="替换",
+         旧=_版, 新=_新版,
          门=[sys.executable, "-B", str(包根 / "tools" / "部署一致性.py")],
          门名="部署一致性"),
     # ── 2026-11-19 第三批：靶扩到「仓库整体 / 契约数据 / 发货脚本」──
@@ -139,9 +168,9 @@ _任一源 = 包根 / "src" / "agentscope_orchestrator" / "_winutf8.py"
          旧="--no-index --find-links", 新="--find-links",
          门=[sys.executable, "-B", str(包根 / "tools" / "离线装可用.py")],
          门名="离线装可用"),
-    dict(名="pyproject 版本被改（0.13.21）⇒ 版本单一源破了，部署三方不一致",
+    dict(名=f"pyproject 版本被改（{_版} → {_新版}）⇒ 版本单一源破了，部署三方不一致",
          靶=包根 / "pyproject.toml", 动作="替换",
-         旧='version = "0.13.20"', 新='version = "0.13.21"',
+         旧=f'version = "{_版}"', 新=f'version = "{_新版}"',
          门=[sys.executable, "-B", str(包根 / "tools" / "部署一致性.py")],
          门名="部署一致性"),
     dict(名="仓内生产力.json 的人工交互点被改成 3 ⇒ 交付状态一页纸必须发现",
