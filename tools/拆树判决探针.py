@@ -132,6 +132,24 @@ def main() -> int:
     判(码放 == 0, f"入口：释放后退出码 0（实测 {码放}；正控：不许恒定非 0）")
     判(not 树2.exists(), "入口：释放后目录真的不在了")
 
+    # ── ⑤ 防误删护栏（2026-11-19 补）：**不是我们造的树**一律拒删 ──
+    #   为什么补（#51 门区分力抓到的洞）：变异「去掉 `if not (_名像 or _标记 or _记过)`」
+    #   此前在 ④ 下**存活** —— ④ 只测"占用/释放"，没测"任意路径"。
+    #   而那正是 `--clean C:\Windows` 这类误删的入口。判两条：
+    #   ①拒绝（非 0 + 明说「不按路径删」）②目录原封不动（正控：不许真删）。
+    野 = 基 / "不是我们造的树"
+    野.mkdir()
+    (野 / "重要.txt").write_text("别删我", encoding="utf-8")
+    cp4 = subprocess.run(
+        [sys.executable, "-B", "-m", "agentscope_orchestrator.workspace",
+         "--clean", str(野), "--profile", str(档)],
+        cwd=str(主), capture_output=True, text=True, encoding="utf-8",
+        errors="replace", env=环, timeout=300)
+    出野 = (cp4.stdout or "") + (cp4.stderr or "")
+    判(cp4.returncode != 0, f"护栏：任意路径退出码**非 0**（实测 {cp4.returncode}）")
+    判(("不按路径删" in 出野) or ("拒绝" in 出野), "护栏：输出含「不按路径删」/「拒绝」")
+    判(野.exists() and (野 / "重要.txt").exists(), "护栏：目录原封不动（正控：不许真删）")
+
     _清(基)
     print(f"判定={'OK' if not 失败 else '回归'}")
     if 失败:

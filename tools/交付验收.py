@@ -165,6 +165,14 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     #   真事故：公仓推到 0.13.20，本地 43 条全绿，但公仓 HEAD 里有一份未完成的 WIP 编辑
     #   （bootstrap 第 574 行未闭合 + 字符串嵌双引号）⇒ clone 下来 `import bootstrap` 直接 SyntaxError。
     #   本判据只回答一个问题：**把公仓 clone 下来，能不能编译、能不能 import、版本对不对。**
+    # ★ #51 门区分力（2026-11-19 扩版）：N4「语义正确性不可判」的**正当替代** ——
+    #   不可判 ≠ 不可量：往产物注机械错误，看门抓不抓。旧版只量 3 条变异 × 1 个门具（靶全在
+    #   workspace.py）；现扩到 **6 条 × 4 个门具 × 3 类产物**（源码 / 打包件 / 公仓提交）。
+    #   ★ 它第一次跑就抓到一个**真洞**：变异「去掉 --clean 防误删护栏」此前**存活**
+    #     （④ 只测占用/释放，没测"任意路径"）⇒ 探针补 ⑤ 后才 6/6。
+    dict(id="51", 名="门区分力（6 条机械变异 × 4 个门具 × 3 类产物）",
+         argv=["python", "tools/门区分力.py"], expect="zero",
+         must=["判定=OK", "区分力 = 抓住 6/6", "门具 4 个"], max_s=1800),
     dict(id="50", 名="公仓可编译可导入（clone → compileall → 逐模块 import）",
          argv=["python", "tools/公仓可编译.py"], expect="zero",
          must=["判定=OK", "模块数", "导入失败 = 0"], max_s=900),
