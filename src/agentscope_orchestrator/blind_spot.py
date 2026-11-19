@@ -146,7 +146,11 @@ class _造不出门(Exception):
 
 
 def _根() -> Path:
-    return Path(os.environ.get("ORCH_STATE_DIR") or (Path.home() / ".orchestrator-state"))
+    # ★ R549：收口到唯一取法（原来自己拼 `~/.orchestrator-state`，
+    #   与 `profile.STATE_ROOT` 可能是两个根 ⇒ home 不可写时会重演
+    #   「写不了被显示成空链/0 条」。）
+    from . import profile as _pf549
+    return _pf549.state_dir()
 
 
 def 台账路径() -> Path:

@@ -52,13 +52,44 @@ if (-not (Test-Path $vpy)) { Write-Host "✗ venv 建失败" -ForegroundColor Re
 #   按名字排序时 "0.9.2" 排在 "0.13.11" 之后 ⇒ 装的是**两个月前那个旧版**，
 #   而输出只说"安装 agentscope_orchestrator-0.9.2"，不细看根本发现不了。
 #   这里按**版本号**排序取最高，并且把选中的版本打出来。
-$whls = Get-ChildItem (Join-Path $here "wheels") -Filter "*.whl"
+$whls = @(Get-ChildItem (Join-Path $here "wheels") -Filter "*.whl")
 if (-not $whls) { Write-Host "✗ wheels/ 里没有 wheel" -ForegroundColor Red; exit 1 }
-$whl = $whls | Sort-Object { try { [version](($_.BaseName -split '-')[-3]) } catch { [version]"0.0.0" } } | Select-Object -Last 1
-Write-Host "· 安装 $($whl.Name)（wheels/ 里共 $($whls.Count) 个，取版本最高）"
-& $vpy -m pip install --upgrade pip -q
-& $vpy -m pip install --force-reinstall --no-deps --no-cache-dir "$($whl.FullName)"
-if ($LASTEXITCODE -ne 0) { Write-Host "✗ 安装失败" -ForegroundColor Red; exit 1 }
+# ★ 必须按**名字前缀**筛出编排器自己的轮子（2026-11-19 实测踩过）：
+#   一旦 wheels/ 里放进依赖轮子（如 pydantic_core-2.50.4），"按版本号取最高"会挑中**依赖包**，
+#   于是"安装了成功"但装的是别的东西 —— 和 2026-11-03 那次"按名字排序装了旧版"是同一类错。
+$own = @($whls | Where-Object { $_.Name -like "agentscope_orchestrator-*" })
+if (-not $own) { Write-Host "✗ wheels/ 里没有 agentscope_orchestrator-*.whl" -ForegroundColor Red; exit 1 }
+$whl = $own | Sort-Object { try { [version](($_.BaseName -split '-')[-3]) } catch { [version]"0.0.0" } } | Select-Object -Last 1
+Write-Host "· 安装 $($whl.Name)（wheels/ 共 $($whls.Count) 个：编排器 $($own.Count) + 依赖轮子；取编排器版本最高）"
+
+# ★ pip 一律不碰缓存：有机器把 PIP_CACHE_DIR 配在写不进去/已断开的盘上，pip 会**静默卡死**
+#   （2026-11-19 本机实测：`pip install --upgrade pip -q` 卡 >10 分钟；加 --no-cache-dir 后 3 秒完）。
+#   install.sh 早就修过这行，Windows 侧此前没同步。
+& $vpy -m pip install --no-cache-dir --disable-pip-version-check --upgrade pip -q 2>$null
+if ($LASTEXITCODE -ne 0) { Write-Host "· pip 自升级没成功（不影响安装，继续）" -ForegroundColor Yellow }
+
+# ★ 依赖必须一起装，而且**只从本地 wheels/ 解析**（--no-index --find-links）⇒ 这才是真离线装。
+#   旧写法 `--no-deps` 在干净机器上装出 doctor=64 的坏装（缺 pyyaml/httpx/mcp）。
+& $vpy -m pip install --no-cache-dir --disable-pip-version-check --no-index --find-links (Join-Path $here "wheels") --force-reinstall "$($whl.FullName)"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "✗ 安装失败（wheels/ 里缺依赖轮子？）" -ForegroundColor Red
+    Write-Host "  修法 A：联网补装依赖  .\.venv\Scripts\python.exe -m pip install --no-cache-dir pyyaml httpx `"mcp<2.0.0`" pywin32" -ForegroundColor Yellow
+    Write-Host "  修法 B：重新构建交付包（tools/make_dist.py 会把 packaging/deps_wheels/ 一并打进 wheels/）" -ForegroundColor Yellow
+    exit 1
+}
+
+# ③.5 预编译字节码（★ R547）
+#
+# ★ 为什么单列一步：verifier 在**干净 venv** 里实测到「第一次 import 15.73s，
+#   之后 3.26~5.16s」。那 15.7 秒不是模块顶层建索引（R543 已去掉），
+#   是 109 个模块的 .pyc **第一次现编** + 冷盘。
+#   而「装完敲第一条命令就要等十几秒」会被直接读成"这东西卡死"。
+#   ⇒ 装的最后一步把字节码先编出来，用户第一次敲就是热的。
+Write-Host "· 预编译字节码（省掉首次 import 的十几秒）"
+$purelib = & $vpy -c "import sysconfig;print(sysconfig.get_paths()['purelib'])"
+& $vpy -m compileall -q "$purelib\agentscope_orchestrator" 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) { Write-Host "  ✓ 字节码已预编译" } else { Write-Host "  · 预编译没成功（不影响可用，只是首次慢）" -ForegroundColor Yellow }
+
 
 # ④ 检索桥配置（B 方案）
 #

@@ -69,7 +69,7 @@ class UnitIndex:
             if not p.is_file():
                 continue
             if exclude_disabled and disabled_marker and \
-                    any(disabled_marker in d for d in p.parts):
+                    any(disabled_marker in d for d in p.relative_to(root).parts):
                 continue
             discovered.append(p)
         for p in discovered:

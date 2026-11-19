@@ -106,7 +106,23 @@ def 源文件们(根: Path, 后缀: str = "*.rs") -> list[Path]:
         pass
     出 = []
     for p in 根.rglob(后缀):
-        if any(part in _跳过目录 for part in p.parts):
+        # ★★★★★ R537（干净环境真跑抓出的缺陷 · 2026-11-16）：
+        #   跳过表**必须比对「相对根」的路径**，不能比对绝对路径。
+        #
+        #   【症状】夹具建在 `...\.venv\Lib\work\临时\tmpXXXX\src\a.rs`，
+        #     绝对路径里带 `work` ⇒ 被自己的跳过表剔掉 ⇒ **枚举到 0 个源文件**
+        #     ⇒ 下游 `接线门.数生产引用` 恒返回 0 ⇒ **每一处声明都报成结构缺口**
+        #     ⇒ 无人值守据此派一堆必然空转的任务。
+        #
+        #   【这一条不是测试专有】跳过表描述的是「**项目内部**哪些子目录不算源码」。
+        #     拿绝对路径比 ⇒ 只要**装它的那个路径**里有个叫 work/products/build/
+        #     dist/vendor 的目录（`D:\work\myproj\src\…` 非常常见）就整体假红。
+        #     而假红比漏报更坏（口径 311）：它让工具在别人的机器上直接不可用。
+        try:
+            相对 = p.relative_to(根).parts
+        except ValueError:
+            相对 = p.parts
+        if any(part in _跳过目录 for part in 相对):
             continue
         if p.is_file():
             出.append(p)

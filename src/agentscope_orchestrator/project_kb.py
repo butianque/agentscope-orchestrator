@@ -108,6 +108,18 @@ def 回落原因() -> tuple[str, str] | None:
     return _回落
 
 
+def _状态根547() -> Path:
+    """状态根：显式 env 优先，否则**只认** `profile.STATE_ROOT`。
+
+    ★ R547：这里曾经自己拼 `Path.home()/".orchestrator-state"`，与
+      `profile._detect_state_root()`（真试写、带 TEMP 兜底）**算出两个不同的根**。
+      实测后果：状态根那处可写、知识库这处不可写 ⇒ 播种静默失败 ⇒
+      doctor 报「知识库 0 条」，被读成「项目本来没知识」。
+    """
+    from . import profile as _pf
+    return _pf.state_dir()
+
+
 def 库根() -> Path:
     """知识库根。`ORCH_KB_DIR` 优先，否则 `<ORCH_STATE_DIR>/kb`。
 
@@ -130,7 +142,14 @@ def 库根() -> Path:
     """
     global _回落
     配 = os.environ.get("ORCH_KB_DIR") or ""
-    状态 = Path(os.environ.get("ORCH_STATE_DIR") or (Path.home() / ".orchestrator-state")) / "kb"
+    # ★★★★★ R547：状态根**只认一个来源**（`profile.STATE_ROOT`）。
+    #   原来这里自己算 `Path.home()/'.orchestrator-state'` —— 而
+    #   `profile._detect_state_root()` 是**逐个候选真试写**选出来的。
+    #   同一件事两处实现（R117）的后果实测：本机 STATE_ROOT 可写，
+    #   而这一行算出 `C:\Users\00\.orchestrator-state\kb` ——
+    #   建目录 **WinError 5 拒绝访问** ⇒ 播种必死 ⇒ doctor 报「知识库 0 条」，
+    #   看起来像「这项目本来没知识」。**同一个事实不许有第二个实现。**
+    状态 = _状态根547() / "kb"
     if 配:
         p = Path(配)
         try:
@@ -295,7 +314,66 @@ def 删(条id: str) -> bool:
     return True
 
 
+_已试播种 = False
+
+
+def _标记() -> Path:
+    """每个**状态根**一个标记（`<state>/.kb_autoseed`，不是 `kb/` 里面）。
+
+    ★ 为什么标记在状态根而不是库根：用户**故意**清空 `kb/` 后，
+      标记还在 ⇒ 不会被自动塞回来。自动补种若每次都补，
+      就等于把「我删掉了」当成「我没删」。
+    """
+    return 库根().parent / ".kb_autoseed"
+
+
+# ★ R547：自动播种失败的**真实原因**（None=没失败/没试过）。
+#   doctor 与 orch-kb 都该能读到它，而不是只看到一个「0 条」。
+_播种失败原因547: str | None = None
+
+
+def _自动播种一次() -> None:
+    """★ R541：运行期库为空 ⇒ **首次真正用到时**从随包种子播一次。
+
+    · 不在 import 时做（调用方是查询路径，不是模块顶层）；
+    · 每个状态根只播一次（见 `_标记()`）；
+    · `ORCH_KB_NO_AUTOSEED=1` 时完全不碰（明确要空库的人）。
+    """
+    global _已试播种
+    if _已试播种:
+        return
+    _已试播种 = True                      # ★ 先置位：播种会回调读路径，防递归
+    try:
+        if os.environ.get("ORCH_KB_NO_AUTOSEED", "").strip() not in ("", "0"):
+            return
+        if _标记().exists():
+            return                        # 播过了 / 用户自己管过
+        if (库根() / "items").is_dir() and any((库根() / "items").glob("*.md")):
+            return                        # 已有条目 ⇒ 什么都不做
+        种子 = 内建种子()
+        if not 种子.is_dir():
+            return
+        出 = 播种()
+        try:
+            _标记().parent.mkdir(parents=True, exist_ok=True)
+            _标记().write_text(
+                f"R541 首次自动播种：{出.get('新增', 0)} 条"
+                f"（ORCH_KB_NO_AUTOSEED=1 可关）\n", encoding="utf-8")
+        except OSError:
+            pass
+    except Exception as _e:               # noqa: BLE001 引导失败不许让查询崩
+        # ★ R547：**不许静默**（口径 92：缺席必须说出来）。
+        #   原来这里 `pass`，于是「状态根建不出来」在 doctor 里
+        #   长得和「这个项目本来没有知识」一模一样 —— 两者行为一致、责任完全不同。
+        global _播种失败原因547
+        _播种失败原因547 = f"{type(_e).__name__}: {_e}"
+        import logging as _lg547
+        _lg547.getLogger("orchestrator").warning(
+            "[project_kb] 自动播种失败（知识库仍为空）：%s", _播种失败原因547)
+
+
 def 全量() -> list[dict]:
+    _自动播种一次()
     出 = []
     目录 = 库根() / "items"
     if not 目录.is_dir():
@@ -1083,6 +1161,7 @@ def 门统计() -> dict:
 
 
 def 统计() -> dict:
+    _自动播种一次()
     """统计**永远不抛**：库不可写/索引坏了也返回可读结论。
 
     ★ 实测教训（2026-11-02 部署侧）：首版只把 `全量()` 包进 try，`冲突()`/`门()` 在库不可写时

@@ -198,10 +198,6 @@ def _witness_literal(pattern: str, text: str) -> str | None:
 
 
 # 兼容旧名（模块内其它处引用）
-def _literal_of(pattern: str) -> str:      # pragma: no cover - 保留旧签名
-    return pattern
-
-
 # ── 主入口 ────────────────────────────────────────────────────────
 
 def _gate_read_target(g: dict, product: Path, work_dir: Path) -> Path | None:

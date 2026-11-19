@@ -34,16 +34,17 @@ _源后缀 = {".py", ".rs", ".ts", ".tsx", ".js", ".mjs", ".go", ".java", ".kt",
 
 
 def _状态根() -> Path:
-    d = os.environ.get("ORCH_STATE_DIR") or os.environ.get("ORCH_HOME")
-    if d:
-        p = Path(d)
-    else:
-        p = Path.home() / ".orchestrator-state"
-    try:
-        p.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        p = Path(tempfile.gettempdir()) / "orch-state"
-        p.mkdir(parents=True, exist_ok=True)
+    """★ R550：收口到**唯一取法** `profile.state_dir()`（verifier 抓出：这处仍是自有实现）。
+
+    ★ 原来这里自己按「env → home → 临时目录」两级退，落点是 `临时目录/orch-state`，
+      而本模块持有的是**判据册 `判据册.jsonl` 与 `receipts/`** —— 都是「跨重启要记住的事」。
+      于是它们与 `profile.STATE_ROOT` 分成两个根：各自都能写、各自都自洽，
+      **所以没有任何判据会红** —— 而这正是最坏的一类：再遇到 home 不可写，
+      「写不了」会被显示成「没有」，与 R547/R548 那个 P0 一模一样。
+    """
+    from . import profile as _pf550
+    p = _pf550.state_dir()
+    p.mkdir(parents=True, exist_ok=True)
     return p
 
 
@@ -86,15 +87,6 @@ def 落检查点(task_id: str, 内容: dict) -> str:
         return str(p)
     except OSError:
         return ""
-
-
-def 读检查点(task_id: str) -> dict:
-    """读回某个任务的检查点（新会话的第一件事）。不存在则返回空 dict。"""
-    p = _回执目录() / f"{task_id}.checkpoint.json"
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
 
 
 def 决策摘要(分类: str, 责任: str | None, 门: list[dict],

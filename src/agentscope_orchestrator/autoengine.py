@@ -165,8 +165,29 @@ _OPEN_RE = re.compile(r"^\s*(?:open|namespace)\s+([A-Za-z_][A-Za-z0-9_.'<>: ]*)"
                       re.MULTILINE)
 
 
-def _is_noise(path: Path) -> bool:
-    for part in path.parts:
+def _相对分量(p: Path, 根: "Path | None" = None) -> tuple:
+    """★ R538k：跳过表的比对基准 —— 有根就用**相对根**的分量。
+
+    ★ 本库为这件事踩过**三次**（只读探针 / 见证门 / 这里），形态完全一样：
+      跳过表写的是**目录名**，而拿**绝对路径**比对 ⇒ 只要项目
+      "装在哪"命中一个名字，整棵树被自己的跳过表吃掉 ⇒ **静默 0 个文件**，
+      而程序看起来一切正常。
+    ★ 对本项目尤其要紧：用户要的是"**任意文件夹**都能建知识图谱" ——
+      项目只要放在 `D:\\build\\`、`D:\\dist\\`、`C:\\work\\` 下，图谱就是空的。
+    """
+    if 根 is not None:
+        try:
+            return p.relative_to(根).parts
+        except ValueError:
+            pass
+    return p.parts
+
+
+def _is_noise(path: Path, 根: "Path | None" = None) -> bool:
+    # ★ R538k：跳过表只认**相对根**的分量（绝对路径里任何一层叫 `.venv`/`dist`/`work`
+    #   都会把整棵树吃掉 ⇒ 静默 0 个文件）。判据的域必须由**被查的那棵树**决定，
+    #   不能由**它被放在哪**决定。
+    for part in _相对分量(path, 根):
         if part in _NOISE_PARTS:
             return True
         if part.startswith("._") or part.startswith("_archive"):
@@ -208,7 +229,7 @@ def scan_code(mem: MemoryIndex, roots: list[Path], glob: str = "**/*.py") -> int
         if not root.is_dir():
             continue
         for p in sorted(root.rglob(glob)):
-            if not p.is_file() or _is_noise(p):
+            if not p.is_file() or _is_noise(p, root):
                 continue
             dotted = ".".join(p.relative_to(root).with_suffix("").parts)
             mem.register("code", str(p), p)
@@ -223,7 +244,7 @@ def scan_tasks(mem: MemoryIndex, roots: list[Path], glob: str = "**/*.md") -> in
         if not root.is_dir():
             continue
         for p in sorted(root.rglob(glob)):
-            if not p.is_file() or _is_noise(p):
+            if not p.is_file() or _is_noise(p, root):
                 continue
             try:
                 head = p.read_text(encoding="utf-8", errors="ignore")[:4000]
@@ -237,7 +258,16 @@ def scan_tasks(mem: MemoryIndex, roots: list[Path], glob: str = "**/*.md") -> in
 
 
 def scan_lean(mem: MemoryIndex, root: Path, profile=None) -> int:
-    """扫产物库 .lean（键前缀/跳过规则由档案 artifact 段决定）。"""
+    """扫产物库 .lean（键前缀/跳过规则由档案 artifact 段决定）。
+
+    ★ `root is None` 必须能跑（2026-11-05 跨项目实测撞出来的）：
+      像 case01 这种**普通工程项目**没有形式化产物库，档案里也就不写 `artifact:` 段。
+      原来的实现直接 `Path.rglob` ⇒ `AttributeError: 'NoneType' object has no attribute 'rglob'`，
+      **一个没有证明库的仓连记忆索引都建不起来**（"换项目 = 换档案"当场断在第二行）。
+      口径：**档案没声明的产物库 = 这类项目没有这种产物，不是"缺文件"**，扫 0 个文件即可。
+    """
+    if root is None:
+        return 0
     from agentscope_orchestrator import profile as prof_mod
     art = (profile or prof_mod.get_profile()).artifact
     idx = mem.index("formal")
@@ -289,8 +319,9 @@ _内容噪声 = ("__pycache__", ".git", ".venv", "venv", "node_modules",
              ".lake", ".mypy_cache", ".pytest_cache", ".ipynb_checkpoints")
 
 
-def _是内容噪声(p: Path) -> bool:
-    if any(part in _内容噪声 for part in p.parts):
+def _是内容噪声(p: Path, 根: "Path | None" = None) -> bool:
+    # ★ R538k：同上 —— 只认相对根的分量。
+    if any(part in _内容噪声 for part in _相对分量(p, 根)):
         return True
     return p.suffix in (".pyc", ".pyo", ".lock")
 
@@ -337,7 +368,7 @@ def scan_declared(mem: MemoryIndex, entries, repo_root: Path) -> dict:
                         if not fnmatch(名, 尾巴):
                             continue
                         p = Path(目录) / 名
-                        if _是内容噪声(p):
+                        if _是内容噪声(p, 根):
                             continue
                         if require:
                             try:

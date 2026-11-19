@@ -55,7 +55,7 @@ def build_rust_index(prof: prof_mod.Profile | None = None) -> UnitIndex:
             for p in sorted(root.rglob(g)):
                 if not p.is_file():
                     continue
-                if skip and any(s in p.parts for s in skip):
+                if skip and any(s in p.relative_to(root).parts for s in skip):
                     continue
                 try:
                     rel_p = p.relative_to(prof.repo_root).with_suffix("")

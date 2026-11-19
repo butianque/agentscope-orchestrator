@@ -42,6 +42,15 @@ from agentscope_orchestrator.autoengine import (MemoryIndex, scan_all,
                                                   scan_project)
 from agentscope_orchestrator import autoengine as ae
 from agentscope_orchestrator import auto_goal as ag
+from agentscope_orchestrator import goal_runner as gr  # 按目标树清单无人值守裁决
+from agentscope_orchestrator import close_loop as cl  # 规划→裁决→定位→改码→复验 一次调用
+from agentscope_orchestrator import goal_iterate as gi  # 迭代闭环（预算护栏/打转检测）
+from agentscope_orchestrator import model_coder as mc  # 模型产改码（机器门裁决，模型不判自己）
+from agentscope_orchestrator import channel_doctor as cd  # 开工前通道体检（逐对真探活）
+from agentscope_orchestrator import repeatability as rpt  # 多文件可重复性（真工具链）
+from agentscope_orchestrator import failure_cause as fc  # 工程失败归因（分清责任层）
+from agentscope_orchestrator import field_contract as fcl  # 跨模块字段契约表（防猜错）
+from agentscope_orchestrator import audit as adt  # 整体交付对账（已证明/没测到）
 from agentscope_orchestrator import ts_receipt  # MCP 任务每轮渲染人类可读 .md 回执
 from agentscope_orchestrator.index import UnitIndex
 from agentscope_orchestrator import doc_store as ds  # 文档外置+自建索引+按需查看（防会话卡死）
@@ -406,21 +415,46 @@ def _db_has(job_id: str) -> bool:
 # 锚定走档案声明的产物库 UnitIndex（点式/前缀/theorem 级均登记），
 # 停用目录不入索引 → 不会锚定到归档代码。
 _ARTIFACT_INDEX = UnitIndex()
-try:
-    if ARTIFACT_DIR:
-        _art = prof_mod.get_profile().artifact
-        _ARTIFACT_INDEX.build_artifact(ARTIFACT_DIR,
-                                   key_prefix=_art.key_prefix,
-                                   disabled_marker=_art.disabled_marker,
-                                   glob=_art.glob)
-    _logger.info("artifact index built")
-except Exception as _iexc:
-    # 索引构建失败不致命：锚定退回字符串直解，判据门仍守真编译
-    _logger.warning("artifact index build failed: %s", _iexc)
+# ★ R546：**构建推迟到真要用的时候**。原来在这里 `build_artifact(...)`，
+#   而 `unattended.py` 在模块级 `import taixu_mcp` ⇒ `orch-run --help` 也要付这笔钱。
+#   见本文件下方 `_确保索引544()`。
+
+
+_索引已建544 = False
+
+
+def _确保索引544() -> None:
+    """★ R546：两套索引**按需**构建（幂等，失败不致命）。
+
+    ★ 为什么必须惰性：`orch-run` 在模块级 import 本模块，模块级构建就意味着
+      **任何** `--help` / `--json` 探测都要先扫全仓（实测 11 秒级）。
+      与 R543 同一个病，同一个治法：把「第一次要用」留在「第一次要用」。
+    """
+    global _索引已建544
+    if _索引已建544:
+        return
+    _索引已建544 = True                      # ★ 先置位：构建过程可能回调本模块
+    try:
+        if ARTIFACT_DIR:
+            _art = prof_mod.get_profile().artifact
+            _ARTIFACT_INDEX.build_artifact(ARTIFACT_DIR,
+                                       key_prefix=_art.key_prefix,
+                                       disabled_marker=_art.disabled_marker,
+                                       glob=_art.glob)
+            _logger.info("artifact index built")
+    except Exception as _iexc:                # noqa: BLE001
+        # 索引构建失败不致命：锚定退回字符串直解，判据门仍守真编译
+        _logger.warning("artifact index build failed: %s", _iexc)
+    try:
+        _build_rust_index()
+        _logger.info("engine source index built: %d units", _RUST_INDEX.size())
+    except Exception as _iexc:                # noqa: BLE001
+        _logger.warning("engine source index build failed: %s", _iexc)
 
 
 def _anchor_unit(unit_id: str) -> Path | None:
     """unit_id 点分路径 → 产物库下真实模块文件；索引命中或真实存在则返回。"""
+    _确保索引544()
     p = _ARTIFACT_INDEX.query(unit_id)
     if p and p.is_file():
         return p.resolve()
@@ -462,7 +496,7 @@ def _build_rust_index() -> None:
                 if p in seen or not p.is_file():
                     continue
                 seen.add(p)
-                if skip and any(s in p.parts for s in skip):
+                if skip and any(s in p.relative_to(root).parts for s in skip):
                     continue
                 rel = p.relative_to(prof.repo_root).with_suffix("")
                 dotted = ".".join(rel.parts)
@@ -485,18 +519,15 @@ def _anchor_engine(unit_id: str) -> Path | None:
         else:
             cands.append(pre + unit_id)
     for k in cands:
+        _确保索引544()
         p = _RUST_INDEX.query(k)
         if p and p.is_file():
             return p.resolve()
     return None
 
 
-# 构建源码索引（函数已定义，模块级执行一次）
-try:
-    _build_rust_index()
-    _logger.info("engine source index built: %d units", _RUST_INDEX.size())
-except Exception as _iexc:
-    _logger.warning("engine source index build failed: %s", _iexc)
+# ★ R546：源码索引的构建也**推迟**（原为「函数已定义，模块级执行一次」）。
+#   代价实测：`orch-run --help` 11.11s、`orch-mcp --help` 11.67s，且 `--help` 有副作用。
 
 
 def rebuild_indexes(path: str | Path | None = None) -> dict:
@@ -649,6 +680,114 @@ def _dep_state(job_id: str) -> tuple[str, str]:
     return ("ready", "")
 
 
+def accept_closed(planned: dict) -> tuple[bool, str]:
+    """★ R256（2026-11-05 · 目标树纪律接进执行层）：**父目标不许假完成**。
+
+    ★ 为什么必须接在**执行侧**而不只在计划器：计划器多返回一个 `closed` 字段，
+      如果没人读它，那只是"打印了一份真相"—— 无人值守照旧会报绿。
+      真形状（本机可复现）：一份 3 个实现任务的计划，若 acceptance 只依赖 1 个，
+      另 2 个做不做都判"目标完成"。
+
+    ★ 零回退：本函数是**新增**的，老调用方一个都不改；
+      谁想用"父目标闭合"这条纪律，就在提交前调它一次。
+      返回 `(能否接受, 原因)`；`planned` 就是 `auto_goal.plan_tasks()` 的返回值。
+    """
+    if not isinstance(planned, dict):
+        return (False, f"计划不是 dict：{type(planned).__name__}")
+    if not planned.get("conserved"):
+        return (False, "计划未通过接线守恒（conserved 非真）⇒ 拒发")
+    if "closed" not in planned:
+        return (False, "计划没有 `closed` 字段（旧版计划器）⇒ 无法证明父目标闭合，拒发")
+    if not planned.get("closed"):
+        _缺 = planned.get("uncovered") or []
+        # ★★ R259b（真读数抓的）：`uncovered` 为空时旧文案照样写
+        #   「**0 个**实现任务不在闭包里 ⇒ 拒发」—— **红得没法修**，
+        #   而且它把真正的原因（没有闭合点 / 没有实现任务）藏起来了。
+        #   口径：「红得没法修」本身就是缺陷（同 R254 齿里那条"没点名"）。
+        if _缺:
+            return (False, "父目标不闭合："
+                           f"{len(_缺)} 个实现任务不在 acceptance 的依赖闭包里"
+                           f"（{'、'.join(map(str, _缺[:6]))}）"
+                           " ⇒ 它们做不做都判「目标完成」，拒发")
+        # ★★ R260（2026-11-05）：**先问"有没有实现任务"，再问"有没有清单"**。
+        #   真读数（刚量的）：`plan_tasks({name, pre, gates: []})` 返回
+        #     tasks=1（只有 pre_emit）、errand=0、acceptance=0、closed=False、uncovered=[]
+        #   ⇒ 旧分支顺序把这一档报成"没给出未覆盖清单"，而**真相是压根没有判据门**：
+        #     档案写了 goal 却没写 gates ⇒ 计划器编不出任何实现任务。
+        #   口径：报错要报**最上游那条原因**，否则读的人会去修一个没坏的东西。
+        if not planned.get("tasks"):
+            return (False, "父目标不闭合：计划里**一个任务都没有** ⇒ 没有可执行实现，"
+                           "拒发（空计划不等于目标已达成）")
+        _实现 = [t for t in (planned.get("tasks") or [])
+                 if isinstance(t, dict) and t.get("kind") == "errand"]
+        if not _实现:
+            return (False, "父目标不闭合：计划里**没有任何实现任务（errand）** ⇒ "
+                           "档案声明了 goal 却没有可执行的判据门（gates 空），"
+                           "计划器编不出实现 ⇒ 拒发。请在档案里写 gates（目标仓自己的验收命令）")
+        return (False, "父目标不闭合，但计划器**没给出未覆盖清单**（uncovered 为空）"
+                       " ⇒ 无法定位缺口；请检查 plan_tasks 是否带了 closed/uncovered 字段")
+    return (True, "")
+
+
+def _父目标闭合闸(cwd: Path | str) -> str:
+    """从目标仓档案里读 `goal` / `plan`，机验父目标闭合；返回拒因（空串 = 放行）。
+
+    ★★★ R259（2026-11-05）：**优先级从"档案里有写"这个偶然事实，改成"档案自己声明的口径"。**
+
+    上一版的漏洞（我立刻发现的）：它只要看到 `plan:` 就要求闭合，
+    **而没写 `plan` 的档案一律放行** ⇒ "没声明"变成了一条**绕过纪律的后门**。
+    真实档案（如 `_crossrepo_case02/orchestrator.profile.yml`）根本没有 `plan` 字段。
+
+    ⇒ 现在三档，按档案**自己**写的来：
+      · 档案写了 `plan`（结构化计划）⇒ 直接用；
+      · 否则档案有 `goal` + `acceptance` ⇒ **现场用 `auto_goal.plan_tasks` 机编计划**再验闭合；
+      · 两者都没有 ⇒ 档案**没声明目标**（不是"声明了又没闭合"）⇒ 放行，老路径零回退。
+
+    口径：**只要档案声明了"目标要达成什么"，就必须证明实现任务全被验收覆盖**；
+      什么都没声明才放行 —— 放行的是"没有目标"，不是"目标没闭合"。
+    """
+    try:
+        根 = Path(cwd)
+        for 名 in ("orchestrator.profile.yml", "orchestrator.profile.yaml",
+                   ".orchestrator/profile.yml"):
+            f = 根 / 名
+            if not f.is_file():
+                continue
+            txt = f.read_text(encoding="utf-8", errors="replace")
+            需要 = ("plan:" in txt) or ("goal:" in txt)
+            if not 需要:
+                return ""
+            try:
+                import yaml as _y
+            except Exception:                      # noqa: BLE001
+                return "档案声明了目标/计划，但本机无 yaml 解析器 ⇒ 无法机验闭合，拒跑（不冒充验过）"
+            档 = _y.safe_load(txt) or {}
+            plan = 档.get("plan")
+            if plan is None:
+                # ★ 从 `goal` + 档案的 `gates`/`acceptance` 现场编计划（机器计划器，不调模型）
+                _g = 档.get("goal")
+                if not _g:
+                    return ""
+                规 = {"name": str(_g)[:80],
+                      "pre": list(档.get("pre") or ["工程仓已就位"]),
+                      "constraints": list(档.get("constraints") or []),
+                      "gates": [dict(x) for x in (档.get("gates") or [])
+                                if isinstance(x, dict) and x.get("type")],
+                      "acceptance": list(档.get("acceptance") or ["档案声明的判据门全绿"])}
+                try:
+                    from agentscope_orchestrator import auto_goal as _ag
+                    plan = _ag.plan_tasks(规)
+                except Exception as _e2:           # noqa: BLE001
+                    return (f"档案声明了 goal，但机器计划器编不出合法计划，拒跑"
+                            f"（**不冒充验过**）：{type(_e2).__name__}: {_e2}")
+            好, 因 = accept_closed(plan if isinstance(plan, dict) else {})
+            return "" if 好 else 因
+        return ""
+    except Exception as _e:                        # noqa: BLE001
+        # 闸自己坏了：**拒跑**（宁可不动，也不要在"不知道闭不闭合"的树上开跑）
+        return f"父目标闭合闸自身异常，拒跑：{type(_e).__name__}: {_e}"
+
+
 def _active_count() -> int:
     """在跑任务数 = 仍有存活 runner 的。孤儿 running（死进程遗留）不计。"""
     return sum(1 for r in _runners.values() if not r.done())
@@ -668,8 +807,17 @@ def _start_job(job_id: str, resume: dict[int, dict] | None = None) -> None:
     j = _jobs[job_id]
 
     def _make_coro():
+        # ★ R551：**所有协程必须惰性建**。
+        #   原来这里直接 `_有槽开跑(job_id, _run_errand(job_id))`：实参 `_run_errand(...)`
+        #   在本行被求值时就建好了。而 `_submit_coro` → `_ensure_loop()` 一旦起不来，
+        #   这个内层协程就没人 await ⇒ Python 只留一行
+        #       RuntimeWarning: coroutine '_run_errand' was never awaited
+        #   **退出码仍是 0、门也抓不住**（本项目最忌的那类：没做成被降级成一行没人看的警告）。
+        #   ⇒ 先返回一层空壳，真协程等空壳**开始运行**时才建；空壳不被 await 就什么都不存在。
+        async def _惰性(工厂):
+            return await 工厂()
         if j.get("kind") == "engine":
-            return _有槽开跑(job_id, _run_errand(job_id))
+            return _惰性(lambda: _有槽开跑(job_id, _run_errand(job_id)))
         task = rt.TaskSpec(id=job_id, unit_id=j["unit_id"], module=j["module"],
                            theorem=j["theorem"],
                            statement_marker=j["statement_marker"],
@@ -677,12 +825,27 @@ def _start_job(job_id: str, resume: dict[int, dict] | None = None) -> None:
                            min_pass=j["min_pass"], n_windows=j["n_windows"],
                            gates=j.get("gates"))
         task.promote = j.get("promote", False)
-        return _有槽开跑(job_id, _run_job(job_id, task, j.get("channel", ""),
-                                       j.get("dry", False), resume=resume))
+        return _惰性(lambda: _有槽开跑(job_id, _run_job(job_id, task, j.get("channel", ""),
+                              j.get("dry", False), resume=resume)))
 
+    # ★ R551（calib 复核时抓到）：`_submit_coro` 里 `_ensure_loop()` 一旦起不来，
+    #   `_make_coro()` 造出来的协程就**没人消费** ⇒ Python 只报一行
+    #       RuntimeWarning: coroutine '_run_errand' was never awaited
+    #   而**退出码仍是 0、门也抓不住**。这正是本项目一直在打的那一类：
+    #   「没做成」被降级成「一行没人看的警告」。
+    #   ⇒ 失败路径显式 close()：把「没跑」变成可见的（下面还有回滚 + 落库 + error 日志）。
+    #   ★ 交付后已 consume 的协程不要 close（交给 Task/threadsafe 管）。
+    _待跑协程 = None
     try:
-        runner = _submit_coro(_make_coro())
+        _待跑协程 = _make_coro()
+        runner = _submit_coro(_待跑协程)
+        _待跑协程 = None                      # 已被 consume，交给 _runners 管
     except RuntimeError as exc:
+        if _待跑协程 is not None:
+            try:
+                _待跑协程.close()
+            except Exception:                 # noqa: BLE001 关不掉也不许影响回滚
+                pass
         # 连兜底循环都起不来：拒绝派发，回滚状态，绝不留孤儿 running
         j["state"] = "error"
         j["error"] = (f"派发失败（{exc}）：当前上下文无事件循环，任务未启动。"
@@ -772,7 +935,8 @@ def _仓指纹(根: Path, 上限文件: int = 20000) -> dict:
             if len(项) >= 上限文件:
                 break
             try:
-                if not p.is_file() or any(part in _跳过目录 for part in p.parts):
+                if not p.is_file() or any(part in _跳过目录
+                                          for part in p.relative_to(根).parts):
                     continue
                 st = p.stat()
                 项[str(p.relative_to(根)).replace("\\", "/")] = (int(st.st_size), int(st.st_mtime))
@@ -1102,6 +1266,16 @@ def run_errand(unit_id: str, cmd: list[str], cwd: str, gates: list[dict],
         return json.dumps({"ok": False,
                            "error": "命令安全闸拒绝：" + "；".join(_vio[:4]),
                            "violations": _vio}, ensure_ascii=False)
+    # ★★★★★ R257（2026-11-05 · 父目标闭合闸**真正接进提交路径**）：
+    #   上一轮我加了 `accept_closed()`，但**没有调用点** —— 那仍然只是"打印了一份真相"。
+    #   现在接在**提交这一刻**：`orchestrator.profile.yml`（或档案里的目标规约）若声明了
+    #   `plan`（= auto_goal.plan_tasks 的结果），本函数**先机验父目标闭合**，不闭合直接拒跑。
+    #   ★ 零回退：没声明 `plan` 的目标**完全不受影响**（老路径照旧），
+    #     但一旦声明了，就**必须**闭合 —— 声明了纪律却允许绕过，等于没有纪律。
+    _闭拒 = _父目标闭合闸(cwd_res)
+    if _闭拒:
+        return json.dumps({"ok": False, "error": _闭拒, "refuse": "parent_goal_not_closed"},
+                          ensure_ascii=False)
     prio = max(0, int(priority) if isinstance(priority, int) else 0)
     deps = list(depends_on or [])
     for d in deps:
@@ -1788,7 +1962,8 @@ def auto_submit(limit: int = 1, min_pass: int = 2, n_windows: int = 3,
 def search_docs(kw: str = "", kind: str = "", limit: int = 20) -> str:
     """查外置文档索引（「模型自己建立索引、按需查看」的入口）。
 
-    kw 子串匹配标题/类别/meta；kind 过滤（chain=推理链/note=说明/tasks=任务列表）。
+    kw 子串匹配标题/类别/meta/**摘录**；元数据没命中时**兜底扫正文**（实测 13.6 MB 全扫 0.42 秒）⇒ 按主题也查得到。
+    kind 过滤（chain=推理链/note=说明/tasks=任务列表）。
     只返回条目标签（doc_id/字节/摘录），全文用 read_doc 按需拉取——
     聊天窗口只留记录、不载大载荷，防 DSH 会话卡死。"""
     rows = ds.search_docs(kw=kw or None, kind=kind or None, limit=limit)
@@ -1884,9 +2059,751 @@ def auto_goal(goal_json: str) -> str:
             "依赖闸": "编排器 _dep_state 只认 promoted（staged=未落地，不放行下游）",
             "失败语义": "任一段红 ⇒ 该段不 promoted ⇒ 下游自动判 error（不放行）",
         }
+        # ★★★★★ R274（2026-11-05 真读数）：**"照 topo 顺序提交"这句话，此前没有人能执行。**
+        #   真读数：`plan_to_submissions` 上一轮加完，调用方只有它自己的自检——
+        #     全仓 grep 只有 `def plan_to_submissions` 和一处 `_s273 = ...`（齿里）。
+        #   而本工具的文档写着"调用方照 topo 顺序逐个提交"，
+        #   **却只给出计划内 tid、不给可提交清单** ⇒ 调用方得自己再实现一遍翻译，
+        #   而"自己再实现一遍"就是 R273 里 `tid`/`kind` 丢失的那条老路。
+        #   ⇒ 计划器**直接给出可提交清单**，把 tid→kind→gates→依赖 全带上，
+        #     调用方只剩一件事：把 `depends_on_plan` 换成真 job id 然后提交。
+        #   ★ 这是**加法**：原有字段一个不动，老调用方零回退。
+        plan["submissions"] = ag.plan_to_submissions(plan)
+        plan["可执行性"] = {
+            "可运行项": [s["tid"] for s in plan["submissions"] if s.get("will_run")],
+            "汇总点": [s["tid"] for s in plan["submissions"] if not s.get("will_run")],
+            "说明": ("`submissions` 已按 topo 序排好；`will_run=True` 的才需要真提交，"
+                    "汇总点只等依赖。`depends_on_plan` 是计划内 tid，"
+                    "提交时换成真 job id 填进 depends_on。"),
+        }
         return json.dumps(plan, ensure_ascii=False, indent=2)
     except ValueError as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool(name=_TOOL("run_goal"))
+def run_goal(goal_json: str, cwd: str) -> str:
+    """按目标树清单**无人值守裁决**：逐段跑目标仓自己的判据门，汇总父目标是否达成。
+
+    ★★★★★ R275：为什么必须有这个工具（真读数，2026-11-05）：
+      · `auto_goal` 能给出 `submissions`（可提交清单，带 tid/kind/gates/依赖）；
+      · 但全仓**没有任何东西按它执行**：`develop.py` 是从 audit/observation
+        抽 Gap 再派模型修的"修坏链"，它把 `auto_goal.py` 当**自检目标**，
+        完全不认识 topo/submissions；
+      · R274 的真跑驱动是我**手写的一次性脚本**，跑完就删了。
+      ⇒ 「一段驱动不了的接线等于没有接线」；同理 **一次性的驱动脚本也不等于产品**。
+
+    本工具做的事：`goal_json` → 机器计划 → 按 topo 序逐段求值目标仓自己的门 →
+    逐段裁决 + 父目标是否达成 + 未达成时**点名到段和门**。
+
+    ★ 它**不派模型、不改码**：段的内容由调用方（模型/人）产出；
+      它只回答"这些段现在到底绿没绿、整体达成没达成"。
+    ★ 级联语义：某段红 ⇒ 依赖它的段**跳过**（不假装绿）；
+      约束段红 ⇒ 下游全停（边界被踩了就不要再往前做）。
+    ★ 空判据不许当绿：会跑的段如果一条门都没有 ⇒ 判「拒跑」。
+    """
+    try:
+        规 = json.loads(goal_json)
+    except ValueError as e:
+        return json.dumps({"ok": False, "error": f"goal_json 不是合法 JSON：{e}"},
+                          ensure_ascii=False)
+    根 = Path(cwd or ".").resolve()
+    if not 根.is_dir():
+        return json.dumps({"ok": False, "error": f"cwd 不是目录：{cwd}"}, ensure_ascii=False)
+    try:
+        计划 = ag.plan_tasks(规)
+    except ValueError as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+    好, 因 = accept_closed(计划)
+    if not 好:
+        return json.dumps({"ok": False, "error": 因, "refuse": "parent_goal_not_closed"},
+                          ensure_ascii=False)
+    果 = gr.run_plan(计划, 根)
+    果["计划摘要"] = {"closed": 计划.get("closed"), "topo": 计划.get("topo"),
+                      "可运行项": [s["tid"] for s in ag.plan_to_submissions(计划)
+                                   if s.get("will_run")]}
+    果["cwd"] = str(根)
+    return json.dumps(果, ensure_ascii=False, indent=2)
+
+
+@mcp.tool(name=_TOOL("close_goal"))
+def close_goal(goal_json: str, cwd: str, adopted_json: str = "",
+               源码根: str = "") -> str:
+    """**闭环一次调用**：规划 → 裁决 → 定位改动面 → （有改码输入才）应用 → 复验。
+
+    ★★★★★ R277：为什么必须有这个工具（真读数，2026-11-06）：
+      `close_loop.close_loop()` 上一轮做完了，但**调用方只有它自己的注释** ——
+      全仓 grep 只有 `def close_loop` 和它内部的自我引用。
+      按本项目自己的口径「一段驱动不了的接线等于没有接线」，
+      一个没有调用方的函数**同样等于没有接线**。
+
+    和 `run_goal` 的分工：
+      · `run_goal`  只**裁决**（跑目标仓自己的门，回答"现在达成没达成"）；
+      · `close_goal` 裁决 + **定位改动面** + 可选**应用改码** + **复验**。
+
+    参数：
+      goal_json    : 同 `auto_goal`（name/pre/constraints/gates/acceptance）
+      cwd          : 目标仓根
+      adopted_json : `{"相对路径": "新全文", ...}` —— **模型产出的改码**。
+                     留空 ⇒ 只跑到"定位"并报 `blocked_on_model`
+                     （**这不是失败，是"还没有改码输入"**）
+      源码根       : 逗号分隔的改动面搜索根（默认自动探测 src/lib/app/pkg）
+
+    ★ 诚实边界：
+      · 留空 `adopted_json` 时，回执**只证明裁决与定位是通的**，不证明目标能达成；
+      · 会写盘：改码落在 `cwd` 指向的仓里，且**只改改动面内的文件**；
+        复验不绿 ⇒ **整批回滚**（有备份），回执里 `应用.回退` 会列出来；
+      · 本工具**不派模型**。改码内容必须由调用方提供。
+    """
+    try:
+        规 = json.loads(goal_json)
+    except ValueError as e:
+        return json.dumps({"ok": False, "error": f"goal_json 不是合法 JSON：{e}"},
+                          ensure_ascii=False)
+    改码 = {}
+    if adopted_json.strip():
+        try:
+            改码 = json.loads(adopted_json)
+        except ValueError as e:
+            return json.dumps({"ok": False,
+                               "error": f"adopted_json 不是合法 JSON：{e}"},
+                              ensure_ascii=False)
+        if not isinstance(改码, dict):
+            return json.dumps({"ok": False,
+                               "error": "adopted_json 必须是 {相对路径: 新全文} 对象"},
+                              ensure_ascii=False)
+    根 = Path(cwd or ".").resolve()
+    if not 根.is_dir():
+        return json.dumps({"ok": False, "error": f"cwd 不是目录：{cwd}"},
+                          ensure_ascii=False)
+    try:
+        计划 = ag.plan_tasks(规)
+    except ValueError as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+    好, 因 = accept_closed(计划)
+    if not 好:
+        return json.dumps({"ok": False, "error": 因, "refuse": "parent_goal_not_closed"},
+                          ensure_ascii=False)
+    _根们 = [x.strip() for x in 源码根.split(",") if x.strip()] or None
+    try:
+        果 = cl.close_loop(计划, 根, adopted=改码 or None, 源码根=_根们)
+    except Exception as e:                          # noqa: BLE001
+        return json.dumps({"ok": False,
+                           "error": f"闭环自身异常：{type(e).__name__}: {e}"},
+                          ensure_ascii=False)
+    果["cwd"] = str(根)
+    果["有没有改码输入"] = bool(改码)
+    # ★★★★★ R283（真读数，2026-11-07）：**未达成时不给出口，调用方就只能猜。**
+    #   实测：只给 `a.py` 的改码时，本工具如实返回
+    #     ok=False · 应用.保留=['src/a.py'] · 阶段=复验
+    #   —— 账是准的（没把半成品当成功）。但调用方看到 `ok=False` 会卡住：
+    #     ① 是"该再给一批改码"？② 还是"我这条路过时了，该换 drive_goal"？
+    #     ③ 还是"根本没有可改的了"？
+    #   三种情形**下一步完全不同**，不给出口等于把判断甩给调用方。
+    #   ⇒ 本工具**只跑一轮**（`close_loop` 不迭代），这是它和 `drive_goal` 的分工：
+    #     · `close_goal` = 你给改码，我应用+复验（**一轮**，你可自己套循环）
+    #     · `drive_goal` = 我调模型产改码，**迭代到达成或抛锚**
+    #   所以 `未达成` 时的出口只有两条，工具必须说清是哪一条。
+    if not 果.get("ok"):
+        # ★ R283b（真读数）：**又读错了层、又猜错了键名。**
+        #   我第一版写 `果.get("段")` —— 而 `close_loop` 返回的顶层**没有** `段`，
+        #   真正的段在 `果["复验"]["段"]` 里（复验才是 run_plan 的结果）。
+        #   于是 `_剩` 恒为空 ⇒ 走进"未达成但没有红段"的兜底 ⇒ **报了假警报**。
+        #   顺带键名也猜错了：段的标识是 `tid` 不是 `id`（`run_plan` 文档写的是
+        #   `{"tid","kind","状态","门","理由"}`）—— **不要猜数据的形状，去读它的生产者。**
+        #   ★ 这已经是**同一类错第 4 次**（R280e 读错层、R281c 猜常量值、
+        #     R282b/c 判据少读一个字段，现在是读错层+猜键名）。
+        #   ⇒ 一律**先问生产者**：段在 `复验` 里，键是 `tid`/`状态`。
+        _复 = 果.get("复验") or {}
+        _剩 = [x for x in (_复.get("段") or [])
+                if x.get("状态") in ("红", "拒跑", "异常")]
+        if 果.get("blocked_on_model"):
+            果["下一步"] = ("没有改码输入 ⇒ 给 `adopted_json` 再来一次，"
+                          "或直接用 `drive_goal`（它会自己调模型产改码并迭代）。")
+        elif _剩:
+            果["未达成的段"] = [{"tid": x.get("tid"), "状态": x.get("状态")}
+                              for x in _剩]
+            果["下一步"] = (
+                f"**只跑了一轮**，还剩 {len(_剩)} 段没绿"
+                f"（{[x.get('tid') for x in _剩]}）。两条路："
+                "①再调 `close_goal` 并给上批**未达成段**的新改码（自己套循环）；"
+                "②改用 `drive_goal`（它迭代到底，你只管给目标和预算）。"
+                "★ 已保留的改动**已在主树里**，不必重做。")
+        else:
+            果["下一步"] = "未达成但没有红段（门没过却没报红）——把回执原文发我看，这本身是个缺陷。"
+    果["入口分工"] = ("close_goal=你给改码，我只跑一轮（应用+复验）；"
+                    "drive_goal=我调模型产改码并迭代。两者都会真落主树。")
+    return json.dumps(果, ensure_ascii=False, indent=2)
+
+
+@mcp.tool(name=_TOOL("drive_goal"))
+def drive_goal(goal_json: str, cwd: str, max_rounds: int = 3,
+               channel: str = "", 源码根: str = "", force: bool = False) -> str:
+    """**无人值守驱动一个工程目标**：迭代「模型产改码 → 机器判据门裁决」直到达成或抛锚。
+
+    ★★★★★ R279：这是整条链的收口工具（真读数，2026-11-06）：
+      前几轮把各段都做出来了，但"产出改码"这一半**仍然是人**——
+      `goal_iterate.iterate(改码=...)` 的改码是个回调占位，我只能用测试脚本里
+      手写的函数喂它。⇒ 本工具把这一半接上**真模型**，形成闭环：
+        `auto_goal`（规划）→ `goal_iterate`（迭代）→ `model_coder`（模型产整文件）
+        → `close_loop` + `gate_spec`（**机器门裁决**，绿保/回退）→ 下一轮
+
+    ★ 三条硬纪律（都是真事故换来的，写进这里免得以后又被绕过）：
+      1. **模型不给自己发合格证**：模型只产 `{相对路径: 完整新全文}`，
+         落不落盘、留不留，全由机器判据门决定；
+      2. **只许改改动面内的文件**：改动面由机器算出（失败栈 + 门声明），
+         模型返回越界文件（如 `tests/`）一律**拒收并如实列出**；
+      3. **拿不到可用产物就如实说**：通道全死 / 返回不是完整文件 ⇒ 报
+         `blocked_on_model`，**不许把"没拿到"说成"改完了"**。
+
+    参数：
+      max_rounds : 预算护栏（1..8）。打转会**提前**停，不跑满。
+      channel    : 通道名；空 = 全通道轮转（单通道故障可降级）。
+      源码根     : 逗号分隔，改动面搜索根（默认自动探测）。
+      force      : ★ R282：默认 False。开工前会**自体检**；若「没有一个确认活的通道、
+                   只剩读不到的槽」，默认**不开工**（写 20 个文件也大概率一个都拿不到），
+                   直接回 `拒跑=no_live_channel_before_start` 并给出该谁动手。
+                   只有你明确知道"那个槽只是慢、其实能用"时才 force=True。
+                   全硬死（缺 key / 无权访问）时 force 也不许 —— 那重试毫无意义。
+
+    ★ 会写盘：改动落在 `cwd` 指向的仓里；每轮失败的改动**逐文件回退**
+      （使红段数减少的保留，没变好的回滚）。最终 `ok` 严格由「目标仓自己的门全绿」决定。
+    """
+    try:
+        规 = json.loads(goal_json)
+    except ValueError as e:
+        return json.dumps({"ok": False, "error": f"goal_json 不是合法 JSON：{e}"},
+                          ensure_ascii=False)
+    根 = Path(cwd or ".").resolve()
+    if not 根.is_dir():
+        return json.dumps({"ok": False, "error": f"cwd 不是目录：{cwd}"},
+                          ensure_ascii=False)
+    try:
+        计划 = ag.plan_tasks(规)
+    except ValueError as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+    好, 因 = accept_closed(计划)
+    if not 好:
+        return json.dumps({"ok": False, "error": 因, "refuse": "parent_goal_not_closed"},
+                          ensure_ascii=False)
+    # ★★★★★ R282（真读数，2026-11-07）：**需要调用方记得做的步骤，等于没做。**
+    #   上一轮做出了 `doctor_channels`，但它是**另一个工具** —— 调用方很容易
+    #   忘了先体检就直接 `drive_goal`，然后**跑到一半**才没通道：
+    #   前几个文件白改，回执里只有一句"阻塞"。
+    #   ⇒ 开工前自己先体检，**没通道就别开工**。而且不许只说"没通道"：
+    #     要把「哪种死法、责任在谁、该做什么」一起给出（这才是能动手的信息）。
+    #   ★ 边界（诚实）：这**不保证**模型改得对；它只保证"有通道可派、且理由说清"。
+    体检 = None
+    try:
+        体检 = cd.体检(channel or "")
+    except Exception as e:                          # noqa: BLE001
+        体检 = {"可开工": False, "档": "体检失败",
+                "结论": f"体检自身异常：{type(e).__name__}: {e}",
+                "可交给router": [], "汇总": {}, "逐通道": []}
+    # ★ R282b（我自己抓的）：**判据选错了依据。**
+    #   第一版用 `体检.get("能开工")` 做闸 —— 而实测本机是
+    #     `能开工=True`（qww 是 unreadable，按 R18 仍交给 Router 试）、
+    #     `可开工=False`（没有一个确认活的通道）
+    #   ⇒ 闸**形同虚设**，照样往下派模型、照样跑到超时。
+    #   ⇒ 这是「手里那个量不是判据需要的那个量」的第 N 次现场：
+    #     "能开工"回答的是"还有没有槽可以试"，而这里要问的是
+    #     **"这一趟值不值得开工"**。
+    #   口径（三档，各自对应不同动作）：
+    #     · `可开工` 有确认活的通道      → 正常开工
+    #     · `仅剩未确认的槽`              → **默认不开工**（写了 20 个文件也大概率
+    #        一个都拿不到），但调用方可以显式 `force=True` 逼它试一次
+    #     · `无通道可用`（全硬死）        → 直接拒跑，force 也不许
+    # ★ R282c（真读数）：**闸要按"能不能派"判断，不是按档名字符串。**
+    #   实测 `channel="不存在的通道__r282"` 时，`体检` 返回
+    #     {"档": None, "能开工": False, "error": "ValueError: 未知频道 …"}
+    #   而我的闸只比 `_档 == "无通道可用"` ⇒ None 不等于它 ⇒ **放行** ⇒
+    #   照样往下派模型跑到超时。
+    #   ⇒ 同一个病（判据只看自己认识的那个值）：**答案在 `能开工` 上，我却去比档名。**
+    #   口径：`能开工` 是硬否决（连配置都读不出来、或全硬死），
+    #         `仅剩未确认的槽` 是软否决（可 force 绕过）。
+    _档 = 体检.get("档")
+    _能开工 = bool(体检.get("能开工"))
+    if (not _能开工) or (_档 == "仅剩未确认的槽" and not force):
+        return json.dumps({
+            "ok": False,
+            "停因": "开工前体检查出无通道可用",
+            "blocked_on_model": True,
+            "用了几轮": 0,
+            "体检": {"档": 体检.get("档"), "结论": 体检.get("结论"),
+                     "汇总": 体检.get("汇总"), "摘要": cd.体检摘要(体检)},
+            "拒跑": ("no_channel_before_start"
+                    if (_档 == "无通道可用" or not _能开工)
+                    else "no_live_channel_before_start"),
+            "诚实边界": ("**一个文件都没改，仓保持原状。**"
+                      "这不是'试过了没成'，是'开工前就知道派不出模型'。"
+                      "按「该做什么」那一栏动手后再调。"),
+        }, ensure_ascii=False, indent=2)
+
+    日志: list[str] = []
+    改码 = mc.模型改码器(计划, 通道=channel,
+                       日志=lambda m: 日志.append(str(m)))
+    _根们 = [x.strip() for x in 源码根.split(",") if x.strip()] or None
+    try:
+        果 = gi.iterate(计划, 根, 改码=改码,
+                        max_rounds=max(1, min(int(max_rounds), 8)), 源码根=_根们)
+    except Exception as e:                          # noqa: BLE001
+        return json.dumps({"ok": False,
+                           "error": f"驱动自身异常：{type(e).__name__}: {e}"},
+                          ensure_ascii=False)
+    果["cwd"] = str(根)
+    果["通道"] = channel or "（全通道轮转）"
+    果["模型日志"] = 日志
+    果["开工前体检"] = {"档": 体检.get("档"), "摘要": cd.体检摘要(体检)}
+    # ★★★★★ R285（真读数，2026-11-07）：**达成时应当自带证据，而不是让调用方再验一遍。**
+    #   前几轮把可重复性做成了机器可判的（repeatability，真 cargo 连跑 3 轮），
+    #   但它当时**只有我手调过**——调用方拿到 ok=True 仍然不知道
+    #   "这台机器侧到底可不可重复"。
+    #   ⇒ 达成时顺手跑一次机器侧自证，把结论直接放进回执。
+    #   ★ 边界（诚实，必须写）：这个自证用的是**本仓内置的 rust 小样本**，
+    #     证明的是**机器侧链路（定位→应用→复跑）可重复**，
+    #     **不**证明"你这个目标被重复执行也会一致"——那要重跑你的目标才行，
+    #     而重跑你的目标可能很贵，所以这里不擅自做。
+    if 果.get("ok"):
+        try:
+            _证 = rpt.多文件可重复(轮数=3)
+            果["机器侧自证"] = {
+                "ok": _证.get("ok"), "测了没": _证.get("测了没"),
+                "结论": _证.get("结论"),
+                "适用边界": ("证明**机器侧链路**（定位→应用→独立复跑）可重复；"
+                          "**不**证明你这个目标重复执行也一致。"
+                          "要后者请重跑本工具并比对回执。"),
+            }
+        except Exception as e:                       # noqa: BLE001
+            果["机器侧自证"] = {"ok": False, "测了没": False,
+                              "结论": f"自证自身异常：{type(e).__name__}: {e}",
+                              "适用边界": "异常 ≠ 不可重复；这是没测到。"}
+    return json.dumps(果, ensure_ascii=False, indent=2)
+
+
+@mcp.tool(name=_TOOL("build_project_graph"))
+def build_project_graph(repo: str, 上限文件数: int = 0, 存到: str = "") -> str:
+    """**给一个文件夹，自动建这个项目的知识图谱**（定理/引理/定义/文档/函数）。
+
+    ★★★★★ R296：为什么必须有它（用户当面指出的根本缺陷，2026-11-06）：
+      「一个数据库有功能，但是不能存任何数据、不能查任何数据，有什么意义？」
+      「没有自动构建的过程，就等于数据从来不入系统内部。」
+      「换一个项目就要重新手写？那有啥意义？」
+
+      改之前的真读数：
+        · 编排器的索引根是 `products/docs` —— **只索引它自己产出的回执**；
+        · 项目本体（`形式化验证/` 下 22,839 个 .lean、224 MB）**从未入索引**；
+        · `search_docs("密码")` → 0 条、`search_docs("theorem")` → 0 条，
+          而 `auto_scan` 明明数得出 4 万条形式化单元。
+      ⇒ **「数得出来」不等于「进得了系统」；「索引里有」不等于「查得到」。**
+
+    ★ 口径三条：
+      ① **机械优先、绝不漏**：theorem/lemma/def/structure、文档标题、代码签名
+         全用正则抽，**不调模型**；
+      ② **语义可降级**：模型不可用时构建照样完成，语义字段标 `未测到`；
+      ③ **覆盖度必须报数**：发现/已解析/跳过/读不了各多少，逐条可查。
+
+    repo: 项目根（绝对路径）。0 上限 = 全量。
+    真读数（`形式化验证/`，本机）：25,755 文件 → **535,478 单元**
+      theorem 385,921 / def 94,909 / instance 22,466 / doc 10,889 /
+      structure 7,881 / abbrev 7,304 / class 3,804 / func 1,604 / axiom 544
+      覆盖率 96.49%（读不了 0，解析失败 251）
+    """
+    import json as _json
+    try:
+        from . import project_graph as _pg296
+    except Exception as e:                      # noqa: BLE001
+        return _json.dumps({"ok": False, "错": f"模块不可用：{e}"}, ensure_ascii=False)
+    果 = _pg296.构建(repo, 上限文件数=int(上限文件数 or 0))
+    if not 果.get("ok"):
+        return _json.dumps(果, ensure_ascii=False)
+    # ★ R297：「建完了没有」必须有标准，不能只给一个覆盖率数字
+    判 = _pg296.构建完毕判定(果)
+    果["建完判定"] = 判
+    到 = 存到 or str(__import__("pathlib").Path(repo).resolve().parent
+                     / "_project_graph.json")
+    存 = _pg296.存(果, 到)
+    return _json.dumps({
+        "ok": True, "根": 果["根"], "耗时秒": 果["耗时秒"],
+        "读数": 果["读数"], "覆盖": 果["覆盖"], "语义": 果["语义"],
+        "建完判定": 判,
+        "失败分诊": _pg296.失败分诊(果, repo),
+        "已存": 存,
+        "下一步": f"用 query_project_graph(图谱={到}, 关键词=...) 查",
+    }, ensure_ascii=False)
+
+
+@mcp.tool(name=_TOOL("graph_completeness"))
+def graph_completeness(图谱: str, 主主题词: str = "") -> str:
+    """**「这个项目的知识图谱建完了没有」—— 四道门，机器判定。**
+
+    ★★★★★ R297：用户问（2026-11-06）：「知识图谱怎么算全局构建完毕？有没有标准？」
+
+      改之前只有一个 `覆盖率: 0.9649` —— **它说明不了"建完了没有"**：
+        · 96.49% 听起来高，但那 3.51% 里有没有整类文件？看不出；
+        · 251 个"解析失败"里，是**不需要索引的锁文件**，还是**我解析器漏了**？分不出。
+
+      ⇒ 定四道门，**全过才算建完**：
+        门1 无遗漏解释 —— 每个没进图的文件都要有可归类原因（"不认识的类型"不算）
+        门2 无解析崩溃 —— 解析器崩了必须 0（崩了是我写错，不是文件的问题）
+        门3 关键类型齐备 —— 项目里实际存在的语言类，每类都必须抽出了单元
+        门4 可回答 —— 给定主主题词必须查得到（图建了但查不到 = 没建）
+
+      真读数（`形式化验证/`，本机）：四道门全过，**完毕=True**，
+      解析失败 **0**、分诊 `{'不需要索引': 20, '补解析器': 0, '问模型': 0, '人工看': 0}`。
+
+    ★ 覆盖率**不是**判定标准，只作参考 —— 结果里明写这一条。
+    主主题词: 逗号分隔，如 "密码学,自主认知,结构本能"（给了才测门4）
+    """
+    import json as _json
+    try:
+        from . import project_graph as _pg296
+    except Exception as e:                      # noqa: BLE001
+        return _json.dumps({"ok": False, "错": f"模块不可用：{e}"}, ensure_ascii=False)
+    图 = _pg296.载(图谱)
+    if not 图:
+        return _json.dumps({"ok": False, "错": f"图谱载不进来：{图谱}"},
+                           ensure_ascii=False)
+    词 = [w.strip() for w in (主主题词 or "").replace("，", ",").split(",") if w.strip()]
+    return _json.dumps(_pg296.构建完毕判定(图, 主主题词=词 or None),
+                       ensure_ascii=False)
+
+
+@mcp.tool(name=_TOOL("graph_triage"))
+def graph_triage(图谱: str, repo: str) -> str:
+    """**没进图谱的文件要分诊**：不需要索引 / 补解析器 / 问模型 / 人工看。
+
+    ★ R297：用户问「解析失败的为什么不会调用模型查？」
+
+      答：**因为大部分失败根本不该问模型。**
+        · `.lock.json` / `lakefile.toml` —— 不是知识载体，模型也只会说"这是锁文件"；
+        · 解析器漏了一个语言 —— **补解析器**，问模型是浪费且结果不可复用；
+        · 只有**未知格式**才该问模型。
+
+      这条口径的来历是真事故：改之前分诊把 `.lean.bak726`（备份）判进"问模型"10 个
+      —— 问模型看一份旧版快照讲了什么，纯属浪费，入图还会污染。
+
+    真读数（`形式化验证/`）：`{'不需要索引': 20, '补解析器': 0, '问模型': 0, '人工看': 0}`
+    即 **本地不需要任何模型介入**（"问模型 0" 是因为没有真需要语义的文件，
+    不是"不需要模型"这个能力）。
+    """
+    import json as _json
+    try:
+        from . import project_graph as _pg296
+    except Exception as e:                      # noqa: BLE001
+        return _json.dumps({"ok": False, "错": f"模块不可用：{e}"}, ensure_ascii=False)
+    图 = _pg296.载(图谱)
+    if not 图:
+        return _json.dumps({"ok": False, "错": f"图谱载不进来：{图谱}"},
+                           ensure_ascii=False)
+    return _json.dumps(_pg296.失败分诊(图, repo), ensure_ascii=False)
+
+
+@mcp.tool(name=_TOOL("query_project_graph"))
+def query_project_graph(图谱: str, 关键词: str, 种类: str = "", 上限: int = 20) -> str:
+    """**在已建好的项目知识图谱上查**（不再遍历目录）。
+
+    ★ R296：这是"这个产品有没有用"的那个出口。
+      真读数（本机，`形式化验证/` 全量图谱）：
+        · 查「密码学」→ **373 条定理**（`rsa_factorization`、`cryptanalysis_instant`…）
+        · 查「自主认知」→ **184 条定理**（`const_rule_no_reuse`…，其中带确认结论）
+        · 查「结构本能」→ **42 条定理**
+        · 多词 OR：「记忆 网络 遗忘」→ 1,352 条
+      ★ 而改之前这些查询**全部返回 0**。
+
+    ★ 0 命中必须先分清「真没有」与「我没索引到」：
+      结果里带 `覆盖`；覆盖率 < 1 或有「读不了」时，0 命中可能是后一种。
+
+    图谱: `build_project_graph` 返回的 `已存.路径`。
+    种类: theorem / def / doc / func / structure / instance / axiom…（空=全部）
+    """
+    import json as _json
+    try:
+        from . import project_graph as _pg296
+    except Exception as e:                      # noqa: BLE001
+        return _json.dumps({"ok": False, "错": f"模块不可用：{e}"}, ensure_ascii=False)
+    图 = _pg296.载(图谱)
+    if not 图:
+        return _json.dumps({"ok": False,
+                            "错": f"图谱载不进来：{图谱}（先跑 build_project_graph）"},
+                           ensure_ascii=False)
+    果 = _pg296.查(图, 关键词, 种类=种类, 上限=int(上限))
+    果["图谱根"] = 图.get("根")
+    果["覆盖"] = 图.get("覆盖")
+    return _json.dumps(果, ensure_ascii=False)
+
+
+@mcp.tool(name=_TOOL("reverse_lookup"))
+def reverse_lookup(图谱: str, 名字: str) -> str:
+    """**反查**：这个名字定义在哪、被谁用到过。
+
+    ★ R296：这是"图"相对于"文件搜索"的独占价值 ——
+      文件系统只能回答"哪里出现这个词"，图能回答"谁依赖它"。
+    """
+    import json as _json
+    try:
+        from . import project_graph as _pg296
+    except Exception as e:                      # noqa: BLE001
+        return _json.dumps({"ok": False, "错": f"模块不可用：{e}"}, ensure_ascii=False)
+    图 = _pg296.载(图谱)
+    if not 图:
+        return _json.dumps({"ok": False, "错": f"图谱载不进来：{图谱}"},
+                           ensure_ascii=False)
+    return _json.dumps(_pg296.反查(图, 名字), ensure_ascii=False)
+
+
+@mcp.tool(name=_TOOL("audit_delivery"))
+def audit_delivery() -> str:
+    """**整体交付对账**：把「已证明什么 / 还没测到什么」一次说清，机器可复跑。
+
+    ★★★★★ R289：为什么必须有它（真读数，2026-11-06）：
+      这个项目的目标是「能无人值守地在任意真实仓上完成多文件/跨文件工程目标」。
+      做了 36 轮之后，**没有任何一个地方能回答**："现在到底证明了哪几条？还差哪几条？"
+      每轮回执只讲那一轮的一件事，读三份回执也拼不出全貌。
+      而这个产品最怕的正是**把"没测到"当成"做成了"**。
+
+    ⇒ 本工具逐条**真跑一遍**，把每条钉死在 `已证明 / 没测到 / 不成立` 三档之一。
+
+    ★ 真读数（本机，2026-11-06，通道已修通）：
+        合计: **{'已证明': 8, '没测到': 0, '不成立': 0}**
+        已证明：任务切分 / 真落主树+可独立复跑 / 失败归因 / 通道降级 /
+                目标树 / 可重复性·机器侧 / **真模型无人值守把多文件改对** /
+                装完就能跑（wheel 形态）
+
+    ★★★ R298：最后那条「真模型无人值守把多文件改对」之前**永远报"没测到"**，
+      因为判它的人写的是 `_档(None if not 上游活 else None, ...)`
+      —— **两个分支都是 None**，条件变了也不重测。
+      那是让作者心安的标签，不是判据。
+      现在：上游活 ⇒ **真跑一次**（派模型改真文件，机器门判对错）。
+      真读数：`通道 ['qww:deepseek-v4.1-flash']；真跑机器门 rc=0；改对了`。
+      ⇒ 口径：**「缺条件」这个结论必须有到期条件。**
+
+    ★ 我第一版这里**会骗人**：把"可重复性"写成一条，依据文字里写着"模型侧没测到"，
+      但那一档是按**机器侧**判的 ⇒ 合计报 `没测到: 0`。
+      **一条只能回答一个问题**；否则"已证明"会把"没测到"盖住 ——
+      而这正是本产品最怕的那种骗。现已拆成两条。
+
+    ★ 诚实边界：
+      · 对账**只报它真跑过的**。要上游活着才能测的，就写 `没测到`，
+        **绝不**因为"代码写完了"就算证明；
+      · `没测到`（缺条件）与 `不成立`（测了没过）是**两件事**，不许混。
+    """
+    try:
+        return json.dumps(adt.对账(), ensure_ascii=False, indent=2)
+    except Exception as e:                          # noqa: BLE001
+        return json.dumps({"ok": False,
+                           "error": f"对账自身异常：{type(e).__name__}: {e}",
+                           "诚实边界": "异常 ≠ 各项都对；这是没测到。"},
+                          ensure_ascii=False)
+
+
+@mcp.tool(name=_TOOL("field_contract"))
+def field_contract_check() -> str:
+    """**跨模块字段契约**：核对"我以为的形状"和"生产者真产出的形状"是否一致。
+
+    ★★★★★ R287：为什么值得专门做个工具（真读数，五轮里栽了 **4 次**）：
+      这几轮的错**全是同一句**「不要猜数据的形状，去读它的生产者」：
+        · R280e 读错层：`client.timeout`（真的在它的上一层）
+        · R281c 猜常量值：`硬死` 其实是 `'dead'`（我以为值就是中文）
+        · R283b 读错层 + 猜键名：`复验.段` 不在顶层，键是 `tid` 不是 `id`
+        · R286b 猜字段含义：证据里的 `file` 是 `"repo"`（**仓目录名**），不是文件路径
+        · R286c 猜容器类型：`门` 是 `{"grep_required": false}`（dict），不是列表
+      五次全是我**在别人的产出上瞎猜**，而且每次代码都能跑、不报错、看着合理，
+      **只是判断全都反了**。这是本项目最贵的一类错。
+
+    ⇒ 本工具**不查文档、不读注解**，只**真跑一遍生产者**，逐条核对表里写的形状。
+      形状一变，这里就红 —— 而不是某个下游悄悄判反、还报绿。
+
+    ★ 它自己抓到过我自己写错的契约（真读数）：契约第一版写「`复验` 是 dict」，
+      实测 `adopted=None` 时 `复验`/`应用` 是 **`None`**（不是空 dict）。
+      下游若 `果["复验"]["段"]` 会 TypeError；更坏的是用 `or {}` 静默吞掉
+      ⇒ 报"没有失败"（R286c 就报了假绿）。
+
+    ★ 诚实边界：本表**只覆盖列出的字段**，不是全部协议。它降低"又猜错"的概率，
+      **不消灭**它 —— 新增跨模块读取时，必须同时往表里加一行。
+    """
+    try:
+        _r = fcl.校验()
+        return json.dumps({
+            "ok": _r["ok"], "过": _r["过"], "错": _r["错"],
+            "契约": fcl.表(),
+            "诚实边界": ("只覆盖表里列出的字段，不是全部协议。"
+                      "新增跨模块读取时必须同时往表里加一行，否则这条齿管不到。"),
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:                          # noqa: BLE001
+        return json.dumps({"ok": False,
+                           "error": f"契约核对自身异常：{type(e).__name__}: {e}",
+                           "诚实边界": "异常 ≠ 形状对；这是没测到。"},
+                          ensure_ascii=False)
+
+
+@mcp.tool(name=_TOOL("explain_failure"))
+def explain_failure(goal_json: str, cwd: str) -> str:
+    """**失败归因**：目标没做成时，分清是"谁的错"——因为下一步动作完全不同。
+
+    ★★★★★ R286：为什么必须有它（真读数，2026-11-06）：
+      既定目标点名了「失败归因」，而此前只有**通道级**的判定
+      （`_classify_failure` 判"硬死 / 读不到"）。**工程失败本身**完全没有归因：
+      一次目标没做成，回执里长得都一样，只有一句"未达成"。
+      而实测四种失败**下一步动作完全互斥**：
+
+      | 档 | 责任 | 该做什么 |
+      |---|---|---|
+      | 无法启动 / 环境缺工具 | 环境 | 装工具（**改代码和改判据都没用**） |
+      | 判据写错（规格非法） | 判据 | 改判据（**改代码没用**） |
+      | 代码没改对 | 代码 | **这才是该改代码的时候** |
+      | 未知 | 未知 | 别猜，把原文贴出来 |
+
+    ★ 我第一版把这件事**全判错了**：我拿证据里的 `file` 字段当"文件路径"，
+      而它实际是 `"repo"`（**仓目录名，表示被测对象**）⇒ 后三种**全被归成"判据写错"**。
+      最坏的是"真代码错 → 判据写错"：调用方会去改一个**好好的判据**，
+      而真正的错在代码里，怎么改都不会绿。
+      ⇒ 判据自己已经把话说清了，**去读 `cause`**：
+        `门规格非法|读不到|in=…（不存在或不是文件）` 才是判据写错的凭据；
+        `必需缺失|X` 是代码没改对。
+
+    ★ 诚实边界：归因是**从证据里读出来的**（cause/err/rc/文件是否存在），
+      **不是**推断"模型哪里想错了"。认不出的一律归 `未知` ——
+      **一个错的归因比没有归因更坏**，它会让人去改一个没坏的地方。
+
+    ★ 这是只读的：**不调模型、不改仓**。它跑目标仓自己的门然后归因。
+    """
+    try:
+        规 = json.loads(goal_json)
+    except ValueError as e:
+        return json.dumps({"ok": False, "error": f"goal_json 不是合法 JSON：{e}"},
+                          ensure_ascii=False)
+    根 = Path(cwd or ".").resolve()
+    if not 根.is_dir():
+        return json.dumps({"ok": False, "error": f"cwd 不是目录：{cwd}"},
+                          ensure_ascii=False)
+    try:
+        计划 = ag.plan_tasks(规)
+    except ValueError as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+    # 逐段跑它自己的门，收集证据再归因（复用 goal_runner，不另起一把尺子）
+    try:
+        from . import generic_goal as _G  # noqa: F401
+        判 = gr.run_plan(计划, 根)
+    except Exception as e:                          # noqa: BLE001
+        return json.dumps({"ok": False,
+                           "error": f"归因自身异常：{type(e).__name__}: {e}"},
+                          ensure_ascii=False)
+
+    # ★★★★★ R286c（真读数，2026-11-06）：**这里我第一版报了假绿。**
+    #   我写的是 `for _g in (_段.get("门") or [])` —— 以为 `门` 是"证据字典的列表"。
+    #   实测 `run_plan` 返回的是：
+    #     `"门": {"grep_required": false}`   ← **一个 dict，值是布尔结论**
+    #   遍历一个 dict 拿到的是 **键名（字符串）**，`isinstance(_g, dict)` 恒假
+    #   ⇒ `_证据` 恒空 ⇒ `归因一批([])` ⇒ `ok=True` 而 `目标达成吗=False`
+    #   ⇒ **工具对外报"没有失败"，而目标其实红着。** 这比归因错误更糟：
+    #     它让调用方以为一切正常。
+    #   ⇒ 两个修法一起上（缺一个都不够）：
+    #     ① `门` 是 dict，按 dict 读；
+    #     ② 但 `run_plan` **只给布尔结论，不给 cause/err** ——
+    #        而归因的**全部原料**都在 cause 里 ⇒ 必须**重跑** `gate_spec.evaluate`
+    #        拿真实明细。这正是「一个错的归因比没有归因更坏」的反面：
+    #        **没有原料就不要归因，宁可说"没归因到"。**
+    _证据: list = []
+    from . import gate_spec as _gs
+    from . import goal_runner as _gr2
+    for _段 in (判.get("段") or []):
+        if _段.get("状态") == "绿":
+            continue
+        _规格 = _段.get("_门规格") or []
+        if not _规格:
+            continue
+        try:
+            _r2, _d2 = _gs.evaluate(_规格, 根, 根)
+        except Exception:                            # noqa: BLE001
+            continue
+        for _e in (_d2 or []):
+            if isinstance(_e, dict) and not _e.get("ok"):
+                _证据.append(_e)
+    归 = fc.归因一批(_证据, 根)
+    # ★ 兜底（不许再报假绿）：有红段却一条证据都没拿到 ⇒ 明说"没归因到"
+    _有红 = any((x.get("状态") in ("红", "拒跑", "异常"))
+                for x in (判.get("段") or []))
+    if _有红 and not 归["逐条"]:
+        归 = {**归, "逐条": [],
+              "汇总": {"未知": ["（一条证据都没取到）"]},
+              "最该先做的": ("**没归因到**：有段是红的，但没取到门的明细。"
+                          "这是归因链自己断了，不是'没有失败'。"),
+              "诚实边界": "归因链断了 ⇒ 必须如实说，不许报'没有失败'。"}
+    return json.dumps({
+        "ok": not 归["逐条"],
+        "目标达成吗": 判.get("ok"),
+        "未达成的原因": 判.get("未达成的原因"),
+        "归因": 归,
+        "拒跑": None,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool(name=_TOOL("check_repeatable"))
+def check_repeatable(rounds: int = 3, lang: str = "rust") -> str:
+    """**机器侧可重复性自证**：同一目标从全红基线连跑 N 轮，看结论是否逐轮一致。
+
+    ★★★★★ R285：为什么它必须是**可调用的工具**而不是我手跑一次：
+      「可重复性」是既定目标里点名的一项，而此前它只在 case02 上**偶然**验过一次
+      （无人值守跑通 1 次、重复 4 次失败 = **1/4**）。判十五只在**单文件**上连跑，
+      那证明不了多文件。
+      ⇒ 现在换成：本机真工具链，仓里同时有**两处独立编译错误**，每轮从全红基线出发，
+        要求①改动面**同时**定位到两个文件 ②每轮面/保留数/独立复跑 rc 逐轮一致。
+
+    ★ 真读数（本机，2026-11-07）：
+      `连跑 3 轮：改动面 ('src/alpha.rs','src/beta.rs')、保留 2、复跑 rc 0 —— 可重复`
+      反向验证：把定位截断成只取第 1 个文件 ⇒
+      `ok=False · 第 1 轮复跑仍红（改动没让目标仓自己的门变绿）`
+      ⇒ 这条齿**真的能抓到"改了一半"**，而"少做"最容易伪装成"做成了"。
+
+    ★ 诚实边界（写在返回值里，不许含糊）：
+      本工具**不调模型**。它证明的是**机器侧**（定位→应用→独立复跑）可重复，
+      **不**证明**模型侧**可重复——后者要上游活着才测得到。
+      本机没有 cargo ⇒ 报 `测了没=False`（**没测到**），**不算通过**。
+
+    参数：rounds=连跑几轮（建议 ≥3）；lang 目前只支持 rust（其余如实说"没验过"）。
+    """
+    try:
+        return json.dumps(rpt.多文件可重复(轮数=max(1, min(int(rounds), 10)),
+                                         语言=str(lang or "rust")),
+                          ensure_ascii=False, indent=2)
+    except Exception as e:                          # noqa: BLE001
+        return json.dumps({"ok": False, "测了没": False,
+                           "error": f"自证自身异常：{type(e).__name__}: {e}",
+                           "诚实边界": "异常 ≠ 不可重复；这是没测到。"},
+                          ensure_ascii=False)
+
+
+@mcp.tool(name=_TOOL("doctor_channels"))
+def doctor_channels(channel: str = "", timeout: float = 25.0) -> str:
+    """**开工前通道体检**：逐 (通道, 模型) 对真探活，给出"为什么不能用、该谁动手"。
+
+    ★★★★★ R281：为什么非要它（真读数，2026-11-07）：
+      上一轮把探活判准了（`HTTP 200 + {"error":…}` 不再算活），但那份结论
+      **只活在一次调用的异常信息里**。真正无人值守时第一次失败往往发生在
+      **跑到一半**——模型改到第 3 个文件才没通道，前面全白做。
+      ⇒ 开工前必须有一张**结构化体检表**，把"哪种死法、责任在谁、该做什么"讲清。
+
+    ★ 三种死法的**责任方完全不同**，混成一档会让人做错决定：
+      · `缺key`     → 你：设 `*_API_KEY`（本机 3 个通道是这个）
+      · `无权访问`  → 你：换有该分组的 key（本机 `dddddd` 是 403 无权访问分组）
+      · `上游异常`  → 上游：只能等，本地不重试（与 R166 一致：慢错重试拿不到新信息）
+
+    ★ 与 `doctor.py` 安装自检的分工：那个**不联网**（装完就能跑），本工具**真探活**。
+
+    ★ 诚实边界（写在返回值里）：探活是**启发式**，Router 有换槽与冷却，
+      **真调用才是判据**。`未探测` 档是「没测到」，不等于「测过不行」。
+      `可开工` 与 `能开工` 是**两件事**：前者=有通道被确认是活的，
+      后者=还有槽可试（兜底，不是保证）。
+    """
+    try:
+        表 = cd.体检(channel or "", timeout=float(timeout))
+    except Exception as e:                          # noqa: BLE001
+        return json.dumps({"ok": False,
+                           "error": f"体检自身异常：{type(e).__name__}: {e}"},
+                          ensure_ascii=False)
+    表["摘要"] = cd.体检摘要(表)
+    return json.dumps(表, ensure_ascii=False, indent=2)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2100,7 +3017,18 @@ _成本账: dict[str, dict] = {}
 _成本文件 = Path(_DB_FILE).parent / "成本账.jsonl"
 # ★ 熔断健康表与成本账同层：同一个"跨重启要记住的事"就放在同一个目录。
 #   不设的话 router 拿不到落点 ⇒ 重启清零（已实测代价：第一个任务重付全部重试）。
-os.environ.setdefault("ORCH_STATE_DIR", str(Path(_DB_FILE).parent))
+# ★★★★★ R548（verifier 用机器对照抓出的真根因，R547 只修到了皮）：
+#   这里原本是 `os.environ.setdefault("ORCH_STATE_DIR", str(Path(_DB_FILE).parent))`
+#   —— 在**模块顶层**改全局环境变量。后果实测：
+#       BEFORE: env=None          条数=16  库=<STATE>\kb
+#       AFTER : env=…\jobs        条数=0   库=…\jobs\kb（不存在）
+#   因为 `project_kb.库根()` 认 env ⇒ 只要 import 本模块，库根就被拐走。
+#   于是 doctor 同一屏出现「知识库可机判 6/16 条」与「知识库 **0 条**」
+#   自相矛盾（前者在被改之前算、后者在之后算），并且照样打「可以开工」。
+#   ⇒ 违反口径 387：**库模块不许在 import 期改全局状态**。
+#   修法：这里不设；在**进程入口** `main()` 设一次，值取**规范状态根** `STATE`
+#   （不是 `jobs` 子目录 —— 子目录只是 jobs.db 的落点，不是状态根）。
+_状态根提示548 = str(STATE)
 
 
 def _成本落盘(job_id: str, 工具: str, 字节: int, 计入调用: bool = True) -> None:
@@ -2955,29 +3883,6 @@ async def _等终态_a(job_id: str, timeout_s: float, 步长: float = 0.4) -> di
         await asyncio.sleep(步长)
 
 
-def _等终态(job_id: str, timeout_s: float, 步长: float = 0.4) -> dict:
-    """服务端等待终态 —— 把轮询从**调用方**的控制流里拿掉。
-
-    ★ 这是"少说话"的机制：我发一次 orch_run/ orch_wait，服务端自己等到有结论再回。
-      以前我得 orch 提交 → sleep → task_status → sleep → …… 每次都是一次会话往返。
-    """
-    t0 = time.time()
-    while True:
-        j = _jobs.get(job_id)
-        if j is None:
-            _db_sync_in()
-            j = _jobs.get(job_id)
-        if j is not None and _是终态(j):
-            return {"等到了": True, "耗时_s": round(time.time() - t0, 2),
-                    "最终state": j.get("state")}
-        if time.time() - t0 >= timeout_s:
-            j = _jobs.get(job_id) or {}
-            return {"等到了": False, "耗时_s": round(time.time() - t0, 2),
-                    "最终state": j.get("state"),
-                    "提示": "未到终态；可用 orch_wait 再等，不要反复 task_status 轮询"}
-        time.sleep(步长)
-
-
 @mcp.tool(name=_TOOL("orch_run"))
 async def orch_run(repo: str, cmd: list[str], gates: list[dict] | None = None,
              unit_id: str = "any", name: str = "engine", wait: bool = True,
@@ -3332,11 +4237,172 @@ async def orch_wait(task_id: str, timeout_s: int = 1800, max_chars: int = 20000)
 
 
 
+_常驻启动读数: dict = {}
+
+
+def _启动常驻同步() -> "threading.Thread":
+    """编排器**自己主动**扫这个仓（R303）—— 用户原话：
+
+    > 「启动编排器，这个编排器**自己就要主动扫**这个文件夹下有什么，
+    >   是这个编排器告诉你的。不是你自己去看的，也不是你告诉我的。」
+
+    ★ 为什么放**后台线程**：首次冷同步实测 **205.9s**（含 Lean 5,595 文件）；
+      放在 `mcp.run` 之前就是「编排器三分多钟不响应」，比不做还坏。
+      第二次只有 **9.1s、读盘 0**（戳筛），所以这是**一次性的**代价。
+    ★ 失败**不阻塞服务器**，但把原因留在 `_常驻启动读数["错"]` 里 ——
+      「降级不是失败，但谎报没降级是最坏的失败」。
+    """
+    def 跑() -> None:
+        try:
+            from agentscope_orchestrator import mem_live as _ml
+            _常驻启动读数.update(_ml.自动同步())
+        except Exception as e:                       # noqa: BLE001
+            _常驻启动读数["错"] = f"{type(e).__name__}: {e}"
+    t = threading.Thread(target=跑, name="常驻仓况同步", daemon=True)
+    t.start()
+    return t
+
+
+@mcp.tool(name=_TOOL("repo_state"))
+def 仓况(同步: bool = False, 预算字: int = 1200) -> str:
+    """**这个仓里现在有什么** —— 常驻仓况（精确到文件夹/文件/符号）。
+
+    为什么有这个工具（用户 2026-11-07 当面指出）：
+      「怎么知道这个文件夹下有什么东西？哪些有用哪些没用？怎么真的知道有什么没什么？」
+      「要实现局部任意召回相关内容不丢，全局遍历知识图谱一次知道完整全局状态
+        **不丢信息，不用遍历整个仓库**的效果。」
+
+    它读的是**常驻符号表**（`mem_live`），不是现扫：
+      · 增量靠 `(mtime_ns, size)` 戳筛 —— 未变文件**一次盘都不读**（实测第 2 次读盘 **0**）；
+      · 状态落盘 `products/mem/活符号表.pkl`，**跨进程存活** ⇒ 「不用遍历整个仓库」不是口号；
+      · 扫什么由**档案 `memory:` 段**决定（换项目 = 换档案），本工具不写死任何项目路径。
+
+    参数：
+      同步    True ⇒ 先增量同步一次再报（默认 False：只读现有常驻表，最快）。
+      预算字  概要截断长度。
+
+    返回：仓况简报 + 上次同步读数 + 目录级分布 + **无仓内调用者的符号数**。
+      ★ 「无调用者」是**线索不是判决**：入口（main / #[test] / pub 外部 API）
+        天然没有仓内调用者。
+    """
+    from agentscope_orchestrator import mem_live as _ml
+    同步读数 = None
+    if 同步:
+        同步读数 = _ml.自动同步()
+    else:
+        _ml.确保载入()          # ★ 显式查询 ⇒ 可以载盘（几秒）；注入路径不载
+    文 = _ml.简报(预算字=预算字)
+    if not _ml.规模().get("文件"):
+        文 = ("【仓况·空】常驻表是空的。可能原因：① 启动同步还在跑（首次冷同步实测 205.9s）"
+              "；② 档案没有 `memory:` 段。**这不是「仓里没东西」** —— "
+              "空表与空仓必须分得开，否则就是「看不见当没有」。")
+    出 = {"常驻": 文, "本次同步": 同步读数, "启动同步": dict(_常驻启动读数),
+          "规模": _ml.规模(), "上次同步": None if _ml.上次同步() is None
+          else _ml.上次同步().行(), "告警": list(_ml.告警())}
+    # ★ 分区摘要（不吐 411 KB 全量档）：回答「这个仓里有哪些项目、各是什么」
+    分 = _ml.取分区()
+    if 分:
+        一方 = [p for p in (分.get("项目们") or []) if str(p.get("类型", "")).startswith("一方")]
+        出["分区"] = {
+            "目录数": 分.get("目录数"), "被剪枝目录数": 分.get("被跳目录数"),
+            "文件数": 分.get("文件数"), "项目数": 分.get("项目数"),
+            "工位残留": 分.get("工位数"),
+            "剪枝按类": 分.get("剪枝按类"),
+            "一方项目": [{"根": p["根"], "清单": p["清单"], "语言": p["语言"],
+                          "文件": p["文件"], "按角色": p["按角色"]} for p in 一方[:40]],
+            "口径": 分.get("口径"), "剪枝边界": 分.get("剪枝边界"),
+            "工位判据": "`<X>/repo` 自己是一个项目根 ⇒ X 是一次性工位（结构性，可复核）",
+        }
+    return json.dumps(出, ensure_ascii=False, indent=1)
+
+
+@mcp.tool(name=_TOOL("repo_symbol"))
+def 仓内符号(名: str = "", 文件: str = "", 上限: int = 30) -> str:
+    """**局部任意召回**：按符号名或文件路径，把这个仓里相关的东西一次拿全。
+
+    与 `仓况` 的分工：`仓况` 是**全局状态**（一眼知道有什么），
+    本工具是**局部召回**（问某个名字/某个文件）。两者读的是**同一张常驻表**。
+
+    参数：
+      名   符号名（精确）。给了就回：定义处、体指纹、**谁调用它**。
+      文件 仓内**相对路径**（如 `机械循环/结构记忆网络.rs`）。给了就回它定义的符号、
+            以及它引用到的名字。
+    两者都给 ⇒ 都回。都不给 ⇒ 回面积的错，**不猜**。
+    """
+    from agentscope_orchestrator import mem_live as _ml
+    _ml.确保载入()              # ★ 显式查询 ⇒ 载盘
+    表 = _ml.现存()
+    if not 名 and not 文件:
+        return json.dumps({"ok": False, "错": "`名` 与 `文件` 至少要给一个（不猜用户想问什么）"},
+                          ensure_ascii=False)
+    出: dict = {"ok": True}
+    if 名:
+        符们 = 表.查(名)
+        出["名"] = {
+            "定义处": [{"文件": s.文件, "行": s.起, "种类": s.种类,
+                        "结构指纹": s.结构指纹[:16]}
+                       for s in 符们[:上限]],
+            "定义处数": len(符们),
+            "调用它的文件": list(表.调用者(名))[:上限],
+            "被引文件数": len(表.调用者(名)),
+        }
+        if not 符们:
+            出["名"]["说明"] = "表里没有这个名字 —— **先确认它是否真在这张表的作用域里**，再谈「不存在」"
+    if 文件:
+        相对 = 文件.replace("\\", "/").lstrip("./")
+        # ★ 兜底：表里的路径是**仓相对**；用户/模型常按记忆写 `机械循环/x.rs`
+        #   而不是 `src/机械循环/x.rs`。**「路径不对」和「东西不在表里」必须分开** ——
+        #   否则一次笔误会读成「这个仓里没有它」，正是「看不见当没有」。
+        候选 = []
+        if 相对 not in 表._文哈希 and 相对 not in 表.墓碑们():
+            候选 = sorted(p for p in 表._文哈希
+                          if p == 相对 or p.endswith("/" + 相对) or p.endswith(相对))
+            if len(候选) == 1:
+                相对 = 候选[0]
+        符们 = 表.查_文件(相对)
+        出["文件"] = {"路径": 相对, "在表里": 相对 in 表._文哈希,
+                      "定义的符号数": len(符们),
+                      "定义的符号": [{"名": s.名, "行": s.起, "种类": s.种类}
+                                     for s in 符们[:上限]],
+                      "引用的名字数": len(表.引用名(相对)),
+                      "它是墓碑": 相对 in 表.墓碑们()}
+        if 相对 not in 表._文哈希 and 相对 not in 表.墓碑们():
+            if 候选:
+                出["文件"]["说明"] = (f"给的路径直接查不到，但有 {len(候选)} 个后缀匹配 ⇒ "
+                                     "**无法唯一确定**，请给仓相对全路径")
+                出["文件"]["后缀匹配样例"] = 候选[:5]
+            else:
+                出["文件"]["说明"] = ("该路径不在常驻表里 —— 可能是：① 档案 `memory:` 没声明它所在的根；"
+                                      "② 被 `skip:` 剪掉了；③ 后缀不在声明内。"
+                                      "**「表里没有」不等于「仓里没有」**")
+    return json.dumps(出, ensure_ascii=False, indent=1)
+
+
 def main() -> int:
     from ._winutf8 import 确保UTF8输出 as _u8; _u8()
+    # ★ R546：`--help` 必须**立刻返回**。不认它时，`orch-mcp --help` 会被当成
+    #   「起 stdio 服务」：stdin 立刻 EOF ⇒ **一个字节都不打印、退出码 0**。
+    #   ⇒ 用户看到「跑完了但没输出」，这是最坏的一类失败：**它看起来成功了**。
+    if any(x in sys.argv[1:] for x in ("-h", "--help", "帮助")):
+        print("用法：orch-mcp [-h|--help]\n"
+              "\n"
+              "  以 MCP stdio 服务方式启动（给 AI 客户端连的入口，不是给人敲的）。\n"
+              "  工具面由档案决定；这里不重复列出（用 guide 工具查）。\n"
+              "\n"
+              "  -h/--help  本帮助（立刻返回，不起服务、不建索引）\n"
+              "\n"
+              "  ★ 边界：本进程讲 MCP 协议（stdin/stdout），直接敲它不会有人话输出 ——\n"
+              "    那是**协议**，不是缺陷。要体检请用 orch-check / orch-doctor。")
+        return 0
+    # ★ R548：状态根只在**进程入口**设一次（见本文件里 R548 那段注释）。
+    os.environ.setdefault("ORCH_STATE_DIR", _状态根提示548)
+    _确保索引544()          # ★ 起服务前建一次（之后就幂等）
     # ★ 启动回收孤儿 running（死进程遗留），防依赖链永久阻塞
     _reap_orphans()
+    # ★ 2026-11-07（R303）：**编排器自己主动扫这个仓** —— 后台，不阻塞 stdio
+    _启动常驻同步()
     mcp.run(transport="stdio")
+    return 0
     return 0
 
 

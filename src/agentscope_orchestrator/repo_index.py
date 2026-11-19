@@ -196,7 +196,7 @@ def _build() -> dict[str, dict]:
                 if p in seen or not p.is_file():
                     continue
                 seen.add(p)
-                if any(s in p.parts for s in _skip()):
+                if any(s in p.relative_to(root).parts for s in _skip()):
                     continue
                 rel = p.relative_to(REPO_ROOT()).as_posix()
                 try:
@@ -506,11 +506,19 @@ def structure_snapshot(goal: str = "", cap: int = _SNAP_CAP) -> str:
             + body)
 
 
-# 模块级首次构建（仿 MCP 服务顶部执行一次）★ R47 自检见文件末
-try:
-    ensure()
-except Exception as _e:  # noqa: BLE001
-    logger.warning("repo_index initial build failed: %s", _e)
+# ★★★ R543：这里**曾经**在模块顶层调 `ensure()` 建索引（注释写的是"仿 MCP 服务
+#   顶部执行一次"）。实测代价：`import agentscope_orchestrator.repo_index`
+#   **自跑 10,486,198µs ≈ 10.5 秒**，`import generic_goal` 合计 15.1 秒 ⇒
+#   `orch-goal --help` 26s、`orch-run --help` 36s、`orch-check --help` >120s。
+#
+#   ★ 去掉它是安全的（读代码取证）：`_load()` 读不到缓存时**已经** `ensure(force=True)`，
+#     `structure_snapshot()` 在 idx 为空时**也**再 `ensure(force=True)`，
+#     `related()`/`entry()` 都走 `_load()` ⇒ 顶层这次构建是**纯冗余**。
+#
+#   ★ 留一句话给下一个人：**"仿某某服务的做法"不是理由** ——
+#     那个服务是长驻的，一次构建摊到一万次请求上；这里是一次性 CLI，
+#     每次都摊。同一个写法在两种生命周期里代价差三个数量级。
+#     （口径 390：慢的机制等于没有的机制。）
 
 
 # ═══════════════════════════════════════════════════════════════════

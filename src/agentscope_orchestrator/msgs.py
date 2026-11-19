@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -127,12 +128,31 @@ class ChatModel:
     """
 
     def __init__(self, credential: 凭据 | None = None, model: str = "",
-                 stream: bool = False, max_retries: int = 0,
+                 stream: bool = True, max_retries: int = 0,
                  retry_delay: float = 1.0, context_size: int = 128_000,
                  client_kwargs: dict | None = None, **_欠: Any):
         self.credential = credential or 凭据()
         self.model = model
-        self.stream = stream                  # ★ 恒走非流式：一次拿全量最好判
+        # ★★★★★ R298（真事故，2026-11-06，用户当面指出）：
+        #   这里原来是 `stream: bool = False`，注释写着
+        #     「★ 恒走非流式：一次拿全量最好判」
+        #   —— **这就是把模型调用写死成失败的那一行。**
+        #
+        #   真对照读数（同通道 `api.hlyrouter.top/v1`、同 key、同 prompt）：
+        #     stream=False → HTTP 200 + {"error":{"message":"上游服务异常，请稍后重试…"}}
+        #     stream=True  → HTTP 200 + choices，内容正常（实测回了「通道通了」）
+        #   ⇒ **这条通道只认流式。** 写死非流式 = 模型永远调不通，
+        #     而报出来的错长得像"上游挂了"——
+        #     **能力坏了，却报得像是环境坏了**，这是本产品最坏的一类 bug。
+        #
+        #   为什么 40 多轮没发现：我自己就跑在 DSH 的这条通道上。
+        #   我把这个矛盾当成了"环境不可用"的借口，而没有去解决它。
+        #   用户一句「如果模型渠道本身有问题你还能在这里跟我说 40 几？」
+        #   直接把它逼出来了。
+        #
+        #   ★ 口径：「**一次拿全量最好判**」这个便利**不值得拿能力去换**。
+        #     流式也能拿全量 —— 拼起来就是（见下面 __call__）。
+        self.stream = stream
         self.context_size = context_size
         _kw = dict(client_kwargs or {})
         self.timeout = _kw.get("timeout") or httpx.Timeout(
@@ -146,20 +166,62 @@ class ChatModel:
         体 = {
             "model": self.model,
             "messages": [_转消息(m) for m in (msgs or [])],
-            "stream": False,
+            # ★ R298：跟随 self.stream（默认 True —— 这条通道只认流式）
+            "stream": bool(self.stream),
         }
         头 = {"Content-Type": "application/json"}
         if self.credential.api_key:
             头["Authorization"] = f"Bearer {self.credential.api_key}"
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as c:
-            r = await c.post(url, json=体, headers=头)
-            if r.status_code >= 400:
-                # 把**上游原文**带出来：诊断读数必须指回真因（R185）
-                raise RuntimeError(f"HTTP {r.status_code} @ {url} :: {r.text[:800]}")
-            数 = r.json()
-        选 = ((数.get("choices") or [{}])[0] or {}).get("message") or {}
-        文 = 选.get("content") or ""
-        return 应答(content=[文本块(text=文)], raw=数, usage=数.get("usage") or {})
+            if not self.stream:
+                r = await c.post(url, json=体, headers=头)
+                if r.status_code >= 400:
+                    # 把**上游原文**带出来：诊断读数必须指回真因（R185）
+                    raise RuntimeError(f"HTTP {r.status_code} @ {url} :: {r.text[:800]}")
+                数 = r.json()
+                选 = ((数.get("choices") or [{}])[0] or {}).get("message") or {}
+                文 = 选.get("content") or ""
+                return 应答(content=[文本块(text=文)], raw=数,
+                            usage=数.get("usage") or {})
+
+            # ★ R298：流式路径 —— 拼成一次完整响应（对外形状不变）
+            #   为什么错误必须读**响应体**：这条通道对非流式请求
+            #   **返回 HTTP 200 但体里是 error**（R280 已记过这个坑）。
+            #   流式也一样：200 + error 要判成失败，不能当成功。
+            片: list[str] = []
+            末数: dict = {}
+            原始行: list[str] = []
+            async with c.stream("POST", url, json=体, headers=头) as r:
+                if r.status_code >= 400:
+                    文 = (await r.aread()).decode("utf-8", "replace")[:800]
+                    raise RuntimeError(f"HTTP {r.status_code} @ {url} :: {文}")
+                行们 = []
+                async for 行 in r.aiter_lines():
+                    if 行:
+                        行们.append(行)
+                全文 = "\n".join(行们)
+                原始行 = 行们
+            if '"error"' in 全文 and '"choices"' not in 全文:
+                raise RuntimeError(f"上游在流式响应里报错 @ {url} :: {全文[:800]}")
+            for 行 in 原始行:
+                if not 行.startswith("data:"):
+                    continue
+                载荷 = 行[5:].strip()
+                if 载荷 == "[DONE]":
+                    break
+                try:
+                    片数 = json.loads(载荷)
+                except Exception:                     # noqa: BLE001
+                    continue
+                if 片数.get("usage"):
+                    末数["usage"] = 片数["usage"]
+                for ch in (片数.get("choices") or []):
+                    d = ch.get("delta") or {}
+                    if d.get("content"):
+                        片.append(d["content"])
+            文 = "".join(片)
+            return 应答(content=[文本块(text=文)], raw=末数,
+                        usage=末数.get("usage") or {})
 
 
 def _转消息(m: Any) -> dict:

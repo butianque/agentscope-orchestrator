@@ -154,6 +154,25 @@ def _detect_state_root() -> Path:
     return 候[0]
 
 
+# ★★★★★ R549：**状态根的唯一取法**。
+#
+# 为什么要有这个函数（同一件事已经犯过三次）：
+#   `project_kb.库根()` 曾经自己算 `Path.home()/".orchestrator-state"`，
+#   与 `STATE_ROOT`（真试写选出来的）**不是同一处** —— 本机那个路径
+#   `WinError 5 拒绝访问` ⇒ 播种必死 ⇒ doctor 报「知识库 0 条」，
+#   看起来像「这项目本来没知识」（R547）。
+#   同类代码在 `coord_chain` / `blind_spot` / `events` / `memory8` 里还有四份。
+#   ⇒ 症状永远一样：**写不了的根被显示成「空的」**，而责任完全不同。
+#
+# 口径：任何要落盘的地方**只调这一个函数**，不许再自己拼路径。
+#   它保证：显式 env 优先；否则就是 `_detect_state_root()` 逐个候选**真试写**
+#   选出来的那个（会退到 TEMP 兜底，不会退到不可写的家目录）。
+def state_dir() -> Path:
+    """状态根（任务库/成本账/知识库/坐标链/盲点台账/事件检查点 **全在这一个根下**）。"""
+    _v = os.environ.get("ORCH_STATE_DIR") or ""
+    return Path(_v) if _v else Path(STATE_ROOT)
+
+
 TOOL_ROOT = _detect_tool_root()
 STATE_ROOT = _detect_state_root()
 
@@ -256,6 +275,10 @@ class Profile:
     memory: tuple[dict, ...] = ()
     source_path: Path | None = None
     raw: dict = field(default_factory=dict)
+    # ★ R231：装载期校验不通过的门（未知 type 等）**不放 `gates`**，单独记着。
+    #   `gates` 里只有能真跑的门 ⇒ 结论不会建立在"没跑的门"上。
+    #   非空即表示档案有问题：装载期已告警，调用方也可以据此不认"达标"。
+    gates_invalid: tuple[dict, ...] = ()
 
     # ── 派生 ────────────────────────────────────────────────────
     @property
@@ -341,6 +364,63 @@ def _as_tuple(v) -> tuple:
     if isinstance(v, str):
         return (v,)
     return tuple(v)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 判据门规格校验（★ R231：装载期就查，别等运行期在深处抛）
+# ═══════════════════════════════════════════════════════════════════
+# 合法门类型 = `gate_spec.evaluate` 真正实现的那 14 种。**这里是唯一权威表**：
+# 加新门类型时两边一起改，否则档案里写了也没人跑。
+GATE_TYPES: frozenset[str] = frozenset({
+    "compile", "test_counts", "regression_parity", "precondition",
+    "instance_agreement", "grep_forbidden", "grep_required", "scan_output",
+    "axiom_footprint", "kernel_statement", "whole_reading", "differential",
+    "property", "oracle",
+})
+
+# 自然写法 ⇒ 正式门类型。`cmd` 是最常见的错写法（"跑这条命令"的直觉），
+# 语义与 `compile` 完全一致（跑命令真退出码），所以**别名过去**，不报错。
+GATE_ALIAS: dict[str, str] = {
+    "cmd": "compile", "command": "compile", "shell": "compile", "run": "compile",
+    "test": "test_counts", "tests": "test_counts", "grep": "grep_required",
+}
+
+
+def _规整门(门列表, mapping: dict[str, str], *, prof_name: str) -> tuple[tuple[dict, ...], tuple[dict, ...]]:
+    """把档案里的门规整成 (可用门, 非法门)。
+
+    · `{repo}` 一类占位符在这里一次性替换（`_subst`）
+    · `type` 走别名表；别名目标是合法类型 ⇒ 静默改写成正式类型（但记一条 debug）
+    · 真不认识 ⇒ **移出可用门、记进非法门**，并大声告警（列出合法类型）
+      —— 口径：**写错的门不许进运行期**，因为进去以后只会以"异常被吞 + 结论照样绿"收场。
+    """
+    ok: list[dict] = []
+    坏: list[dict] = []
+    for g in (_subst(门列表, mapping) or []):
+        if not isinstance(g, dict):
+            坏.append({"raw": repr(g), "因": "门不是 dict"})
+            continue
+        门 = dict(g)
+        typ = str(门.get("type") or "").strip()
+        真 = GATE_ALIAS.get(typ, typ)
+        if 真 not in GATE_TYPES:
+            坏.append({"name": 门.get("name") or "", "type": typ, "因": "未知门类型"})
+            continue
+        if 真 != typ:
+            logger.info("[profile] 门 `%s` 的 type `%s` 是自然写法 ⇒ 按别名改写成 `%s`",
+                        门.get("name") or "?", typ, 真)
+        门["type"] = 真
+        ok.append(门)
+    if 坏:
+        logger.warning(
+            "[profile] 档案 `%s` 有 %d 条判据门**类型不认识**，已移出 gates（不许拿它判达标）：%s\n"
+            "   合法类型：%s\n"
+            "   常见写法：type: cmd 会自动当 compile 用；你若写了别的名字，改成上面某一个。",
+            prof_name, len(坏),
+            "；".join(f"{x.get('name') or '?'}({x.get('type') or '?'})" for x in 坏),
+            " / ".join(sorted(GATE_TYPES)),
+        )
+    return tuple(ok), tuple(坏)
 
 
 def _load_yaml(path: Path) -> dict:
@@ -466,7 +546,22 @@ def load_profile(path=None) -> Profile:
     repo_root = _p(base, raw.get("repo_root") or ".") or base
     repo_root = repo_root.resolve()
 
-    audit_dir = _p(base, raw.get("audit_dir")) or (repo_root / ".orchestrator")
+    # ★★★ R537：`audit_dir` 原来**默认落在仓库根里面**（`<repo>/.orchestrator`）。
+    #   对**只读项目**（vendor 副本、参考资料树、别人给的源码包 —— 很常见）这一句直接
+    #   `WinError 5 拒绝访问`；而「档案装载」不该因为写不进去就装不上（实测：
+    #   真跑 `orch-init D:\tools` 生成的档案，一加载就刷这行错）。
+    #   ⇒ 先试 `<repo>/.orchestrator`，**写不进去就落到状态区**并**明说落哪了**
+    #     （口径 92：不许静默换地方 —— 否则用户去错目录找审计记录，等于没有审计）。
+    audit_dir = _p(base, raw.get("audit_dir"))
+    if audit_dir is None:
+        _候选 = repo_root / ".orchestrator"
+        try:
+            _候选.mkdir(parents=True, exist_ok=True)
+            audit_dir = _候选
+        except OSError as _e:                              # noqa: BLE001
+            audit_dir = STATE_ROOT / "audit"
+            logger.warning("[profile] 仓库根不可写（%s：%s）⇒ 审计目录落到状态区 %s",
+                           repo_root, _e, audit_dir)
     work_dir = _p(base, raw.get("work_dir")) or (STATE_ROOT / "work")
     products_dir = _p(base, raw.get("products_dir")) or (STATE_ROOT / "products")
 
@@ -502,8 +597,20 @@ def load_profile(path=None) -> Profile:
     }
     # ★ R230：记忆索引范围 —— 项目声明的，工具不猜
     memory = tuple(dict(x) for x in (raw.get("memory") or []) if isinstance(x, dict))
-    gates = tuple(_subst(raw.get("gates") or [], mapping))
-    dev_gates = tuple(_subst(raw.get("dev_gates") or [], mapping))
+    # ★ R231（2026-11-05 跨项目真跑撞出来的）：档案里的门**在装载期就要校验**。
+    #
+    #   真事：靶子仓档案里写了 `type: cmd`（用户最自然的写法），装载期一查不查，
+    #   运行期才在 `gate_spec.evaluate` 深处抛 `ValueError: unknown gate type: cmd`，
+    #   而调用方把这条异常按"如实报出、不阻断规划"吞掉了 ⇒ **我配的真测试门等于没接**，
+    #   最后靠自动派生的"结构键门"判 `converged`。这就是**假绿的入口**：
+    #   门规格写错 → 门没跑 → 结论照样"达标"。
+    #
+    #   口径：**档案里写错的判据门不许进运行期**。两条处理：
+    #     ① 自然写法 `cmd` / `command` / `shell` ⇒ 别名到 `compile`（宽容，因为语义相同）；
+    #     ② 真不认识的门 ⇒ 移出 `gates`、记进 `gates_invalid`、装载期**大声告警**（不静默）。
+    gates, gates_invalid = _规整门(raw.get("gates") or [], mapping, prof_name=str(raw.get("name") or pf.stem))
+    dev_gates, dev_invalid = _规整门(raw.get("dev_gates") or [], mapping, prof_name=str(raw.get("name") or pf.stem))
+    gates_invalid = gates_invalid + dev_invalid
     # ★ R23：冻结区（路径相对仓库根；不参与 {repo} 替换 —— 它就是仓库内相对路径）
     frozen = tuple(dict(x) for x in (raw.get("frozen") or []) if isinstance(x, dict))
 
@@ -530,6 +637,7 @@ def load_profile(path=None) -> Profile:
         anchors=anchors,
         gates=gates,
         dev_gates=dev_gates,
+        gates_invalid=gates_invalid,
         frozen=frozen,
         orphan_api_prefixes=_as_tuple(raw.get("orphan_api_prefixes")),
         memory=memory,

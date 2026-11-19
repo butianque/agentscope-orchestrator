@@ -586,7 +586,7 @@ def _api_hints(gap: Gap, max_per_type: int = 60, max_types: int = 6) -> str:
                 if p in seen_paths or not p.is_file():
                     continue
                 seen_paths.add(p)
-                if skip and any(s in p.parts for s in skip):
+                if skip and any(s in p.relative_to(ROOT).parts for s in skip):
                     continue
                 low = p.read_text(encoding="utf-8", errors="ignore")
                 names = sorted({m.group(1) for m in

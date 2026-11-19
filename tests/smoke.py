@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -66,7 +67,18 @@ async def main() -> int:
             print("[smoke] 这一段验的是真实模型通道；本机未配置，代码本身未参与判决。")
             return 3
         raise
-    resp = await model([UserMsg(name="user", content="回复四个字：烟测通过")])
+    # ★★★★★ 2026-11-05（第 253 轮 run_all 真读数）：**上游不可用 ≠ 代码坏了，也 ≠ 通过**。
+    #   现场原文：`json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)`
+    #   —— 因为通道回的是 `HTTP 200 + {"error":{"message":"上游服务异常，请稍后重试"}}`，
+    #   解析层拿到空包体直接抛 JSONDecodeError。
+    #   ⇒ 这条既不是"代码缺陷"（跑一千次都一样），也不是"通道能用"（回复是空的）。
+    #   口径：**判它是"未验"（exit 3），并把上游原话打进读数**，不许冒充红、也不许冒充绿。
+    try:
+        resp = await model([UserMsg(name="user", content="回复四个字：烟测通过")])
+    except json.JSONDecodeError as e:
+        print(f"[smoke] UNVERIFIED 上游返回的不是模型回复（空包体/错误包）：{type(e).__name__}: {e}")
+        print("[smoke] 这一段验的是真实模型通道；上游不可用时**不能**判为代码缺陷。")
+        return 3
     text = _extract_text(resp.content)
     print(f"[smoke] reply=>>{text}<<")
     if not text.strip():

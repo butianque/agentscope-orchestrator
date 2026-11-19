@@ -49,9 +49,38 @@ def 文件快照(路径: str | Path) -> dict[str, tuple[str, str]]:
         return {}
     语言 = _语言(str(路径))
     出: dict[str, tuple[str, str]] = {}
-    for 名, _种类, _起行, 体 in 抽取符号(文本, 语言):
-        出[名] = (代码结构(体, 语言).指纹()[:16],
-                  hashlib.sha256(体.encode("utf-8", "replace")).hexdigest()[:12])
+    # ★ ④ 接线（R303 第 7 轮）：`.lean` 走**接线版** ——
+    #   **elaborator 定「哪些名字算数」**（正则抽不到 `_proof_` / `_private` /
+    #   `structure` 生成的 `_arg_pusher` / `_flat_ctor` 这类名），
+    #   **正则供体文**（结构指纹与内容哈希都要体文）。
+    #   ⇒ 名字集从「文本里看得见的」升级为「**内核里真有的**」。
+    #   ★ **体文不可知的，不伪造指纹**：`elaborator-only` 那类的体文拿不到
+    #     （没 InfoTree 就没有源码跨度），给它一个**哨兵值** `"elaborator-only"`，
+    #     而不是拿空串算一个**看起来像真哈希**的东西 ——
+    #     「假绿与真红长得一样」的反面：**别让「不知道」长得像「知道」**。
+    模 = None
+    if 语言 == "lean":
+        from .mem_symbols import 模块名 as _模名
+        try:
+            _rel = str(路径)
+            for _根 in ("formal_proof",):
+                if _根 in _rel.replace("\\", "/"):
+                    _rel = _rel.replace("\\", "/").split(_根 + "/", 1)[1]
+                    break
+            模 = _模名(_rel)
+        except Exception:                        # noqa: BLE001
+            模 = None
+    try:
+        from .mem_symbols import 抽取符号带口径 as _带口径
+        符们, _口 = _带口径(文本, 语言, 模) if 语言 == "lean" else (抽取符号(文本, 语言), {})
+    except Exception:                            # noqa: BLE001
+        符们, _口 = 抽取符号(文本, 语言), {}
+    for 名, 种类, _起行, 体 in 符们:
+        if 种类 == "elaborator-only":
+            出[名] = ("elaborator-only", "elaborator-only")
+        else:
+            出[名] = (代码结构(体, 语言).指纹()[:16],
+                      hashlib.sha256(体.encode("utf-8", "replace")).hexdigest()[:12])
     return 出
 
 

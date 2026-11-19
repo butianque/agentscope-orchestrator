@@ -94,13 +94,35 @@ def 源文件们(根: Path, 后缀: str = "*.rs") -> list[Path]:
                 出 = []
                 for x in 名们:
                     f = 根 / x.strip()
-                    if f.is_file() and not any(y in f.parts for y in _跳过目录):
+                    if f.is_file() and not _该跳(f, 根):
                         出.append(f)
                 return sorted(出)
     except Exception:
         pass
     return sorted(f for f in 根.rglob(后缀)
-                  if f.is_file() and not any(x in f.parts for x in _跳过目录))
+                  if f.is_file() and not _该跳(f, 根))
+
+
+def _该跳(p: Path, 根: Path) -> bool:
+    """★ R538j：跳过表只认**相对 `根`** 的路径分量。
+
+    ★ 为什么不能比对绝对路径（本库第二次踩，第一次在 `只读探针.源文件们`）：
+      跳过表里的名字是**目录名**（`.venv` / `target` / `backup` …）。
+      而绝对路径里**任何一层**叫这些名字都会被命中 ——
+      于是「**装在哪／临时目录落在哪**」决定了门看得见什么：
+
+      实测（2026-11-17 · 自检【R91】②）：
+        夹具由 `tempfile.mkdtemp()` 建，本机临时目录已降级到
+        `...\\agentscope_orchestrator\\.venv\\Lib\\work\\临时\\`
+        ⇒ 绝对路径含 `.venv` ⇒ 这里返回 0 个文件 ⇒ 门报「名字里没点名任何接口」
+        ⇒ 退出码 0 ⇒ 连红两条。**同一个门，夹具换个盘就换个结论。**
+      ★ 口径：判据的域必须由**被查的那棵树**决定，不能由**它被放在哪**决定。
+    """
+    try:
+        相对 = p.relative_to(根).parts
+    except ValueError:
+        相对 = p.parts
+    return any(y in 相对 for y in _跳过目录)
 
 _剥RE = re.compile(
     r"//[^\n]*"                      # 行注释
@@ -167,20 +189,6 @@ def 取函数体(净源: str, 函数名: str) -> str | None:
     return None
 
 
-def 收集接口名(根: Path, 前缀们: tuple[str, ...], 后缀: str = "*.rs") -> list[str]:
-    """仓库里**声明过的**、符合命名约定的接口名（`pub fn <前缀>…`）。"""
-    出: list[str] = []
-    模式 = re.compile(r"\bpub\s+fn\s+([\w\u4e00-\u9fff]+)")
-    for f in 源文件们(根, 后缀):
-        try:
-            净 = 剥注释字面量(f.read_text(encoding="utf-8", errors="replace"))
-        except OSError:
-            continue
-        for m in 模式.finditer(净):
-            名 = m.group(1)
-            if any(名.startswith(p) for p in 前缀们) and 名 not in 出:
-                出.append(名)
-    return 出
 
 
 def 见证缺口(根: Path, 测试名: str, 前缀们: tuple[str, ...],

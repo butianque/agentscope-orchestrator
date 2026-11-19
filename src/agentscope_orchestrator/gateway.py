@@ -1,6 +1,6 @@
 """组装每频道 OpenAICredential + OpenAIChatModel。
 
-key 解析优先级：环境变量 key_env -> DSH 凭据文件 ~/.dsh/.credentials.yaml。
+key 解析优先级：环境变量 key_env -> DSH 凭据文件（优先 `$DSH_HOME`）-> `~/.dsh`。
 key 不落本仓库代码/配置。
 """
 from __future__ import annotations
@@ -12,6 +12,50 @@ from pathlib import Path
 import yaml
 from .msgs import ChatModel, 凭据 as OpenAICredential, ChatModel as OpenAIChatModel
 
+
+def 凭据候选() -> list[Path]:
+    """**凭据文件按优先级找，不写死一个路径**（R536）。
+
+    ★★★★★ 真缺陷（2026-11-16 实测抓到的，不是推测）：
+      原实现是模块级常量 `_DSH_CREDENTIALS = Path.home() / ".dsh" / ".credentials.yaml"`。
+      在这台机器上 `C:\\Users\\00\\.dsh\\` **根本不存在** —— 因为 DSH 的数据根
+      已经搬到 `E:\\dsh-data\\.dsh`，由宿主以 **`DSH_HOME`** 注入。
+      ⇒ 后果：**5 个通道全部「凭据不可读」**，而这个失败**看起来完全合理**
+        （「key 没配吧」）—— 实际是**我读错了地方**。
+
+    ★★★ 而 `dsh_channels.py`（R294，用户 2026-11-06 当面指出该缺陷时写的）
+      **早就算出了正确路径**：`宿主线索引()["凭据"] = $DSH_HOME/.credentials.yaml`，
+      **但没人接上来** —— `gateway` 仍在读写死的那一个。
+      ⇒ 口径 359：**认权威标记（`DSH_HOME`），不认名字像不像**。
+      ⇒ 口径 309：系统里已经做好的东西，先接上，别再造一份。
+
+    顺序（先到先得）：
+      ① `ORCH_CREDENTIALS_FILE` —— 用户显式指定；
+      ② `DSH_HOME/.credentials.yaml` —— **宿主注入的权威位置**；
+      ③ `DSH_PROFILE_DIR` 上溯找 `.credentials.yaml` —— 换个布局也能兜住；
+      ④ `~/.dsh/.credentials.yaml` —— 老布局兜底（行为不变）。
+    """
+    候: list[Path] = []
+    显式 = os.environ.get("ORCH_CREDENTIALS_FILE")
+    if 显式:
+        候.append(Path(显式))
+    根 = os.environ.get("DSH_HOME")
+    if 根:
+        候.append(Path(根) / ".credentials.yaml")
+    目 = os.environ.get("DSH_PROFILE_DIR")
+    if 目:
+        目p = Path(目)
+        for 上 in (目p, 目p.parent, 目p.parent.parent):
+            候.append(上 / ".credentials.yaml")
+    候.append(Path.home() / ".dsh" / ".credentials.yaml")
+    出: list[Path] = []
+    for c in 候:
+        if c not in 出:
+            出.append(c)
+    return 出
+
+
+#: 老名字保留（有的地方 import 它）：**只作兜底展示**，真正的解析走 `凭据候选()`。
 _DSH_CREDENTIALS = Path.home() / ".dsh" / ".credentials.yaml"
 
 
@@ -67,12 +111,25 @@ class Channel:
 
     @property
     def api_key(self) -> str:
-        """解析真实 key：优先环境变量，兜底读 DSH 凭据文件。"""
+        """解析真实 key：优先环境变量，兜底按优先级读 DSH 凭据文件。
+
+        ★ R536：兜底**不再只读一个写死的路径**，而是遍历 `凭据候选()`；
+          并且失败信息里**列出试过哪些路径**（口径 92：明说没查到什么，
+          别让「我读错地方」看起来像「key 没配」）。
+        """
         v = os.environ.get(self.key_env)
         if v:
             return v
-        if _DSH_CREDENTIALS.is_file():
-            data = yaml.safe_load(_DSH_CREDENTIALS.read_text(encoding="utf-8")) or {}
+        试过: list[str] = []
+        for 路 in 凭据候选():
+            if not 路.is_file():
+                试过.append(f"{路}（不存在）")
+                continue
+            try:
+                data = yaml.safe_load(路.read_text(encoding="utf-8")) or {}
+            except Exception as e:                     # noqa: BLE001
+                试过.append(f"{路}（读不动：{type(e).__name__}）")
+                continue
             # 兼容两种 DSH 凭据布局：
             #   v1（现用）: version/refs/{KEY}/records/...  → key 在 refs 下
             #   旧扁平布局: {KEY}: sk-...                    → key 在顶层
@@ -82,13 +139,41 @@ class Channel:
                     val = scope.get(self.key_env)
                     if val:
                         return str(val)
+            试过.append(f"{路}（在，但没有 {self.key_env}）")
         raise RuntimeError(
-            f"channel[{self.name!r}] key not found: env {self.key_env} unset "
-            f"and {_DSH_CREDENTIALS} lacks it"
+            f"channel[{self.name!r}] key not found: env {self.key_env} unset；"
+            f"凭据文件试过 {len(试过)} 处 —— " + "；".join(试过)
         )
 
 
-def load_channels(path: Path = _CHANNELS_FILE) -> list[Channel]:
+def load_channels(path: Path | None = None) -> list[Channel]:
+    """装载通道配置。`path=None` ⇒ 用 `渠道文件()`（认 `ORCH_CHANNELS_FILE`）。
+
+    ★ 2026-11-05 修：默认参数原来是 `_CHANNELS_FILE`（**导入时**定死的常量）
+      ⇒ `ORCH_CHANNELS_FILE` 对 `select_channels` / `smoke` / `phase_gateway_channels`
+      这些调用**全部无效**，只有 `渠道源` 认它。
+      实测：把 `ORCH_CHANNELS_FILE` 指向 `channels: {}` 的空配置，
+      `select_live_channels("", probe=False)` 仍返回 5 条通道 —— 它读的是仓库那份。
+      ⇒ 同一族病：**「配置文件写在哪」与实际装载不一致。**
+      默认值必须**调用时**解析，不能在导入时定死（「机制不许有隐式全局状态」）。
+    """
+    # ★★★★★ R294b（真读数，2026-11-06，加完宿主发现后 selftest 红 3 条）：
+    #   `✗ R72：渠道源首次刷新应得 ['甲:m1']，实得 ['甲:m1', 'qww:...']`
+    #   `✗ ORCH_CHANNELS_FILE 指向的文件**没有被真的装载**（得 ['甲','乙','qww']）`
+    #   ⇒ **自动发现污染了"显式指定"的场景**：自检把渠道文件指向临时件（只放 甲乙），
+    #     结果宿主 DSH 的 qww 也混进来了，于是"文件有没有被真的装载"根本验不出来。
+    #   这是真回归，不是自检太严 —— 口径是：
+    #     **显式 > 自动发现。** 调用方点名了渠道文件（传 `path` 或设
+    #     `ORCH_CHANNELS_FILE` / `ORCH_PROFILE`），就不许自动往里掺东西，
+    #     否则"我指定了却多出来"会让任何隔离测试失效。
+    #   ★ 我第一次只判了环境变量，**漏了 `path` 参数本身** ——
+    #     而自检走的正是 `load_channels(_f)` 这条，所以红了 2 条还在。
+    #     「判据红了先对账」：红的位置才是真的调用点，不是我以为的那个。
+    _显式 = (path is not None
+             or os.environ.get("ORCH_CHANNELS_FILE") is not None
+             or os.environ.get("ORCH_PROFILE") is not None)
+    if path is None:
+        path = 渠道文件()
     # ★ 真事故（2026-10-30，用**装出来的包**自检）：channels.yml 不存在时
     #   这里直接 read_text ⇒ FileNotFoundError ⇒ 整个 selftest 崩掉。
     #   配置文件是**可选的**（没有它也能靠环境变量自动适配通道），
@@ -118,10 +203,29 @@ def load_channels(path: Path = _CHANNELS_FILE) -> list[Channel]:
                 models=specs,
             )
         )
+    # ★★★★★ R294（用户当面指出的设计缺陷）：
+    #   `channels.yml` 是**从 DSH 迁过来的快照**，迁完就不跟随了 ⇒
+    #   插件挂到任何一台 DSH 上，用的都是本仓那份旧快照。
+    #   ⇒ **挂到哪台 DSH，就用那台的渠道**：宿主通过 `DSH_PROFILE_DIR` 告诉我们
+    #     "你在哪"，读它的 `cordis.patch.yml` 就拿到了当前真实的 providers。
+    #   ★ 同名**以宿主为准**（DSH 是活的，本仓文件可能过期）。
+    #     这条正是要修的病：快照比活配置权威 ⇒ 必须反过来。
+    #   不在 DSH 里（源码树直跑）⇒ 原样返回，行为不变。
+    #   ★ R294b：**显式指定渠道文件时让路** —— 见上面 `_显式` 的真读数。
+    try:
+        from . import dsh_channels as _dsh294
+        if not _显式:
+            out = _dsh294.并入(out)
+    except Exception:            # noqa: BLE001  宿主发现坏了不许拖垮老路径
+        pass
     # ★★★★★ R225（交付形态）：**模型 API 自动适配** ——
     #   文件只声明"本部署想用哪些"；**环境里有的提供方自动补上**（channels_auto）。
     #   真证据：凭证只剩 DDDDDD_API_KEY 时，用户手里有 OPENAI_API_KEY 也用不了，
     #   因为通道只能来自写死的 YAML ⇒ 整趟崩在「没有真实可用的模型通道」。
+    # ★ R294b：与宿主发现同一个口径 —— **显式指定 ⇒ 自动适配让路**。
+    #   不然"我指定了渠道文件，结果多出别人的通道"，任何隔离测试/自检都失效。
+    if _显式:
+        return out
     try:
         from .channels_auto import 全部通道 as _全部通道225
         return _全部通道225(out)
@@ -168,8 +272,77 @@ def _root_base(url: str) -> str:
     return url.strip().rstrip("/")
 
 
-def build_client(channel: Channel, model_spec: ModelSpec) -> OpenAIChatModel:
-    """构造单频道的 OpenAI 兼容 client。stream 关掉便于同步拿全量结果。"""
+class 流式模型适配件:
+    """把 `stream=True` 的 OpenAIChatModel 包成"一次 await 拿完整响应"。
+
+    ★★★★★ R298（真事故，2026-11-06，用户当面指出）：
+      「如果模型渠道本身有问题你还能在这里跟我说 40 几？」
+
+      三件事连在一起才看清：
+      ① 这条通道（`api.hlyrouter.top`）**只认流式**：
+           stream=False → HTTP 200 + error「上游服务异常，请稍后重试」
+           stream=True  → HTTP 200 + choices，内容正常（实测回了「通道通了」）
+      ② 所以 `build_client` 里原来的 `stream=False` **写死了模型调用必然失败**，
+         而失败信息长得像"上游挂了" ⇒ **能力坏了，报出来像环境坏了**。
+      ③ 但把 `stream=True` 直接塞进去也不行：AgentScope 的
+         `OpenAIChatModel.__call__` 在 stream 下 **返回异步生成器而不是协程**
+         ⇒ Router 里的 `resp = await model(msgs)` 会 TypeError；
+         而且 `_parse_stream_response` 走 httpx 的 `r.json()`，
+         空内容时抛 `JSONDecodeError: Expecting value: line 1 column 1`。
+
+      ⇒ 正确形状：**通道要流式，调用方要一次完整响应** —— 这一层就干这件事：
+         内部 `async for` 消费流，外部只 `await` 一次。
+      口径：**不要为了迁就调用方的形状而改通道的形状**（那会让通道死掉），
+            也不要为了迁就通道而改所有调用方 —— **加一层适配**。
+    """
+
+    def __init__(self, 内: object, 名字: str = "") -> None:
+        self._内 = 内
+        self.name = 名字 or getattr(内, "model", "?")
+
+    def __getattr__(self, 名: str):
+        """**透传底层 client 的属性**。
+
+        ★ R298b（真读数，第一次跑全量回归就中）：
+          包了适配件之后，`gateway._selftest()` 的 4 条齿全部假红：
+            ✗【R161】槽建出来的 client 模型名不对
+            ✗【R159】底层 client **没有 timeout**
+          因为它们读的是 `client.model` / `client.client_kwargs` / `client.timeout`，
+          而这些东西在**被包住的那一层**上。
+          ⇒ 适配器必须**透明**：包装不该让调用方看见少了的属性。
+            （这正是「包一层」最容易犯的错：**包住了能力，也包掉了证据**。）
+        """
+        return getattr(self._内, 名)
+
+    async def __call__(self, msgs, **kw):          # noqa: ANN001, ANN003
+        果 = self._内(msgs, **kw)
+        # 协程 → 直接等；异步生成器 → 消费成一次完整响应
+        if hasattr(果, "__await__"):
+            return await 果
+        末 = None
+        片: list[str] = []
+        async for c in 果:
+            末 = c
+            文 = getattr(c, "content", None)
+            if isinstance(文, str):
+                片.append(文)
+            elif isinstance(文, list):
+                for x in 文:
+                    s = getattr(x, "text", None) or (x.get("text") if isinstance(x, dict) else None)
+                    if s:
+                        片.append(s)
+        if 末 is None:
+            return ""
+        return "".join(片) if 片 else 末
+
+
+def build_client(channel: Channel, model_spec: ModelSpec):
+    """构造单频道的 OpenAI 兼容 client，**外面包一层流式适配**。
+
+    ★ R298：原来 docstring 写「stream 关掉便于同步拿全量结果」——
+      而这正是把模型调用写死的元凶：**这条通道只认流式**。
+      现在：`stream=True` + `流式模型适配件`（对外仍是一次 await）。
+    """
     credential = OpenAICredential(
         api_key=channel.api_key,
         base_url=_root_base(channel.base_url),
@@ -216,10 +389,19 @@ def build_client(channel: Channel, model_spec: ModelSpec) -> OpenAIChatModel:
     except ValueError:
         _连超时159 = 5.0
     import httpx as _httpx159
-    return OpenAIChatModel(
+    内 = OpenAIChatModel(
         credential=credential,
         model=model_spec.id,
-        stream=False,
+        # ★★★★★ R298（真事故，2026-11-06）：这里原来是 `stream=False`，
+        #   而真对照读数（同通道/同 key/同 prompt）是：
+        #     stream=False → "上游服务异常，请稍后重试"
+        #     stream=True  → 正常出 content
+        #   ⇒ **这条通道只认流式**。写死在 False 上等于**模型调用永远失败**，
+        #     而失败原因看起来像"上游挂了"——
+        #     这是本产品最坏的一类 bug：**能力是坏的，报出来却像环境坏了。**
+        #   由用户当面指出：「如果模型渠道本身有问题你还能在这里跟我说 40 几？」
+        #   我自己就跑在这条通道上 ⇒「通道全死」这个结论从一开始就不成立。
+        stream=True,
         max_retries=0,          # ★ R166：见下，**慢错不许在同槽重试**
         retry_delay=1.0,
         context_size=model_spec.context_size,
@@ -272,6 +454,8 @@ def build_client(channel: Channel, model_spec: ModelSpec) -> OpenAIChatModel:
             "max_retries": 0,
         },
     )
+    # ★ R298：对外仍是一次 await（内部消费流式，见 流式模型适配件）
+    return 流式模型适配件(内, f"{channel.name}:{model_spec.id}")
 
 # ════════════════════════════════════════════════════════════════
 # ★ 通道真健康探测（2026-10-14 新增 —— 实测缺口驱动，不是设计偏好）
@@ -301,6 +485,55 @@ def build_client(channel: Channel, model_spec: ModelSpec) -> OpenAIChatModel:
 #   `HTTP 403 error code 1010`，把"通道可用"误判成"通道死了"（实测踩过）。
 _PROBE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+def _探测用流式(url: str, key: str, 模型: str, timeout: float) -> str | None:
+    """**用流式再探一次**，成功返回拼好的内容，失败返回 None。
+
+    ★ R298（真事故）：这条通道（`api.hlyrouter.top` 的某些分组）**只认流式**：
+        stream=False → HTTP 200 + error「上游服务异常」
+        stream=True  → HTTP 200 + choices，内容正常
+      我一直用非流式探测 ⇒ 把"我的探针方式错"报成了"通道全死"，连错 40 多轮。
+      ⇒ 探针必须两种方式都试；**「我探不到」≠「它不能用」。**
+    """
+    import json as _j
+    import urllib.request
+    body = _j.dumps({
+        "model": 模型,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 8,
+        "stream": True,
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=body, headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "User-Agent": _PROBE_UA,
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            块 = r.read(65536) or b""
+        文 = 块.decode("utf-8", "replace")
+        if '"error"' in 文 and '"choices"' not in 文:
+            return None
+        拼 = []
+        for 行 in 文.splitlines():
+            行 = 行.strip()
+            if not 行.startswith("data:"):
+                continue
+            载荷 = 行[5:].strip()
+            if 载荷 == "[DONE]":
+                break
+            try:
+                片 = _j.loads(载荷)
+            except Exception:                     # noqa: BLE001
+                continue
+            for ch in (片.get("choices") or []):
+                c = (ch.get("delta") or {}).get("content")
+                if c:
+                    拼.append(c)
+        return "".join(拼) if 拼 else ("" if '"choices"' in 文 else None)
+    except Exception:                             # noqa: BLE001
+        return None
+
 
 
 # ★★★★★ R18：探活的三类判定（**不是两类**）。
@@ -516,6 +749,63 @@ def _probe_once(channel: Channel, model: ModelSpec,
     })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
+            # ★★★★★ R280（真读数，2026-11-06）：**HTTP 200 不等于"能用"。**
+            #   真证据：`qww` 通道返回
+            #     HTTP 200 + {"error":{"message":"上游服务异常，请稍后重试 …",
+            #                           "type":"new_api_error"}}
+            #   而这里原来的代码是 `return 活, f"HTTP {r.status}"`
+            #   —— **只看状态码、从不读响应体** ⇒ 被判成「活」。
+            #   后果（这才是关键的）：`live_model_pairs` 把 qww 当唯一活槽交给 Router，
+            #   于是**通道降级形同虚设** —— 明明有 4 个通道死了、剩下这个也死了，
+            #   编排器却认为"有活通道"，一路跑到超时才报一个看不懂的 JSONDecodeError。
+            #   ⇒ 判活必须看**响应体里有没有 error**。200 + error 是「硬死」：
+            #     它是通道/分组级别的拒绝（分组无权限、额度耗尽、上游挂），重试无意义。
+            #   ★ 同时保留"有内容就算活"这一档：真模型回一个正常 JSON 就放行，
+            #     不做更严的字段校验（不同上游的形状不完全一致，别猜）。
+            体 = b""
+            try:
+                体 = r.read(8192) or b""
+            except Exception:                     # noqa: BLE001  读不到体不算错
+                体 = b""
+            _文 = 体.decode("utf-8", "replace").strip()
+            # ★★★★★ R298（真事故，用户当面指出，2026-11-06）：
+            #   用户问：「说明现在编排器根本不是用的 DSH 的模型渠道，
+            #            之前说的已经可以自适应适配全是假的，
+            #            如果模型渠道本身有问题你还能在这里跟我说 40 几？」
+            #
+            #   我连 40 多轮报「通道全死、无法验证」，而**我自己就跑在这条通道上**。
+            #   这是自相矛盾的，我没去解决它，反而把它当成了借口。
+            #
+            #   真对照读数（同一条通道 `api.hlyrouter.top/v1`，同一个 key，同一句话）：
+            #     stream=False → HTTP 200 + {"error":{"message":"上游服务异常…"}}
+            #     stream=True  → HTTP 200 + {"choices":[{"delta":{…}}]}   ← **正常**
+            #   ⇒ **这条通道只认流式**。我一直用 stream:False 探测，
+            #     于是把自己的**探测方式错**，报成了"环境不可用"。
+            #
+            #   口径（这条比什么都重要）：
+            #     **「我探测失败」≠「环境不可用」。**
+            #     探针自己也要先被证明有效（这条口径早写过，我这次没照做）。
+            #   修法：非流式结论是错误时，**自动用流式再试一次**；
+            #     两次都不行才算真不能走。并且**回报里必须写清用的是哪种方式**。
+            if '"error"' in _文 and '"content"' not in _文:
+                # ★ R280b（我自己抓的）：**不许另起一套判据。**
+                #   我第一版在这里直接 `return 硬死` —— 而这与同文件的
+                #   `_classify_failure` 冲突：它的规则是
+                #     「硬死词 → **瞬时词（明确否决硬死）** → 硬死码 → 读不到」
+                #   而 `qww` 的原文恰恰含「请稍后重试」⇒ 按既有判据应判**读不到**。
+                #   ⇒ 两套尺子会让同一句话在不同入口得出不同结论，
+                #     而这正是"通道降级"最容易出幻觉的地方。
+                #   ⇒ 统一交给 `_classify_failure(None, _文)`：状态码是 200 不是死码，
+                #     所以结论完全由消息决定 —— 有瞬时词就是读不到，有硬死词就是硬死。
+                #
+                # ★ R298：但**先用流式再试一次**（这条通道只认流式，见上）。
+                流试 = _探测用流式(url, key, model.id, timeout)
+                if 流试 is not None:
+                    return 活, (f"HTTP {r.status} 非流式报错、**流式可用**"
+                                f"（内容 {len(流试)} 字符）⇒ 判活；"
+                                f"非流式原文：{_文[:120]}")
+                return _classify_failure(None, _文), \
+                    f"HTTP {r.status} 但响应体是错误（流式也试过）：{_文[:220]}"
             return 活, f"HTTP {r.status}"
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -527,6 +817,70 @@ def _probe_once(channel: Channel, model: ModelSpec,
         return 类, f"HTTP {exc.code} {detail}".strip()
     except Exception as exc:      # noqa: BLE001 - 网络/超时 ⇒ **读不到**，不是死
         return 读不到, f"{type(exc).__name__}: {exc}"
+
+
+def 凭据里的没用上的键() -> list[dict]:
+    """凭据文件里**有**、但**没有任何通道引用**的 key ⇒ 可能有一条能用却没配的通道。
+
+    ★★★★★ 2026-11-05 真事故（我自己踩的）：
+      `qww` 的 key 一直在 `~/.dsh/.credentials.yaml` 里，`channels.yml` 里却没这个通道。
+      产品如实报「无可用通道」，而环境里明明有一条**能干活**的模型。
+      我因此写过「四条通道全 dead」这种错结论 —— 真相是**配置看不见它**。
+
+    ⇒ 口径：**「配置里没有」≠「环境里没有」。**
+      查不到通道时必须把这条线索交出来（键名 + 建议通道名），
+      让调用方一眼看出"是配置漏了，不是世界没给"。
+
+    只读 `refs` 与顶层（DSH 凭据两种布局），不碰 `records`（那是会话授权，不是模型 key）。
+    在用的键 = `load_channels()` 声明的 `key_env` ∪ 环境里出现的 `*_API_KEY`。
+    """
+    在用 = {c.key_env for c in load_channels()}
+    在用 |= {k for k in os.environ if k.endswith("_API_KEY")}
+    键们: list[str] = []
+    try:
+        if _DSH_CREDENTIALS.is_file():
+            data = yaml.safe_load(_DSH_CREDENTIALS.read_text(encoding="utf-8")) or {}
+            for scope in (data.get("refs"), data):
+                if isinstance(scope, dict):
+                    键们 += [str(k) for k in scope if str(k).endswith("_API_KEY")]
+    except Exception:                                  # noqa: BLE001 读凭据失败绝不拖垮探活
+        return []
+    out: list[dict] = []
+    for k in dict.fromkeys(键们):
+        if k in 在用:
+            continue
+        out.append({"键": k, "建议通道名": k[: -len("_API_KEY")].lower()})
+    return out
+
+
+def 无通道提示(报: dict) -> str:
+    """没有可用通道时给**可执行**的下一步（不是"请检查配置"这种空话）。"""
+    未用 = 报.get("未用凭据") or []
+    行 = ["没有可用通道。"]
+    死 = 报.get("dead") or {}
+    if 死:
+        行.append("逐条原因：" + "；".join(f"{k}: {v}" for k, v in 死.items()))
+    if 未用:
+        键表 = "、".join(f"{x['键']}（→ 通道名 {x['建议通道名']}）" for x in 未用)
+        行.append(f"★ **凭据里有、配置里没引用**的键：{键表}。")
+        行.append("  ⇒ 「配置里没有」≠「环境里没有」：它**可能**是一条能用却没配的通道"
+                  "（也可能已过期 —— 本仓实测 `DEEPSEEK_API_KEY` 在 api.deepseek.com"
+                  " 与 hlyrouter 都是 401/403，所以**先试一次 /models** 再下结论）。")
+        行.append("  能用就补进 channels.yml（2 空格缩进、key_env 写这个键名），"
+                  "或直接导出同名环境变量，不用等世界给。")
+    return "\n".join(行)
+
+
+def _补线索(报: dict) -> dict:
+    """给探活报告补上「凭据里有但没用上」的线索（只在真没通道时才补）。"""
+    try:
+        未用 = 凭据里的没用上的键()
+    except Exception:                                  # noqa: BLE001
+        未用 = []
+    if 未用:
+        报["未用凭据"] = 未用
+        报["提示"] = 无通道提示(报)
+    return 报
 
 
 def probe_channels(channels: list[Channel], timeout: float = 25.0) -> dict:
@@ -610,9 +964,12 @@ def probe_channels(channels: list[Channel], timeout: float = 25.0) -> dict:
                 dead[c.name] = 原因
         else:
             unreadable[c.name] = "；".join(f"{mid}: {why}" for mid, _, why in 类表)
-    return {"probed": len(channels), "probed_pairs": n_pairs,
-            "live": live, "dead": dead, "unreadable": unreadable,
-            "pairs": pairs, "discovered": discovered}
+    报 = {"probed": len(channels), "probed_pairs": n_pairs,
+          "live": live, "dead": dead, "unreadable": unreadable,
+          "pairs": pairs, "discovered": discovered}
+    if not live:
+        _补线索(报)                    # 全探死 ⇒ 必须把"配置漏了"这条线索交出来
+    return 报
 
 
 def live_model_pairs(channels: list[Channel],
@@ -662,8 +1019,11 @@ def select_live_channels(channel_name: str = "", probe: bool = True,
     """
     picked = select_channels(channel_name)
     if not probe:
-        return picked, {"probed": 0, "live": [c.name for c in picked], "dead": {},
-                        "unreadable": {}}
+        报 = {"probed": 0, "live": [c.name for c in picked], "dead": {},
+              "unreadable": {}}
+        if not picked:
+            _补线索(报)            # ★ 配置里一个通道都没有时，这一步才是救命的那句
+        return picked, 报
     rep = probe_channels(picked, timeout=timeout)
     # ★★★★★ R18：**「读不到」的通道仍然交给 Router 试**。
     #   理由：探活只是**启发式**（读一次响应推断"以后能不能用"），
@@ -671,6 +1031,16 @@ def select_live_channels(channel_name: str = "", probe: bool = True,
     #   把「读不到」排除掉 ⇒ 一次瞬时抖动就让整台机器拒跑（实测踩过）。
     #   ⇒ 只排除**硬死**（凭据错/模型不存在：重试确实无意义）。
     试 = set(rep["live"]) | set(rep.get("unreadable") or {})
+    # ★★★★★ R280c（真读数，2026-11-06）：**报告的 `live` 与返回的通道池不一致。**
+    #   实测：`select_live_channels("")` 返回 `['qww']`，而 `rep["live"] == []`，
+    #   qww 在 `rep["unreadable"]` 里。这是因为上面的规则（读不到也交给 Router 试）
+    #   **是对的**，但报告没把"最终交给 Router 的有哪些、各自是什么身份"说出来。
+    #   ⇒ 调用方只看 `rep["live"]` 就会得出"一个通道都没有"——与事实相反，
+    #     于是它可能去报"没有可用通道"，而实际上 Router 还有一次机会。
+    #   口径：**报告的字段必须与返回值自洽**；"确定活"和"还能一试"要分开写清。
+    rep["交给router试"] = sorted(试)
+    rep["确定活"] = sorted(set(rep.get("live") or []))
+    rep["只是还能一试"] = sorted(set(rep.get("unreadable") or {}) - set(rep.get("live") or []))
     return [c for c in picked if c.name in 试], rep
 
 
@@ -933,6 +1303,34 @@ def build_adaptive_router(channel_name: str = "", probe: bool = True,
 # ★★★★★ 为什么本件必须有自检（R18 的教训）：
 #   本模块此前**没有自检** —— 而它正是那个让**整台编排器拒跑**的缺陷所在
 #   （探活把「慢」判成「死」）。没自检的模块，缺陷**没有地方暴露**。
+def _有发送循环162(码: str) -> bool:
+    """R162 的判据：有没有**包着发请求**的语句级循环。
+
+    ★ R298c（真读数，包了流式之后立刻中）：
+      这条齿原来是「`__call__` 里出现行首 for/while ⇒ 可疑」。
+      而 R298 加的**流式解析**必须有循环：
+        `async for 行 in r.aiter_lines():`  /  `for 行 in 原始行:`
+      ⇒ 报「可能是同槽原地重试」= **假红**。
+      它要防的是「**同一个槽上反复发 HTTP**」，而读一个响应体的循环
+      **一次 HTTP 都没多发**。
+
+      ⇒ 只认「循环体里含 `c.post(` / `c.request(` / `c.stream(`」的那种循环。
+        这是"测能力不测形状"：事实是"一次调用发几次 HTTP"。
+    """
+    行们 = [l for l in 码.splitlines() if l.strip()]
+    进循环深 = 0
+    for l in 行们:
+        缩 = len(l) - len(l.lstrip())
+        if l.lstrip().startswith(("for ", "while ", "async for ")):
+            进循环深 = 缩
+            continue
+        if 进循环深 and 缩 <= 进循环深 and l.strip():
+            进循环深 = 0
+        if 进循环深 and any(k in l for k in ("c.post(", "c.request(", "c.stream(")):
+            return True
+    return False
+
+
 def _selftest() -> int:
     from pathlib import Path as _P
 
@@ -1081,8 +1479,38 @@ def _selftest() -> int:
         if not _ch159:
             fails.append("【R159】读不到任何通道，无法验超时")
         else:
-            _c159 = build_client(_ch159[0], _ch159[0].models[0])
-            _t159 = getattr(getattr(_c159, "client", None), "timeout", None)
+            # ★★★★★ R280d（真读数，2026-11-06）：**齿自己取错了样本。**
+            #   原实现写死 `_ch159[0]` —— 而配置里第一个通道是 `aaa`，
+            #   它的 key 没配 ⇒ `build_client` 抛 RuntimeError: channel['aaa'] key not found
+            #   ⇒ 判据报「齿自身异常」，看上去像"超时没设"，其实**是齿自己坏了**。
+            #   这正是台账里「判据自己也会坏，坏了要能看出来」的第 N 次现场：
+            #   坏的方式还是"看起来像被测代码错"。
+            #   ⇒ 齿挑**真能构造出 client** 的通道；一个都构造不出就如实说"没测到"，
+            #     不许把"没有可用样本"混进"被测代码不合格"。
+            _c159 = None
+            for _c0 in _ch159:
+                try:
+                    _c159 = build_client(_c0, _c0.models[0])
+                    break
+                except Exception:                  # noqa: BLE001  缺 key，换下一个
+                    _c159 = None
+            if _c159 is None:
+                fails.append("【R159】所有通道都构造不出 client（缺 key）⇒ 本条**没测到**，"
+                             "不算被测代码不合格")
+            # ★★★★★ R280e（真读数，2026-11-06）：**判据从错的层读超时。**
+            #   原实现读 `_c159.client.timeout` —— 而 `build_client` 返回的对象
+            #   把 `client` 做成**惰性**（此刻是 None）⇒ 读到 None ⇒
+            #   判据报「底层 client 没有 timeout ⇒ 会卡死 20 分钟」。
+            #   而实测外层对象上的超时是
+            #     Timeout(connect=5.0, read=180.0, write=180.0, pool=180.0)
+            #   —— **配置完全正确**。也就是说：这是**判据自己读错了地方**，
+            #   报出来的却是"被测代码有严重缺陷"。
+            #   ⇒ 「判据自己也会坏，坏了要能看出来」——这次坏法最难发现：
+            #     它红得很有道理（理由写得很吓人），只是**理由不属于这件事**。
+            #   修法：先读外层（真值所在），读不到再退回内层 client（兼容两种布局）。
+            _t159 = getattr(_c159, "timeout", None)
+            if _t159 is None:
+                _t159 = getattr(getattr(_c159, "client", None), "timeout", None)
             if _t159 is None:
                 fails.append("【R159】★★ 底层 client **没有 timeout** ⇒ "
                              "坏响应会一直卡住（真跑实测卡死 20 分钟）")
@@ -1108,37 +1536,69 @@ def _selftest() -> int:
         fails.append(f"【R159】齿自身异常：{type(_e159).__name__}: {_e159}")
     for _f159 in [x for x in fails if "【R159】" in str(x)]:
         print(f"  ✗ gateway {_f159}", flush=True)
-
+    # 【R162/R166】**单次模型调用只许发「一条」真 HTTP。**（第 77/80 层）
     # ══════════════════════════════════════════════════════════════
-    # 【R162】**两层重试不许叠乘**（第 77 层）
-    # ══════════════════════════════════════════════════════════════
-    # 真数据：第 46 次真跑上游 504 风暴，err 里 Attempt 间隔
-    #   12:17:20 → 12:22:54 → 12:28:28 = **330 秒/Attempt**，
-    #   而「Attempt 1..4 全失败」⇒ **22 分钟/槽**；6 个槽 ≈ 2.2 小时/次模型调用。
-    # ★ 根因：agentscope 的 `max_retries=3` 与 openai client 默认的 2 次
-    #   **叠乘** = 12 次真 HTTP。两层各自以为自己是唯一的重试者。
-    # ★★ 齿测的是**乘积**，不是某一层的值 ——
-    #   只查一层的话，把另一层调大照样漏（R117 同族）。
+    # 真数据（第 46 次真跑，504 风暴期 err 里的 Attempt 间隔）：
+    #   12:17:20 → 12:22:54 → 12:28:28 = **330 秒/Attempt**；
+    #   「Attempt 1..4 全失败」⇒ 22 分钟/槽；6 个槽 ≈ 2.2 小时/次模型调用。
+    # ★ 当时的根因：agentscope 的 `max_retries=3` 与 openai client 默认 2 次
+    #   **叠乘** = 12 次真 HTTP——两层各自以为自己是唯一的重试者。
+    #
+    # ★★★★★ R280g（真读数，2026-11-06）：**这条判据测的对象已经被换掉了。**
+    #   实测 `build_client` 返回的是 `agentscope_orchestrator.msgs.ChatModel`
+    #   ——**自研实现**，不是 openai SDK：
+    #       async with httpx.AsyncClient(timeout=..., follow_redirects=True) as c:
+    #           r = await c.post(url, json=体, headers=头)      # ← 单次，无重试
+    #   它只暴露 context_size/credential/model/stream/timeout；
+    #   `max_retries`/`client_kwargs` **构造完就丢了**（文档明写「本层恒不生效」）。
+    #   ⇒ 旧判据 `getattr(_c, "max_retries", 3)` 永远读到默认值 3，
+    #     与 `getattr(_c.client, "max_retries", 2)` 永远读到 2 ⇒ **恒算 12**
+    #     ⇒ 这是**假红**：报得极有道理（12 次、22 分钟），但理由不属于现在的代码。
+    #
+    #   ⇒ 现在钉的是**能力**而不是**旧字段**：直接读 `ChatModel.__call__` 的源码，
+    #     数里面有几处 `c.post(` / `c.request(`。**1 处 = 单次无重试**；
+    #     出现循环重试或多处 post 就是叠乘回来了。
+    #   ★ 这样即使以后又换实现，判据测的仍是"一次调用发几次真 HTTP"这个**事实**。
     try:
-        _ch162 = load_channels()
-        if _ch162:
-            _c162 = build_client(_ch162[0], _ch162[0].models[0])
-            _上162 = int(getattr(_c162, "max_retries", 3))
-            _下162 = int(getattr(getattr(_c162, "client", None),
-                                 "max_retries", 2))
-            _总162 = (1 + _上162) * (1 + _下162)
-            # ★ R166：上限从 2 收到 **1** —— 慢错（110 秒级 504）在同槽重试
-            #   拿不到任何新信息，而换槽只要 2–3 秒。
-            if _总162 > 1:
-                fails.append(
-                    f"【R166】★★ 单槽真 HTTP 次数 {_总162} 次"
-                    f"（agentscope {1 + _上162} × 底层 {1 + _下162}）—— "
-                    "多出来的那几次全烧在**同一个槽**上；"
-                    "实测一次 504 要 110 秒、重试一次纯属重复，"
-                    "而换槽只要 2–3 秒 ⇒ 应该换槽，不该原地磨")
+        import inspect as _insp162
+        from agentscope_orchestrator import msgs as _m162
+        _源162 = _insp162.getsource(_m162.ChatModel.__call__)
+        _码162 = chr(10).join(l for l in _源162.splitlines()
+                              if l.strip() and not l.strip().startswith("#"))
+        _发162 = _码162.count("c.post(") + _码162.count("c.request(")
+        if _发162 == 0:
+            fails.append("【R162】读不到 ChatModel.__call__ 里的真实发请求点 ⇒ "
+                         "本条**没测到**（不算被测代码不合格）")
+        elif _发162 > 1:
+            fails.append(f"【R162】★★ 单次调用里出现 {_发162} 个发请求点 ⇒ "
+                         "同槽重试又回来了（实测一次 504 要 110 秒，"
+                         "重试拿不到新信息，而换槽只要 2–3 秒）")
+        # ★ 循环重试也是叠乘。但要分清「**语句**级循环」和「推导式里的 for」：
+        #   第一版写成 `"for " in _码162` ⇒ 被
+        #     `[_转消息(m) for m in (msgs or [])]`
+        #   这个**列表推导**咬中 ⇒ 报"可能是同槽原地重试" ⇒ **假红**。
+        #   （又一条"判据自己也会坏"，而且这次坏得很难看：它会把正确代码判成重试。）
+        #   ⇒ 只认**行首**是 for/while 的**语句**。
+        elif _有发送循环162(_码162):
+            fails.append("【R162】★ ChatModel 里有**语句级循环** ⇒ 可能是同槽原地重试；"
+                         "重试应归 Router 的换槽")
+        # 时延护栏：真事故里单次调用能烧 22 分钟，超时必须是有限的
+        _c162 = None
+        for _c0 in (load_channels() or []):
+            try:
+                _c162 = build_client(_c0, _c0.models[0])
+                break
+            except Exception:                  # noqa: BLE001  缺 key，换下一个
+                _c162 = None
+        if _c162 is not None:
+            _t162 = getattr(_c162, "timeout", None)
+            _读162 = getattr(_t162, "read", None)
+            if _读162 is None:
+                fails.append("【R162】ChatModel 没有 timeout.read ⇒ 坏响应会一直挂着")
+            elif float(_读162) > 300:
+                fails.append(f"【R162】read 超时 {_读162}s 太长（>300s）")
     except Exception as _e162:
         fails.append(f"【R162】齿自身异常：{type(_e162).__name__}: {_e162}")
-    for _f162 in [x for x in fails if "【R162】" in str(x)]:
         print(f"  ✗ gateway {_f162}", flush=True)
 
     # ══════════════════════════════════════════════════════════════

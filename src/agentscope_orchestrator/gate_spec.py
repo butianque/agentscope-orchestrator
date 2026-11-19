@@ -508,19 +508,6 @@ import platform as _platform
 import sys as _sys
 
 
-def _to_wsl_path(p: str) -> str:
-    """Windows 路径 → WSL /mnt 路径（E:\\a → /mnt/e/a）。已是 /mnt/ 则原样。"""
-    if not p:
-        return p
-    p = p.replace("\\", "/")
-    if p.startswith("/mnt/"):
-        return p
-    m = re.match(r"^([A-Za-z]):", p)
-    if m:
-        return "/mnt/" + m.group(1).lower() + p[2:]
-    return p
-
-
 def _map_wsl_in_text(s: str) -> str:
     """把文本内所有盘符路径（`E:\\...` / `E:/...`）映射为 /mnt/<drive>/...。
     用于 bash 脚本字符串——脚本里 grep/awk 引用的 {file}/{work} 绝对路径在 WSL
@@ -712,8 +699,110 @@ def _evidence(out: str, err: str, limit: int = 6000) -> str:
     return 合并[:limit // 3] + "\n\n[尾部]\n" + 合并[-(limit - limit // 3 - 16):]
 
 
+def _同目录串行(cwd):
+    """**同一个构建目录里的门命令串行执行** —— 并发会抢共享构建锁。
+
+    ★★★★★ 2026-11-05 真事故（两个测试从"未验"变红，根因在这里）：
+      两个窗并发跑 `lake env lean`，第二个在
+      `<pkg>/.lake/config/[anonymous]/lakefile.olean.lock` 上拿到
+      `error: permission denied (error code: 13)` ⇒ shell_ok 当场红。
+      而**手工单跑同一条命令 4~10 秒 exit 0**。
+      ⇒ 这不是"产物坏了"，是**并发抢构建锁**被读成了"证明失败"。
+
+    为什么做成机制、而不是给 Lean 打补丁：任何**在共享目录里落缓存/索引**的
+    构建系统（cargo 的 target、lake 的 .lake、npm 的 node_modules）都有这个性质。
+    判据门只需保证"同目录不并发"，与语言无关。
+
+    超时就**不锁**照跑（宁可可能红，也不让门卡死）；锁文件在系统临时目录，
+    不往被测仓里写东西（「判据的仓里不许出现判据自己写出来的东西」）。
+    """
+    import contextlib
+    import hashlib
+    import os as _os
+    import tempfile
+    import time as _time
+
+    @contextlib.contextmanager
+    def _锁():
+        try:
+            键 = hashlib.sha1(str(_os.path.abspath(str(cwd))).encode()).hexdigest()[:16]
+            路径 = _os.path.join(tempfile.gettempdir(), f"orch_gate_{键}.lock")
+            # ★ R236（2026-11-05 case01 真跑）：**进程的临时目录可能退化成仓内**。
+            #   `tempfile.gettempdir()` 会挑"第一个可写"的候选；受限环境里 %TEMP%
+            #   写不进 ⇒ 它退到最后那个候选 = **当前工作目录** ⇒ 锁文件被写进
+            #   被测仓根（真读：`case01/orch_gate_032a4d181847d250.lock`），
+            #   而口径是「判据的仓里不许出现判据自己写出来的东西」。
+            #   ⇒ 一旦解析出的临时目录落在仓内，就用工具自己的 work 目录放锁。
+            _临 = _os.path.abspath(tempfile.gettempdir())
+            _仓 = _os.path.abspath(str(cwd))
+            if _临 == _仓 or (_仓 + _os.sep).startswith(_临 + _os.sep):
+                from agentscope_orchestrator import profile as _pm
+                _锁基 = Path(str(_pm.get_profile().work_dir)) / "_locks"
+                _锁基.mkdir(parents=True, exist_ok=True)
+                路径 = str(_锁基 / f"orch_gate_{键}.lock")
+            句柄 = open(路径, "a+b")                     # noqa: SIM115
+        except Exception:                              # noqa: BLE001 锁建不出来就不锁
+            yield
+            return
+        开始 = _time.time()
+        拿到 = False
+        try:
+            if _os.name == "nt":
+                import msvcrt
+                while True:
+                    try:
+                        句柄.seek(0)
+                        msvcrt.locking(句柄.fileno(), msvcrt.LK_NBLCK, 1)
+                        拿到 = True
+                        break
+                    except OSError:
+                        if _time.time() - 开始 > 1800:     # 半小时拿不到 ⇒ 不锁照跑
+                            break
+                        _time.sleep(0.2)
+            yield
+        finally:
+            try:
+                if 拿到 and _os.name == "nt":
+                    import msvcrt
+                    句柄.seek(0)
+                    msvcrt.locking(句柄.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:                          # noqa: BLE001
+                pass
+            try:
+                句柄.close()
+            except Exception:                          # noqa: BLE001
+                pass
+
+    return _锁()
+
+
 def _run(cmd: list[str], cwd, timeout: int = 300, stall: int | None = None,
          label: str = "", env: dict | None = None) -> tuple[int, str, str]:
+    """门外壳：**同一个 cwd 的命令串行**，再交给 `_run_裸` 执行。
+
+    ★ 2026-11-05 真跑抓到的缺陷（是"自述检索"把它翻出来的）：
+      `compile` 门的 `cmd` 写成**字符串**时，`[str(c) for c in cmd]` 会把字符串
+      **按字符拆开** ⇒ 报出来的是「**命令无法启动**」。实测（三条门，同一台机器）：
+      ```
+      列表形式      ok=True  rc=0  cause=绿
+      字符串形式    ok=False rc=-1 cause=命令无法启动|…
+      裸命令字符串  ok=False rc=-1 cause=命令无法启动|…
+      ```
+      ⇒ 这是**门规格写错**，不是"环境缺件"。两者混成一个因由，人就会被送去
+      查 PATH（"这台机器没装 echo？"）而不是查规格。口径：
+      **规格错与环境错不许共用一个因由。**
+      守卫放在这里（唯一的跑命令入口）⇒ 所有门型、探针、差分一起受益。
+    """
+    if isinstance(cmd, str):
+        return -1, "", ("[CMD_SPEC_INVALID] cmd 必须是**列表**（argv 形式）；"
+                        "写成字符串会按字符拆开执行 —— 这是**门规格写错**，"
+                        "不是命令不存在")
+    with _同目录串行(cwd):
+        return _run_裸(cmd, cwd, timeout, stall, label, env)
+
+
+def _run_裸(cmd: list[str], cwd, timeout: int = 300, stall: int | None = None,
+          label: str = "", env: dict | None = None) -> tuple[int, str, str]:
     """跑命令回 (rc, stdout, stderr)。两类软失败都不抛异常：
       · 总超时 timeout → rc=-1 + [SUBPROCESS_TIMEOUT]（develop 不会被崩掉）
       · 挂起 stall：若指定 `stall` 秒，则流式读输出，**长时间无新输出即判
@@ -793,18 +882,27 @@ def _run(cmd: list[str], cwd, timeout: int = 300, stall: int | None = None,
     _env.setdefault("CARGO_TERM_COLOR", "never")
     if not use_stall:
         try:
+            # ★★★★★ R268（2026-11-05 真读数）：**子进程输出不能硬编 UTF-8**。
+            #   真证据：本机真 javac（中文 locale，出厂默认）输出的是 GBK
+            #     b'src\\Helper.java:1: \xb4\xed\xce\xf3: \xd5\xd2\xb2\xbb\xb5\xbd\xb7\xfb\xba\xc5'
+            #   按 utf-8 解码 ⇒ `src\Helper.java:1: ??????`（乱码）
+            #   ⇒ 我特意在失败栈解析里补的中文诊断词「错误/警告」**一个字都匹配不上**，
+            #     改动面变成 []。而且 `locale.getpreferredencoding()` 返回 utf-8，
+            #     **它跟子进程实际用的 ANSI 代码页不是一回事** —— 靠它猜会猜错。
+            #   口径：**先拿字节，再按「能不能解成 UTF-8」判**；解不了就用系统 ANSI 代码页。
+            #     （UTF-8 是自校验的，能解通基本就是 UTF-8；解不通就是本地代码页。）
             proc = subprocess.run([str(c) for c in cmd], cwd=str(cwd),
-                                  capture_output=True, text=True, timeout=timeout,
-                                  encoding="utf-8", errors="replace", env=_env,
-                                  stdin=subprocess.DEVNULL)
-            return proc.returncode, proc.stdout, proc.stderr
+                                  capture_output=True, timeout=timeout,
+                                  env=_env, stdin=subprocess.DEVNULL)
+            return (proc.returncode,
+                    _解输出268(proc.stdout), _解输出268(proc.stderr))
         except subprocess.TimeoutExpired as e:
             out = getattr(e, "stdout", None) or b""
             err = getattr(e, "stderr", None) or b""
             if isinstance(out, bytes):
-                out = out.decode("utf-8", errors="ignore")
+                out = _解输出268(out)
             if isinstance(err, bytes):
-                err = err.decode("utf-8", errors="ignore")
+                err = _解输出268(err)
             return -1, out, f"[SUBPROCESS_TIMEOUT >{timeout}s] {err}"
         except OSError as e:
             # ★★★ 2026-10-14 真跑抓到的缺陷（**命令起不来 ⇒ 炸穿整个门评估**）：
@@ -1029,6 +1127,9 @@ def _pats_of(g: dict) -> list:
 _TIMEOUT_RE = re.compile(r"\[SUBPROCESS_TIMEOUT\s*>(\d+)s\]")
 _STALL_RE = re.compile(r"\[HANG_STALL\s*无输出>(\d+)s\]")
 _CMDNF_RE = re.compile(r"\[CMD_NOT_FOUND\]\s*<([^>]*)>")
+# ★ 门规格写错（目前只有一种：cmd 写成字符串）—— 必须与「命令不存在」分开，
+#   否则同一句话会把人送去查 PATH 而不是查规格（2026-11-05 实测）。
+_CMDSPEC_RE = re.compile(r"\[CMD_SPEC_INVALID\]\s*(.+)")
 _ERRCODE_RE = re.compile(r"error\[(E\d{4})\]")
 _ERRHEAD_RE = re.compile(r"^\s*error(\[E\d{4}\])?:\s*(.*)$")
 _ERRLOC_RE = re.compile(r"^\s*-->\s*(\S+?):(\d+):(\d+)")
@@ -1115,6 +1216,13 @@ def 判据因由(g: dict, ok: bool, info: dict) -> str:
         # 否则真实的失败因由会被它顶掉（活体真跑抓到过：rc=1 文件不存在，
         # 回执却写"写量不可计" ⇒ 可诊断变成不可诊断）。
         return "资源上限未验|写量不可计（仓规模超出计时/硬顶）"
+
+    # ★★★ 门规格写错 —— 必须排在「命令起不来」**前面**（2026-11-05 实测）：
+    #   cmd 写成字符串时，旧实现报 `命令无法启动|<门名>`，看着像"这台机器没装这个命令"，
+    #   实际是规格错。两个因由混用 ⇒ 诊断方向被带偏。
+    m = _CMDSPEC_RE.search(err)
+    if m:
+        return "门规格非法|" + m.group(1).strip()
 
     # ★★★ 命令起不来 —— 对**一切**跑命令的门型统一先判（2026-10-14 真跑抓到）。
     #   原实现让 `FileNotFoundError` 逃逸出 `evaluate` ⇒ 一个坏门规格把**所有门**
@@ -1312,7 +1420,8 @@ def _读入参(g: dict, key: str, path: Path, work_dir: Path
         return None, f"读不到|{key}={目标.name}（{type(exc).__name__}）"
 
 
-def _run_one(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bool, dict]:
+def _run_one(g: dict, path: Path, work_dir: Path, cwd_default,
+             file_root: Path | None = None) -> tuple[bool, dict]:
     """单门执行。**围栏在这里设**：network / secrets 是门声明的能力项。
 
     ★ 默认 network=false、secrets=strip（fail-closed）：门要出网、要凭据必须
@@ -1328,7 +1437,7 @@ def _run_one(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bool, di
         限 = None
     try:
         if 限 is None:
-            return _run_one_inner(g, path, work_dir, cwd_default)
+            return _run_one_inner(g, path, work_dir, cwd_default, file_root=file_root)
         # ── ② 写量配额：门前门后各数一次（只对待判根，跳构建产物）──
         根 = Path(str(g.get("cwd") or cwd_default))
         上文件 = int(限.get("max_new_files", _配额默认["max_new_files"]))
@@ -1355,7 +1464,38 @@ def _run_one(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bool, di
         _凭据脱敏.reset(_t2)
 
 
-def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bool, dict]:
+def _解输出268(b) -> str:
+    """把子进程的原始字节解成文本（R268）。
+
+    ★ 为什么不能硬编 UTF-8：真 javac 在中文 locale 下输出 GBK
+      （`\xb4\xed\xce\xf3` = 错误），按 utf-8 解就是乱码，
+      于是失败栈里的中文诊断词永远匹配不上，改动面静默变成 []。
+
+    ★ 为什么不能靠 `locale.getpreferredencoding()` 猜：本机它返回 utf-8，
+      而子进程实际用的是 ANSI 代码页 GBK —— **两者不是一回事**。
+
+    ⇒ 先严格试 UTF-8（自校验，能解通基本就是 UTF-8）；
+      解不通再试系统 ANSI 代码页；都不行才 `errors="replace"` 兜底。
+    """
+    if b is None:
+        return ""
+    if isinstance(b, str):
+        return b
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    # Windows ANSI 代码页（中文系统 = GBK/936）。`oem` 是控制台代码页，二者可能不同。
+    for _编 in ("mbcs", "oem", "gbk", "cp936", "latin-1"):
+        try:
+            return b.decode(_编)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return b.decode("utf-8", errors="replace")
+
+
+def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default,
+                     file_root: Path | None = None) -> tuple[bool, dict]:
     typ = g["type"]
     # ★★★ ③ 三态门 `oracle`（2026-11-01）：**证明 / 反例 / 未知**。
     #
@@ -1373,7 +1513,7 @@ def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bo
         cmd = _sub(g.get("cmd", []), file=str(path), work=str(work_dir))
         if not cmd:
             return False, {"err": "oracle 需要 cmd", "三态": "未知", "未知原因": "无命令"}
-        cwd = g.get("cwd", cwd_default)
+        cwd = _落cwd261(g.get("cwd", cwd_default), work_dir, file_root)
         rc, out, err = _run(cmd, cwd, g.get("timeout", 300), g.get("stall"),
                             g.get("name", "oracle"))
         组合 = out + err
@@ -1401,10 +1541,10 @@ def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bo
         _s = g.get("src") or g.get("in")
         _srcp = str(_入参路径(g, "src", path, work_dir)) if _s else str(path)
         cmd = _sub(g.get("cmd", []), file=str(path), work=str(work_dir), src=_srcp)
-        cwd = g.get("cwd", cwd_default)
+        cwd = _落cwd261(g.get("cwd", cwd_default), work_dir, file_root)
         rc, out, err = _run(cmd, cwd, g.get("timeout", 300),
                             g.get("stall"), g.get("name", cmd[0] if cmd else "cmd"))
-        cwd = g.get("cwd", cwd_default)
+        cwd = _落cwd261(g.get("cwd", cwd_default), work_dir, file_root)
         # 失败证据**抽错误块**（不是位置截断）—— 见 `_evidence` 的注释：
         # 实测 396 条警告会把 9 条 error 正文挤出窗口，模型拿到"无错误的红门"。
         # 绿色时短记（保尾部足够），红门时抽错误块。
@@ -1416,7 +1556,7 @@ def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bo
 
     if typ == "test_counts":
         cmd = _sub(g.get("cmd", []), file=str(path), work=str(work_dir))
-        cwd = g.get("cwd", cwd_default)
+        cwd = _落cwd261(g.get("cwd", cwd_default), work_dir, file_root)
         rc, out, err = _run(cmd, cwd, g.get("timeout", 900), g.get("stall"),
                             g.get("name", "test_counts"))
         文 = _strip_ansi(out) + "\n" + _strip_ansi(err)
@@ -1479,7 +1619,7 @@ def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bo
         _超 = int(g.get("timeout", 900))
         _停 = g.get("stall")
         _基cwd = str(_入参路径(g, "baseline_cwd", path, work_dir)) if g.get("baseline_cwd") else g.get("cwd", cwd_default)
-        _现cwd = g.get("cwd", cwd_default)
+        _现cwd = _落cwd261(g.get("cwd", cwd_default), work_dir, file_root)
         _brc, _bout, _berr = _run(_基, _基cwd, _超, _停, g.get("name", "baseline"))
         _nrc, _nout, _nerr = _run(_现, _现cwd, _超, _停, g.get("name", "current"))
         _基计 = _测试计数(_strip_ansi(_bout) + "\n" + _strip_ansi(_berr))
@@ -1618,7 +1758,7 @@ def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bo
         _须同 = bool(g.get("require_same_verdict", True))
         _超 = int(g.get("timeout", 900))
         _停 = g.get("stall")
-        _cwd = g.get("cwd", cwd_default)
+        _cwd = _落cwd261(g.get("cwd", cwd_default), work_dir, file_root)
         _各: list[dict] = []
         for _i in range(_n):
             _env = dict(__import__("os").environ)
@@ -1687,8 +1827,8 @@ def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bo
             for f in sorted(_in.rglob("*")):
                 if not f.is_file():
                     continue
-                if any(x in f.parts for x in ("__pycache__", ".git", "target",
-                                              "node_modules")):
+                if any(x in f.relative_to(_in).parts
+                       for x in ("__pycache__", ".git", "target", "node_modules")):
                     continue
                 try:
                     if f.stat().st_size > _GREP_MAX_BYTES:
@@ -1776,7 +1916,7 @@ def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bo
         try:
             cmd = _sub(g.get("cmd", []), file=str(tmp), work=str(work_dir),
                        src=str(src))
-            cwd = g.get("cwd", cwd_default)
+            cwd = _落cwd261(g.get("cwd", cwd_default), work_dir, file_root)
             rc, out, err = _run(cmd, cwd, g.get("timeout", 300))
             comb = out + err
             hits = [t for t in g.get("must_not", []) if t in comb]
@@ -1815,7 +1955,7 @@ def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bo
         try:
             cmd = _sub(g.get("cmd", []), file=str(tmp), work=str(work_dir),
                        src=str(src))
-            cwd = g.get("cwd", cwd_default)
+            cwd = _落cwd261(g.get("cwd", cwd_default), work_dir, file_root)
             rc, comb, err, 退过 = _跑探针带退回(
                 cmd, cwd, g.get("timeout", 300), g.get("stall"), text, append,
                 tmp, "公理足迹")
@@ -1891,7 +2031,7 @@ def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bo
         try:
             cmd = _sub(g.get("cmd", []), file=str(tmp), work=str(work_dir),
                        src=str(src))
-            cwd = g.get("cwd", cwd_default)
+            cwd = _落cwd261(g.get("cwd", cwd_default), work_dir, file_root)
             rc, comb, err, 退过 = _跑探针带退回(
                 cmd, cwd, g.get("timeout", 300), g.get("stall"), text, append,
                 tmp, "内核陈述")
@@ -2004,7 +2144,7 @@ def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bo
         参照 = _sub(g.get("ref", []), file=str(path), work=str(work_dir))
         if not 命令 or not 参照:
             return False, {"err": "differential 需要 cmd 与 ref 两条命令"}
-        cwd = g.get("cwd", cwd_default)
+        cwd = _落cwd261(g.get("cwd", cwd_default), work_dir, file_root)
         期望 = int(g.get("expect_exit", 0))
         rc1, out1, err1 = _run(命令, cwd, g.get("timeout", 300), g.get("stall"),
                               "differential-被测")
@@ -2037,7 +2177,7 @@ def _run_one_inner(g: dict, path: Path, work_dir: Path, cwd_default) -> tuple[bo
         基 = list(g.get("cmd", []))
         if not 基:
             return False, {"err": "property 需要 cmd"}
-        cwd = g.get("cwd", cwd_default)
+        cwd = _落cwd261(g.get("cwd", cwd_default), work_dir, file_root)
         期望 = int(g.get("expect_exit", 0))
         必含 = [str(x) for x in (g.get("require") or [])]
         禁含 = [str(x) for x in (g.get("forbid") or [])]
@@ -2122,6 +2262,32 @@ def _evaluate_lossless_inner(spec, path: Path, work_dir: Path, cwd_default=".",
     return 因由, results, audit
 
 
+def _落cwd261(cwd, work_dir, file_root) -> str:
+    """★ R261（2026-11-05 真读数）：**相对 cwd 必须相对「求值根」解析，而不是进程 cwd**。
+
+    真证据（本机可复现，3 行）：
+      `evaluate([{type:compile, cwd:".", cmd:[python,-m,unittest,discover,-s,tests]}],
+                仓, 仓)` ⇒ **退出码 5**；同一门把 cwd 写成绝对路径 ⇒ **绿**。
+    ⇒ 因为 `cwd_default` 默认是字面量 `"."`，而 `subprocess.run(cwd=".")` 用的是
+      **进程当前目录**（= 工具自己的安装目录），不是被判字节所在的那棵树。
+    这正是「求值根必须与被判字节同一棵树」的又一次违反 —— 而且它是**静默的**：
+    判红时报「退出码不符」，读的人会去改代码，而问题在求值根。
+
+    口径：`"."` / `"./x"` / `"x"` 一律相对 **求值根**（work_dir，其次 file_root）；
+    绝对路径与 `{repo}`/`{file}` 等占位符原样返回（它们由 `_sub` 负责展开）。
+    """
+    s = str(cwd)
+    if not s or "{" in s or s.startswith('~'):
+        return s
+    q = __import__("pathlib").Path(s)
+    if q.is_absolute():
+        return s
+    根 = work_dir or file_root
+    if 根 is None:
+        return s
+    return str((__import__("pathlib").Path(str(根)) / q).resolve())
+
+
 def evaluate(spec, path: Path, work_dir: Path, cwd_default=".",
              file_root: Path | None = None,
              ) -> tuple[dict[str, bool], list[dict]]:
@@ -2137,6 +2303,8 @@ def evaluate(spec, path: Path, work_dir: Path, cwd_default=".",
       在协程里直接调用会**冻住整个事件循环**：同进程的 MCP 服务器将无法收发任何
       消息，正在等待的工具响应被推迟到门跑完才发出（实机表现为"提交任务永不回包"）。
       协程上下文请改用 `await evaluate_async(...)`。"""
+    # ★ R261：相对 cwd 归一成"相对求值根"的绝对路径（否则命令跑在进程 cwd 里）
+    cwd_default = _落cwd261(cwd_default, work_dir, file_root)
     _, results, audit = evaluate_lossless(spec, path, work_dir, cwd_default, file_root)
     return results, audit
 

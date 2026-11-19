@@ -295,6 +295,47 @@ def run() -> dict:
     return _汇总(结果, t0, 版本)
 
 
+def _预算545() -> float:
+    """⑧ 的墙钟预算：`ORCH_SELFCHECK_MODEL_S`（默认 420 秒）。
+
+    ★ 为什么可配：这条检查真调模型。只有 1 条活通道的机器上，420s 可能不够；
+      而把它写死会让「机器慢」看起来像「产品坏」。
+    """
+    try:
+        _v = float(os.environ.get("ORCH_SELFCHECK_MODEL_S", "") or 420)
+    except ValueError:
+        _v = 420.0
+    return _v if _v > 0 else 420.0
+
+
+def _判真模型回执(回: dict) -> tuple[bool | None, str, dict | None]:
+    """⑧ 的**判决本体**：只判「门真复跑过 + 真跑通」，不负责怎么拿到回执。
+
+    ★ N9：分出来的理由 —— 原来它和"起子进程调真模型"写在一起，
+      于是想量这条判据的区分力就**只能再花一次真模型调用**，
+      结果永远不会有人量（N9 长期挂在"未做"）。分开之后判决可被**合成回执**反复测。
+
+    ★ 判决只认两件事（R552 的教训换来的）：
+      ① `仲裁rc == 0` —— 门**真复跑过**；
+      ② 输出里有成功标记 `ORCH-OK-42` —— 只有 `assert` 真通过才会打印它。
+      只看退出码会被 `sys.exit(0)` 击穿（口径 552）；只看输出会被"回执伪造"击穿。
+      两个都要，缺一个就不绿。
+
+    ★ 返回三态：True=绿 · False=红 · None=**未验**（环境侧不可用）。
+      未验不许被记成红（口径 311：假红比漏报更坏），也不许记成绿。
+    """
+    分类 = 回.get("分类")
+    if 分类 == "基础设施不可用":
+        return (None, f"未验（环境侧）：{回.get('错误') or 分类}",
+                {"做": "配一个可用通道 key 后重跑；或 ORCH_SELFCHECK_MODEL=0 明确跳过"})
+    _输出 = 回.get("仲裁输出") or ""
+    绿 = 回.get("仲裁rc") == 0 and "ORCH-OK-42" in _输出
+    return (绿, (f"分类={分类} · 头门={回.get('门')} · 仲裁rc={回.get('仲裁rc')} "
+                 f"· 输出={(回.get('仲裁输出') or '')[:80]}"),
+            None if 绿 else
+            {"做": "看门表与仲裁输出；这是**真模型**没改对，不是环境问题"})
+
+
 def _真模型链() -> tuple[bool | None, str, dict | None]:
     """⑧ 真模型链：派一个真模型改一个坏仓，再用判据门复跑判绿 ⇒ 关掉"未调真模型"这条边界。
 
@@ -313,7 +354,7 @@ repo = Path(tempfile.mkdtemp(prefix="orch-selfcheck-model-", dir=sys.argv[1]))
 (repo / "pkg" / "__init__.py").write_text("", encoding="utf-8")
 (repo / "pkg" / "mod.py").write_text("def f():\n    return 41\n", encoding="utf-8")
 cmd = [sys.executable, "-c",
-       "import sys; sys.path.insert(0,'.'); from pkg.mod import f; assert f()==42, f()"]
+       "import sys; sys.path.insert(0,'.'); from pkg.mod import f; assert f()==42, f(); print('ORCH-OK-42')"]
 
 from agentscope_orchestrator import fixloop
 回 = asyncio.run(fixloop.修复(str(repo), cmd, 轮数=1))
@@ -335,7 +376,9 @@ print(json.dumps({"分类": 回.get("分类"),
     try:
         子 = subprocess.run(
             [sys.executable, "-c", 子代码, str(工作)],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=420,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            # ★ R545：预算可配（本机只有 1 条活通道时 420s 不够 ⇒ 用户/CI 能调）。
+            timeout=_预算545(),
             env={**os.environ,
                   # ★★★★★ 2026-11-03 根因修复：**孙进程的输出编码必须显式固定**。
                   #
@@ -362,18 +405,18 @@ print(json.dumps({"分类": 回.get("分类"),
             return (False, f"子进程没给回执：{(子.stderr or 子.stdout).strip()[-200:]}",
                     {"做": "先手动跑一次 orch_fix；仍失败就看通道与 key"})
         回 = json.loads(行[-1])
-        分类 = 回.get("分类")
-        if 分类 == "基础设施不可用":
-            return (None, f"未验（环境侧）：{回.get('错误') or 分类}",
-                    {"做": "配一个可用通道 key 后重跑；或 ORCH_SELFCHECK_MODEL=0 明确跳过"})
-        绿 = 回.get("仲裁rc") == 0
-        return (绿, (f"分类={分类} · 头门={回.get('门')} · 仲裁rc={回.get('仲裁rc')} "
-                     f"· 输出={(回.get('仲裁输出') or '')[:80]}"),
-                None if 绿 else
-                {"做": "看门表与仲裁输出；这是**真模型**没改对，不是环境问题"})
+        return _判真模型回执(回)
     except subprocess.TimeoutExpired:
-        return (False, "420s 内没拿到回执（模型链卡住）——子进程已杀，自检不会挂",
-                {"做": "先手动跑一次 orch_fix 看单轮耗时；必要时换通道"})
+        # ★ R545：**超预算记「未验」，不记「红」**（口径 311：假红比漏报更坏）。
+        #   理由：这条检查要真的调一次模型；本机此前的实测是「只有 1 条活通道」，
+        #   负荷一高 420s 内就出不来。那测到的是**这台机器现在跑不动**，
+        #   不是**产品坏了** —— 把它记成红，用户会去修一个不存在的 bug。
+        #   但也不许记成绿：所以是 None（未验），并在证据里写明预算与调法。
+        return (None,
+                f"未验（超预算 {_预算545():.0f}s 没拿到回执）——子进程已杀，自检不会挂。"
+                "★ 这不是产品红：这条要真调一次模型，本机通道慢/少就到不了。"
+                "调预算：ORCH_SELFCHECK_MODEL_S=1200；明确跳过：ORCH_SELFCHECK_MODEL=0",
+                {"做": "先手动跑一次 orch_fix 看单轮耗时；必要时换通道或加预算"})
     except FileNotFoundError:
         return None, "未装到可运行的解释器（跳过）", None
 
@@ -400,6 +443,21 @@ def _汇总(结果: list[dict], t0: float, 版本: str) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    # ★ R540：`--help` 必须**立刻返回**，不许把它当成"跑一遍全量自检"。
+    #   实测代价：不认 --help 时敲它要跑 238 秒（还会建索引 2352 个单元），
+    #   任何 CI / shell 都会先把它杀掉 ⇒ 用户看到的是"卡死"。
+    if any(x in argv for x in ("-h", "--help", "帮助")):
+        print("用法：orch-check [-h|--help] [--json]\n"
+              "\n"
+              "  一条命令回答「这层现在能不能干活」（装完先敲这个）。\n"
+              "\n"
+              "  --json    机器读：stdout 只出 JSON（日志全部赶去 stderr）\n"
+              "  -h/--help 本帮助（立刻返回）\n"
+              "\n"
+              "  退出码：0 = 自检全过；1 = 有项没通过（会逐项给证据与修法）。\n"
+              "  ★ 边界：这是冒烟，不是全量回归。⑧ 会**真调一次模型**改一个坏仓；"
+              "无可用通道或超预算时 ⑧ 记「未验」而不记红（不改退出码）。")
+        return 0
     机器读 = "--json" in argv
     try:
         if 机器读:

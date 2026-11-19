@@ -180,7 +180,11 @@ def _状态根() -> Path:
     ★ 与 project_kb 同一条口径：`ORCH_STATE_DIR` 优先，否则 `~/.orchestrator-state`。
       链进 git 会让每次跑都产生 diff 噪声，而它本身可以从回执全量重建（见 `重建()`）。
     """
-    return Path(os.environ.get("ORCH_STATE_DIR") or (Path.home() / ".orchestrator-state"))
+    # ★ R549：收口到唯一取法（原来自己拼 `~/.orchestrator-state`，
+    #   与 `profile.STATE_ROOT` 可能是两个根 ⇒ home 不可写时会重演
+    #   「写不了被显示成空链/0 条」。）
+    from . import profile as _pf549
+    return _pf549.state_dir()
 
 
 def 链路径() -> Path:
@@ -271,8 +275,6 @@ def _解锁(f) -> None:
         pass
 
 
-def 首步() -> int:
-    return 1
 
 
 def 查(种类: str | None = None, 引用含: str | None = None) -> list[坐标]:

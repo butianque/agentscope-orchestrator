@@ -103,17 +103,6 @@ def _变体_去空行(文本: str, 后缀: str) -> str:
     return "\n".join(ln for ln in 文本.splitlines() if ln.strip()) + "\n"
 
 
-def _变体_压缩进(文本: str, 后缀: str) -> str:
-    """把行首缩进压成最小合法形式 —— 抓"门钉了缩进"。"""
-    出: list[str] = []
-    for ln in 文本.splitlines():
-        if ln.strip():
-            出.append(ln.lstrip() if not ln.startswith(" ") else ln)
-        else:
-            出.append(ln)
-    return "\n".join(出) + "\n"
-
-
 def _变体_改标识符(文本: str, 后缀: str) -> str:
     """给够长的自定义标识符加后缀 —— **最强的一类**：抓"门钉了具体名字"。
 

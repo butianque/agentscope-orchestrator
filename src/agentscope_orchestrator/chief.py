@@ -1555,12 +1555,8 @@ def _selftest() -> int:
                    "in": "{repo}/src", "否定样本":
                    [{"旧": "T", "新": "X", "说明": "目录口径"}]}
 
-        def _假跑171b(门spec, 工作根, 变异相对=""):
-            _文 = (Path(工作根) / "_契约产物.txt").read_text(encoding="utf-8")
-            return ("T" in _文), ("绿" if "T" in _文 else "红")
-
         _命171b = _在多文件里应用(_产171b, _门171b["否定样本"][0],
-                                 优先=_门171b["in"])
+                          优先=_门171b["in"])
         if not _命171b or _命171b[0] != "src/b.rs":
             fails.append("【R171b】★ 门的 `in` 是目录时，变异没落在该目录内的产物上"
                          f"（实际 {(_命171b or ['无'])[0]!r}，应为 'src/b.rs'）")

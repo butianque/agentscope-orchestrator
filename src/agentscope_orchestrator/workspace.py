@@ -400,28 +400,137 @@ def 回灌(句柄: dict, 只这些: list[str] | None = None) -> dict:
     return {"落": 落, "让开": 让, "缺": 缺, "让开文件": 让开, "落下文件": 落下}
 
 
+def _清只读(树: Path) -> int:
+    """清掉树内所有只读位，返回清了几个。
+
+    ★ 为什么需要（R556）：Windows 上 `shutil.rmtree` 遇到只读文件会失败，而原来的
+      `ignore_errors=True` 把失败吞掉 ⇒ 目录还在却报「已删」。`git worktree remove --force`
+      自己会清一部分，但兜底路径（元数据损坏时）走的是 rmtree，得自己清。
+    """
+    import os as _os
+    import stat as _stat
+    数 = 0
+    try:
+        项 = list(树.rglob("*"))
+    except OSError:
+        return 0
+    for p in 项:
+        try:
+            m = p.stat().st_mode
+            if not (m & _stat.S_IWRITE):
+                _os.chmod(p, m | _stat.S_IWRITE)
+                数 += 1
+        except OSError:
+            continue
+    return 数
+
+
+def _残留台账(主: Path) -> Path:
+    """`<主仓>/.git/orch_残留.jsonl`：拆失败留下的目录清单（工具元数据，不进 git 工作区）。"""
+    g = Path(主) / ".git"
+    根 = g if g.is_dir() else Path(主)
+    return 根 / "orch_残留.jsonl"
+
+
+def _记残留(主: Path, 树: Path) -> None:
+    """把"没删掉的目录"记下来 —— 否则登记/标记都被摘掉后，连自己人也认不出它。"""
+    try:
+        台 = _残留台账(主)
+        行 = str(Path(树))
+        旧 = 台.read_text(encoding="utf-8", errors="replace") if 台.exists() else ""
+        if 行 in 旧.splitlines():
+            return
+        台.write_text(旧 + ("" if not 旧 or 旧.endswith("\n") else "\n") + 行 + "\n",
+                      encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _是残留(主: Path, 树: Path) -> bool:
+    try:
+        台 = _残留台账(主)
+        if not 台.exists():
+            return False
+        return str(Path(树)) in 台.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+
+
+def _清残留记录(主: Path, 树: Path) -> None:
+    try:
+        台 = _残留台账(主)
+        if not 台.exists():
+            return
+        行们 = [x for x in 台.read_text(encoding="utf-8", errors="replace").splitlines()
+               if x and x != str(Path(树))]
+        台.write_text("\n".join(行们) + ("\n" if 行们 else ""), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def 拆(句柄: dict, 保留: bool = False, 删分支: bool = True) -> dict:
-    """拆隔离树。`保留=True` 只解绑不删目录（留证据用）。"""
+    """拆隔离树。`保留=True` 只解绑不删目录（留证据用）。
+
+    ★ R556：**删不掉必须说出来**。原实现 `rmtree(ignore_errors=True)` 吞掉失败，
+      而 `main --clean` 照打「已删」并 return 0 ⇒ 假绿（实测：子进程还占用工作树时
+      删目录=False、目录仍在，却报「已删」）。
+      现在返回里带 `清只读` 与 `剩余`（剩余项数；-1 = 数不出来），由调用方判决。
+    """
     主 = Path(句柄["主树"])
     树 = Path(句柄["树"])
-    出: dict = {"删目录": False, "删分支": False}
+    出: dict = {"删目录": False, "删分支": False, "清只读": 0, "剩余": 0}
     if not 保留:
         cp = _git(主, "worktree", "remove", "--force", str(树))
         if cp.returncode != 0:
             # 兜底：目录还在就手工删（worktree 元数据可能已损坏）
+            出["清只读"] += _清只读(树)
             shutil.rmtree(树, ignore_errors=True)
             _git(主, "worktree", "prune")
+        if 树.exists():                      # 再试一次：清了只读位再删
+            出["清只读"] += _清只读(树)
+            shutil.rmtree(树, ignore_errors=True)
         出["删目录"] = not 树.exists()
-    if 删分支:
+        if not 出["删目录"]:
+            try:
+                出["剩余"] = sum(1 for _ in 树.rglob("*"))
+            except OSError:
+                出["剩余"] = -1
+    # ★ 2026-11-19 实测：`git worktree remove --force` 会**先摘登记再删文件**，
+    #   删文件失败 ⇒ 登记没了、目录还在。若此时再把分支删掉，就**连重跑的匹配句柄也没了**
+    #   （`--clean` 只会说"没找到"），残留变成只能手工删的垃圾。
+    #   ⇒ 目录没删掉就保留分支（它还是一条线索），交给 `--clean` 按路径兜底重跑。
+    if not 出["删目录"]:
+        _记残留(主, 树)                     # ★ 见 _记残留 注释：标记会被摘掉，必须自己记
+    if 删分支 and 出["删目录"]:
         cp = _git(主, "branch", "-D", 句柄["分支"])
         出["删分支"] = cp.returncode == 0
     return 出
 
 
+def _删结果判决(树: Path, r: dict, 分支: str = "") -> tuple[int, str]:
+    """把「删成功没」的判决抽成**函数**（口径 388：判据测函数、交付测入口）。
+
+    返回 (退出码, 消息)。删不掉 ⇒ **3**，且消息里必须写明剩余项数与常见原因；
+    不许返回 0 —— 那就是拿「我试过了」冒充「删掉了」。
+    """
+    分支尾巴 = ""
+    if 分支 and not r.get("删分支"):
+        分支尾巴 = f"（⚠ 分支 `{分支}` 也没删掉）"
+    if r.get("删目录"):
+        return 0, f"已删 {树}：{r}{分支尾巴}"
+    return 3, (f"✗ 删不掉 {树}：目录**还在**（剩 {r.get('剩余')} 项；已清只读位 "
+               f"{r.get('清只读')} 个）{分支尾巴}。"
+               "常见原因：仍有进程以它为工作目录（Windows 会锁住），或权限不足。"
+               "⇒ **不算删成功**，退出码 3；请先停掉占用进程再重跑 `orch-tree --clean`。")
+
+
 def 列(主树: Path | None = None) -> list[dict]:
-    """列出现存隔离树（供 --list / --clean 用）。"""
-    档 = _pf.get_profile()
-    主 = Path(主树 or 档.repo_root).resolve()
+    """列出现存隔离树（供 --list / --clean 用）。
+
+    ★ 调用方给了主树就**不再读档案**：档案缺失/损坏时 `--clean` 本可以正常工作，
+      不该因为一个用不到的配置而抛（实测：给不了 ORCH_PROFILE 的环境里 `列(主)` 会连带失败）。
+    """
+    主 = Path(主树 or _pf.get_profile().repo_root).resolve()
     cp = _git(主, "worktree", "list", "--porcelain")
     出: list[dict] = []
     当: dict = {}
@@ -619,8 +728,42 @@ def main(argv=None) -> int:
             if 命中:
                 r = 拆({"主树": str(主), "树": str(树),
                         "分支": w.get("分支", "")}, 删分支=bool(w.get("分支")))
-                print(f"已删 {树}：{r}")
-                return 0
+                码, 话 = _删结果判决(树, r, w.get("分支", ""))
+                print(话)
+                return 码
+        # ★ 2026-11-19 实测兜底：占用时 `worktree remove --force` 摘掉了登记，
+        #   只剩目录留在盘上（见 `拆()` 里那段注释）⇒ 光靠 `列()` 永远找不到它。
+        #   只要 `--clean` 指的是**盘上还在的路径**，就按「残留」删，判决口径不变（失败仍 3）。
+        if 命.exists() and 命.is_dir():
+            # ★★ 安全护栏（2026-11-19 自查）：这条兜底会 **rmtree 用户给的路径**，
+            #   不加限制的话 `orch-tree --clean C:\\Windows` 会把系统目录删掉。
+            #   只认"看起来确实是隔离树"的目录：① 名字是 `<仓库名>_orch_<标签>`（本工具自己的命名）
+            #   ② 或带 worktree 标记（`.git` 是**文件**且指向主仓 worktrees 目录）。
+            #   另外一律拒绝：主仓本身、主仓内部的任何目录（那是在删源码）。
+            _名像 = 命.name.startswith(主.name + "_orch_")
+            _标记 = (命 / ".git").is_file()
+            _记过 = _是残留(主, 命)         # ★ 台账：只有**我们自己**没删掉的目录才算
+            if 主.resolve() == 命 or 主 in 命.resolve().parents:
+                print(f"✗ 拒绝：`{命}` 在主仓 `{主}` 里面（这是源码，不是隔离树）")
+                return 1
+            if not (_名像 or _标记 or _记过):
+                print(f"✗ 拒绝：`{命}` 既不是 `<仓库名>_orch_*` 命名、也没有 worktree 标记"
+                      " —— 不按路径删（防误删）。若确要删，请手工确认后处理。")
+                return 1
+            出 = {"删目录": False, "删分支": False, "清只读": _清只读(命), "剩余": 0}
+            shutil.rmtree(命, ignore_errors=True)
+            出["删目录"] = not 命.exists()
+            if not 出["删目录"]:
+                try:
+                    出["剩余"] = sum(1 for _ in 命.rglob("*"))
+                except OSError:
+                    出["剩余"] = -1
+            _git(主, "worktree", "prune")
+            码, 话 = _删结果判决(命, 出)
+            if 出["删目录"]:
+                _清残留记录(主, 命)
+            print("（不在 git 登记里，按**路径残留**处理）" + 话)
+            return 码
         print(f"没找到隔离树：{a.clean}")
         return 1
     ap.print_help()

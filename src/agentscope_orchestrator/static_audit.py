@@ -112,19 +112,6 @@ def undefined_globals_in_file(path: Path, modname: str = "") -> list:
     return sorted(缺)
 
 
-def scan_dir(root: Path, skip: tuple = ("__pycache__",)) -> dict:
-    """扫一个目录下全部 .py，返回 {相对路径: [未定义名...]}（只含非空的）。"""
-    坏: dict = {}
-    for f in sorted(root.rglob("*.py")):
-        if any(s in f.parts for s in skip):
-            continue
-        try:
-            缺 = undefined_globals_in_file(f, f.stem)
-        except Exception as exc:                # noqa: BLE001 扫不动不算缺陷
-            缺 = [f"<扫描失败>:{type(exc).__name__}"]
-        if 缺:
-            坏[str(f.relative_to(root)).replace("\\", "/")] = 缺
-    return 坏
 
 
 def missing_module_attrs(src_dir: Path) -> dict:

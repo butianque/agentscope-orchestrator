@@ -30,12 +30,17 @@ fi
 VPY=".venv/bin/python"
 [ -x "$VPY" ] || { echo "✗ venv 建失败"; exit 1; }
 
-WHL="$(ls -1 wheels/*.whl 2>/dev/null | sort | tail -1 || true)"
-[ -n "$WHL" ] || { echo "✗ wheels/ 里没有 wheel"; exit 1; }
-echo "· 安装 $(basename "$WHL")"
-# ★ 不用 pip 缓存：有机器把 cache-dir 配在已断开的网络盘上，install 会静默卡住。
-"$VPY" -m pip install --no-cache-dir --disable-pip-version-check --upgrade pip -q
-"$VPY" -m pip install --no-cache-dir --disable-pip-version-check --force-reinstall "$WHL"
+# ★ 只挑编排器自己的轮子：依赖轮子也在 wheels/ 里（如 pydantic_core-2.50.4 版本号更高），
+#   按名字 sort|tail -1 会挑中依赖包 —— 与 install.ps1 同一条坑（2026-11-19 实测）。
+WHL="$(ls -1 wheels/agentscope_orchestrator-*.whl 2>/dev/null | sort | tail -1 || true)"
+[ -n "$WHL" ] || { echo "✗ wheels/ 里没有 agentscope_orchestrator-*.whl"; exit 1; }
+echo "· 安装 $(basename "$WHL")（wheels/ 共 $(ls -1 wheels/*.whl 2>/dev/null | wc -l) 个）"
+# ★ 不用 pip 缓存：有机器把 cache-dir 配在写不进去/已断开的盘上，pip 会**静默卡死**
+#   （2026-11-19 本机实测 pip 升级卡 >10 分钟；加 --no-cache-dir 后 3 秒完）。
+"$VPY" -m pip install --no-cache-dir --disable-pip-version-check --upgrade pip -q || true
+# ★ 依赖只从本地 wheels/ 解析 ⇒ **真离线装**。旧写法缺依赖时会装出 doctor=64 的坏装
+#   （install.sh 原本没写 --no-deps，是靠联网补依赖；离线机器上就装坏了）。
+"$VPY" -m pip install --no-cache-dir --disable-pip-version-check --no-index --find-links wheels --force-reinstall "$WHL"
 
 echo
 set +e

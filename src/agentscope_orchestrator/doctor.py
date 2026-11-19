@@ -47,6 +47,81 @@ def _行(tag: str, ok: bool | None, 文本: str) -> None:
         _硬阻塞.append(f"{tag}: {文本}")
 
 
+def check_state_root() -> None:
+    """★★ R547：**状态根真可写吗**（不是"路径算出来了没有"）。
+
+    ★ 为什么要单列一项（真事故，verifier 在干净环境里抓到）：
+      知识库默认根曾经自己算 `Path.home()/.orchestrator-state/kb`，与
+      `profile.STATE_ROOT`（真试写选出来的）**不是同一处**。本机实测那个路径
+      `WinError 5 拒绝访问` ⇒ 播种必死 ⇒ doctor 报「知识库 0 条」，
+      被读成「这个项目本来没有外挂知识」。**同一个事实两处实现**（R117）。
+      ⇒ 状态根可写性是**所有持久化**的前提，必须自己有一行判据，
+        而不是等它下面的每一项各自显示成「空的」。
+    """
+    import os as _os
+    from . import profile as _pf
+    根 = _pf.STATE_ROOT
+    源 = "ORCH_STATE_DIR" if _os.environ.get("ORCH_STATE_DIR") else "自动探测"
+    探 = 根 / f".写探针doctor.{_os.getpid()}"
+    try:
+        根.mkdir(parents=True, exist_ok=True)
+        探.write_text("ok", encoding="utf-8")
+        探.unlink()
+    except OSError as _e:                       # noqa: BLE001
+        _行("状态根", False,
+            f"**不可写**：{根}（来源 {源}）⇒ {type(_e).__name__}: {_e}。"
+            "★ 这一项红 ⇒ 知识库/回执/任务库**全都落不了盘**，"
+            "而它们各自只会显示成「空的」——会被误读成「本来就没有」。"
+            "修法：设 ORCH_STATE_DIR 到一个可写目录。")
+        return
+    _行("状态根", True, f"{根}（来源 {源}，真试写通过）")
+
+
+def check_kbpower() -> None:
+    """`project_kb.门统计()` —— 知识库里**能转成机器的判据**有多少条。
+
+    ★ R262：也是"写了没人调"的一个（全仓引用 = 0）。
+      而这个数字比"库里有几条"有意义得多：**库再大，转不出门的规则都只是提示**
+      （提示级 = 模型可能不听）。"能变门的条数"才是这套东西的**硬约束存量**。
+    """
+    from agentscope_orchestrator import project_kb as _kb
+    try:
+        统 = _kb.门统计()
+    except Exception as _e:                       # noqa: BLE001
+        _行("知识库可机判", None, f"读取失败（不影响别的检查）：{type(_e).__name__}: {_e}")
+        return
+    # ★ 字段名是**读**出来的（`门统计()` 真返回：总数/可转门/没写范围/转不出模式/不可机判），
+    #   第一版我凭想象写 `可机判`/`条数` ⇒ 永远取到 0，报「0/0 条」还打绿勾 ——
+    #   **"看不见"被当成了"没有"**。口径：不许猜数据的形状，去读它的生产者。
+    _总 = int(统.get("总数") or 0)
+    _可 = int(统.get("可转门") or 0)
+    _不 = int(统.get("不可机判") or 0)
+    if _总 == 0:
+        _行("知识库可机判", None, "知识库是空的（0 条规则）⇒ 无从谈可机判性")
+    elif _可 == 0:
+        _行("知识库可机判", False,
+            f"0/{_总} 条能变判据门（不可机判 {_不} 条）⇒ 全是提示级，模型可能不听")
+    else:
+        _行("知识库可机判", True, f"{_可}/{_总} 条能变判据门（不可机判 {_不} 条）")
+
+
+def check_indexdegrade() -> None:
+    """读 `repo_index.缓存状态()` —— 索引降级原因（没降级时为空）。
+
+    ★ R262（2026-11-05）：这个函数**写了但没人调**（我数全仓引用 = 0），
+      而"索引降级"正是会让人把**环境问题误判成任务失败**的一类读数。
+      「一段驱动不了的接线，等于没有接线」⇒ 接进 doctor 才有意义。
+
+    ★ 判档：降级**不是**致命（索引还能用，只是慢/不全）⇒ 记 `None`（提示级），
+      而**不许**记成通过：那会把"我这儿退化了"藏起来。
+    """
+    from agentscope_orchestrator import repo_index as _ri
+    降 = _ri.缓存状态()
+    _行("索引降级", None if 降 else True,
+        "；".join(f"{k}={v}" for k, v in 降.items()) if 降
+        else "索引可用（无降级）")
+
+
 def check_python() -> None:
     v = sys.version_info
     ok = (v.major, v.minor) >= (3, 12)
@@ -228,6 +303,34 @@ def check_tempdir() -> None:
     _行("tmpdir", free > 0.2,
         f"{d} · 可写={可写} · 剩 {free:.2f}GB"
         + ("" if free > 0.2 else " ⇒ 空间不足，装包会报 Errno 28（且可能指向别的盘，别被骗）"))
+
+    # ── ★★★ 2026-11-07 新增：残渣报告 ────────────────────────────────
+    # 为什么必须在这里报（不是写个脚本等人去跑）：
+    #   `gettempdir()` 曾在本机**回落到 cwd**（= 包根），于是每一次 `mkdtemp()`
+    #   都在仓里造一个目录、而且没人删。实测代价：包根下积了 **4,736 个**直接子目录，
+    #   其中 3,739 个随机名的合计 **2.6 GB**，全是历年测试夹具的整仓拷贝；
+    #   工位残留同步从 1,749 涨到 1,807。
+    #   「缺口史」之前这种「慢慢变坏」是**看不见的** —— 所以它得进体检，
+    #   每跑一次 doctor 就看见一次。**需要调用方记得做的事，等于没做。**
+    try:
+        from . import temp_guard as _tg
+        # ★ 只调**一次**：`清理残渣(干跑=True)` 内部会算 `残渣()`，返回值里
+        #   候选数/体积/跳过大类都齐。
+        #   我先写成「调 `残渣()` 报一个数、再调 `清理残渣()` 报另一个数」——
+        #   实测立刻出现 **687 vs 690** 的差：两次调用之间又有 3 个目录越过年龄线。
+        #   「同一个判断写在两处，必然给出两个答案」—— 这里就是。
+        残 = _tg.清理残渣(干跑=True)
+        if 残["候选数"]:
+            _行("tmp残渣", False,
+                f"包根下判定为临时残渣 **{残['候选数']} 个**、约 **{残['候选合计MB']:,.0f} MB**"
+                f"（下限年龄 {残['最小年龄小时']} 小时；跳过 {sum(残['跳过大类'].values())} 个："
+                + "；".join(f"{k}×{v}" for k, v in list(残["跳过大类"].items())[:3]) + "）"
+                f" ⇒ 修法：`temp_guard.清理残渣(干跑=False, 最小年龄秒=86400)`")
+        else:
+            _行("tmp残渣", True, "包根下没有超龄的临时残渣目录")
+    except Exception as e:                       # noqa: BLE001
+        # 与上面同一条口径：这里失败是**体检结果**，不是体检事故
+        _行("tmp残渣", None, f"残渣统计没跑出来：{type(e).__name__}: {e}")
 
 
 def check_pointers() -> None:
@@ -1057,7 +1160,44 @@ def _播种() -> int:
 
 
 def main() -> int:
+    # ══════════════════════════════════════════════════════════════════════
+    # ★ N2：**非 win32 显式拒绝**（2026-11-18）。
+    #   以前这里是静默往下走 —— 在 Linux 上"跑完了但每条结论都不可信"，
+    #   比"直接拒绝"坏得多：下游会把它当成一次合格交付。
+    #   本工程依赖 Windows 专有行为的清单（都在实测里踩过）：
+    #     · 临时目录降级（系统 TEMP 全不可写时的落点）
+    #     · 只读属性清位（git worktree 拆树）
+    #     · `DETACHED_PROCESS`（后台子进程）
+    #     · `os.kill(pid, 0)` 在 DETACHED 下失效（进程存活判断）
+    #   返回码 **67**：与 64 python / 65 profile / 66 channel 都分开。
+    # ══════════════════════════════════════════════════════════════════════
+    if sys.platform not in ("win32", "cygwin"):
+        print(f"✗ 本平台未验，不承诺可用：sys.platform={sys.platform!r}")
+        print("  ⇒ 本工程只在 **win32** 上证过（临时目录降级 / 只读清位 / "
+              "DETACHED_PROCESS / os.kill(pid,0) 都依赖 Windows 行为）。")
+        print("  ⇒ doctor **拒绝给出结论**（返回 67），不做静默降级。")
+        return 67
     from ._winutf8 import 确保UTF8输出 as _u8; _u8()
+    # ★ R540：`--help` 必须**立刻返回**。不认它时敲 `--help` 会把**整份体检**
+    #   跑一遍（实测 160 秒、退出码 70），用户看到的是"帮助命令报错了"。
+    if any(x in sys.argv[1:] for x in ("-h", "--help", "帮助")):
+        print("用法：orch-doctor [-h|--help] [--播种 | --重建链 <回执目录>]\n"
+              "\n"
+              "  机器体检：一条命令回答「这台机器上这层能不能开工」。\n"
+              "\n"
+              "  （无参数）        跑全部体检项并逐项给证据\n"
+              "  --播种            把内置的项目知识条目写进知识库（外挂知识不再空转）\n"
+              "  --重建链 <目录>   从回执目录重建坐标链\n"
+              "  --导出状态 <zip>  把状态（任务库/成本账/产物/工作目录）打成可迁移 zip；\n"
+              "                   带清单.json（每文件 sha256）⇒ 换机器接手用这个\n"
+              "  --导入状态 <zip>  核对清单后导入；任何一条 sha256 对不上 ⇒ **整包拒收**；\n"
+              "                   默认不覆盖已有文件，并写 jobs/续跑来源.json\n"
+              "  --状态根 <目录>   上面两条用它指定状态根（默认 profile.state_dir()，验夹具用）\n"
+              "  -h/--help         本帮助（立刻返回）\n"
+              "\n"
+              "  退出码：0 可以开工 · 64 装坏了 · 65 档案有问题 · 66 无可用通道 · 70 其它\n"
+              "  ★ 边界：doctor 不联网，通道探活发生在真跑时。")
+        return 0
     if "--播种" in sys.argv:
         return _播种()
     if "--重建链" in sys.argv:
@@ -1066,6 +1206,41 @@ def main() -> int:
             print("用法：doctor --重建链 <回执目录>")
             return 2
         return _重建链(sys.argv[i + 1])
+    # ── N1/R557：状态 bundle（跨机器接手）──
+    根 = None
+    if "--状态根" in sys.argv:
+        _i = sys.argv.index("--状态根")
+        if _i + 1 >= len(sys.argv):
+            print("用法：--状态根 <目录>")
+            return 2
+        根 = sys.argv[_i + 1]
+    if "--导出状态" in sys.argv:
+        _i = sys.argv.index("--导出状态")
+        if _i + 1 >= len(sys.argv):
+            print("用法：orch-doctor --导出状态 <zip> [--状态根 <目录>]")
+            return 2
+        from . import state_bundle as _sb
+        r = _sb.导出(sys.argv[_i + 1], 根)
+        print(f"✓ 已导出 {r['文件数']} 个文件 · {r['总字节']:,} B → {r['zip']}")
+        print(f"  zip sha256 = {r['sha256']}")
+        print("  ★ 换机器接手：`orch-doctor --导入状态 <zip>`；它会先核对清单再落盘。")
+        return 0
+    if "--导入状态" in sys.argv:
+        _i = sys.argv.index("--导入状态")
+        if _i + 1 >= len(sys.argv):
+            print("用法：orch-doctor --导入状态 <zip> [--状态根 <目录>]")
+            return 2
+        from . import state_bundle as _sb
+        r = _sb.导入(sys.argv[_i + 1], 根, 覆盖=("--覆盖" in sys.argv))
+        if r["拒绝"]:
+            print(f"✗ 拒收：{r['拒绝']}")
+            return 3
+        print(f"{'✓' if not r['失败'] else '✗'} 导入 {len(r['写入'])} 个文件 · 跳过 {len(r['跳过'])}"
+              f" · 失败 {len(r['失败'])}")
+        for x in r["失败"][:5]:
+            print("   ✗", x)
+        print(f"  续跑来源：{r['续跑来源']}")
+        return 0 if not r["失败"] else 3
     print("═══ orchestrator doctor ═══")
     # ★ 2026-11-03：体检项**逐个隔离**，任何一项自己崩了也只能变成一行红，
     #   不许把整次体检、以及后面所有检查项一起吞掉。现场：`check_tempdir()` 里
@@ -1075,6 +1250,8 @@ def main() -> int:
     #   注意这里只兜异常**不许**兜成通过 —— 崩了的项一律记成红，并明说"这次结论不完整"。
     检查们 = [
         ("python", check_python), ("package", check_package), ("deps", check_deps),
+        ("索引降级", check_indexdegrade), ("知识库可机判", check_kbpower),
+        ("状态根", check_state_root),
         ("tmpdir", check_tempdir), ("pointers", check_pointers), ("profile", check_profile),
         ("channels", check_channels), ("mcp-names", check_mcp_names), ("tools", check_tools),
         ("知识库", check_project_kb), ("坐标链", check_coord_chain),

@@ -43,3 +43,11 @@ channels:
       - id: cb/deepseek-v4.1-flash
         context_size: 1000000
         max_tokens: 393216
+  qww:
+    display_name: qww
+    base_url: https://api.hlyrouter.top/v1
+    key_env: QWW_API_KEY
+    models:
+      - id: deepseek-v4.1-flash
+        context_size: 128000
+        max_tokens: 8192

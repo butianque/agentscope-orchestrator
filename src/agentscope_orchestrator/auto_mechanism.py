@@ -691,11 +691,6 @@ def _is_evo(op: str) -> bool:
     return _op_parse(op)[0] == "evo:"
 
 
-def _evo_base(op: str) -> str:
-    """`evo:add` → `add`（被自演化规则驱动的基算子）。"""
-    return _op_parse(op)[1]
-
-
 def _s64v(v: int) -> int:
     """i64 环绕（**与两个后端同一口径** · TS-256 计算约束=结构约束）。
 
@@ -1143,14 +1138,6 @@ def _op_chain(ops: tuple, carry: int, 算子定义: dict | None = None) -> str:
 
 
 _ITER_PREFIXES = (("iter:", "iter_", False), ("count:", "count_", True))
-
-
-def _iter_split(op: str):
-    """`op` 若是迭代算子 ⇒ `(内层名, 函数名标签, 是否计步)`；否则 None。"""
-    for pfx, tag, 计步 in _ITER_PREFIXES:
-        if op.startswith(pfx):
-            return op[len(pfx):], tag, 计步
-    return None
 
 
 def _fn_name(op: str) -> str:
@@ -2472,13 +2459,6 @@ def asc_rule_space_nonempty(s: StructureTruth) -> bool:
     return len(structure_field_rules(s)) >= 1 and asc_id_rule().name == "id"
 
 
-def asc_lift_single(r: AscendingRule) -> AscendingRule:
-    """δ提升（RA-02）：对单条规则施一阶翻倍升阶（distinguish 二分支之一）。"""
-    def apply(st: DeriveState) -> DeriveState:
-        return r.apply(st)
-    return AscendingRule(f"δ[{r.name}]", r.phase + 1, apply)
-
-
 def asc_rule_space_n(s: StructureTruth, n: int) -> list[AscendingRule]:
     """RA-03 ruleSpaceN：取相位 ≤ n 的规则（升阶到 n 阶的规则空间，覆盖生长）。"""
     return [r for r in structure_field_rules(s) if r.phase <= n]
@@ -2654,14 +2634,6 @@ def r_fill_exact(s):
     return apply
 
 
-def multi_step_derivation(rules, st: DeriveState, s: StructureTruth, steps: int) -> DeriveState:
-    """多步推导：single_step 迭代 steps 次。对应 UniversalDerivation.multi_step。"""
-    out = st
-    for _ in range(steps):
-        out = single_step_derivation(rules, out, s)
-    return out
-
-
 def derivation_limit(rules, st: DeriveState, s: StructureTruth, max_iter: int) -> DeriveState:
     """推导极限：反复单步至不动点。对应 UniversalDerivation.derivation_limit。
     全局覆盖：迭代到 known 不再变化 = 所有可推导内容片段都被覆盖。"""
@@ -2672,12 +2644,6 @@ def derivation_limit(rules, st: DeriveState, s: StructureTruth, max_iter: int) -
             return cur
         cur = nxt
     return cur
-
-
-def derivable_content(rules, st0: DeriveState, line: str, s: StructureTruth) -> bool:
-    """可推导：存在步数 n 使 line 在多步推导后被包含。对应 UniversalDerivation.derivable。"""
-    return any(line in multi_step_derivation(rules, st0, s, n).known
-               for n in range(0, 12))
 
 
 def cover_to_content(s: StructureTruth) -> str:

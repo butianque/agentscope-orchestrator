@@ -106,23 +106,70 @@ def read_doc(doc_id: str, max_chars: int = MAX_READ_CHARS) -> str:
 
 
 def search_docs(kw: str | None = None, kind: str | None = None,
-                limit: int = 20) -> list[dict]:
-    """按类别/关键词查索引（子串匹配 title/kind/meta，不全文扫），返回条目标签。"""
+                limit: int = 20, 扫正文: bool | None = None) -> list[dict]:
+    """按类别/关键词查索引，返回条目标签。
+
+    ★ 2026-11-05 修（此前**按内容永远 0 命中**）：
+      原实现只在 `title/kind/meta` 里找子串，可归档文档的标题大多是
+      「任务列表(148条)」「xxx · w0」这类**不含内容**的名字 ⇒ 按主题搜永远空。
+      实测 `search_docs('通道')`/`('概念')`/`('回执')` 全 []，
+      而索引里有 1256 条、1725 个文档、13.6 MB 正文。
+
+    ⇒ 两阶段：① **元数据 + 摘录**（摘录本来就在索引里，零 I/O）；
+      ② ①没命中且给了 kw ⇒ **兜底扫正文**（实测 13.6 MB 全扫 0.42 秒）。
+
+    口径：**「索引里有」不等于「查得到」。** 建了索引却只能按标题找，
+    等于把长期记忆锁在文件名上 —— 而人记的是内容。
+    """
     limit = max(1, min(limit, 100))
+    if 扫正文 is None:
+        扫正文 = True                                   # 只在①空了时才真扫
+
+    def 元数据命中(rec: dict) -> bool:
+        hay = " ".join([rec.get("title", ""), rec.get("kind", ""),
+                        str(rec.get("excerpt") or ""),
+                        json.dumps(rec.get("meta", {}), ensure_ascii=False)])
+        return (kw or "") in hay
+
+    档 = sorted(_load_index().values(), key=lambda r: -r.get("ts", 0))
     rows: list[dict] = []
-    for rec in sorted(_load_index().values(), key=lambda r: -r.get("ts", 0)):
+    for rec in 档:
         if kind and rec.get("kind") != kind:
             continue
-        if kw:
-            hay = " ".join([rec.get("title", ""), rec.get("kind", ""),
-                            json.dumps(rec.get("meta", {}), ensure_ascii=False)])
-            if kw not in hay:
-                continue
+        if kw and not 元数据命中(rec):
+            continue
         rows.append({"doc_id": rec["doc_id"], "kind": rec.get("kind"),
                      "title": rec.get("title"), "byte_len": rec.get("byte_len"),
-                     "excerpt": rec.get("excerpt")})
+                     "excerpt": rec.get("excerpt"), "命中位置": "元数据/摘录"})
         if len(rows) >= limit:
-            break
+            return rows
+    if rows or not kw or not 扫正文:
+        return rows
+
+    # ── ② 兜底：扫正文（有字节预算，防索引膨胀后拖死会话）──
+    docs_root = DOCS_DIR.resolve()
+    预算 = 64 * 1024 * 1024                             # 64 MB 上限
+    for rec in 档:
+        if kind and rec.get("kind") != kind:
+            continue
+        p = Path(str(rec.get("path") or ""))
+        try:
+            rp = p.resolve()
+            if not str(rp).startswith(str(docs_root)) or not rp.is_file():
+                continue
+            字节 = rp.stat().st_size
+            if 字节 > 预算:
+                break                                   # 预算用尽 ⇒ 停（宁可少命中，不许拖死）
+            预算 -= 字节
+            正文 = rp.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if kw in 正文:
+            rows.append({"doc_id": rec["doc_id"], "kind": rec.get("kind"),
+                         "title": rec.get("title"), "byte_len": rec.get("byte_len"),
+                         "excerpt": rec.get("excerpt"), "命中位置": "正文"})
+            if len(rows) >= limit:
+                break
     return rows
 
 

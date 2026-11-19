@@ -203,7 +203,9 @@ def 项目键(仓) -> str:
 
 
 def 库路径() -> Path:
-    根 = Path(os.environ.get("ORCH_STATE_DIR") or (Path.home() / ".orchestrator-state"))
+    # ★ R549：收口到唯一取法（同 R547/R548 那一类：状态根不许有第二份实现）。
+    from . import profile as _pf549
+    根 = _pf549.state_dir()
     return 根 / "memory8.sqlite3"
 
 

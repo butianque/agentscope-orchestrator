@@ -281,7 +281,17 @@ def _build_prompt(task: TaskSpec, 反馈: str = "") -> str:
     """任务提示词 = 任务自带（优先）或档案 default_task.prompt，注入模板与机制基线。
 
     反馈：上一轮失败时由 `failure_feedback` 生成的**机器原文**段，追加在末尾。
-    为空 ⇒ 首轮，提示词与原先逐字一致（不改变既有行为）。
+    为空 ⇒ 首轮。
+
+    ★ 2026-11-07（R303）：追加**常驻仓况**段（`mem_live.仓况段()`）。
+      用户原话：「启动编排器，这个编排器**自己就要主动扫**这个文件夹下有什么……
+      是你在每轮对话里就**必须知道的**和你训练数据那样的**本来就知道**的。」
+      ⇒ 所以仓况**每轮都在提示词里**，不靠调用方记得去查。
+      · 与 `MECH`（档案里的**静态**机制基线）分工：仓况是**动态**的那个对应物；
+      · 仓况为空（没扫/没声明）⇒ 返回空串，**不占位、不编造**，提示词退化为原样；
+      · 取仓况**失败不阻塞任务** —— 宁可少给背景，不可让任务跑不了；
+      · 同步本身**不在这里做**（首次冷同步可能几百秒）：由 `taixu_mcp` 启动时
+        在后台做一次，这里只读常驻表。
     """
     tmpl = task.prompt or str((_p().default_task or {}).get("prompt") or "")
     if not tmpl:
@@ -291,7 +301,18 @@ def _build_prompt(task: TaskSpec, 反馈: str = "") -> str:
                 "```\n{TEMPLATE}\n```")
     base = tmpl.format(TEMPLATE=task.template,
                        MECH=math_model.get_charter())
-    return base + 反馈 if 反馈 else base
+    仓 = ""
+    try:
+        from agentscope_orchestrator import mem_live as _ml
+        仓 = _ml.仓况段()
+    except Exception as e:                       # noqa: BLE001 —— 背景段绝不能让任务跑不了
+        仓 = ""
+        _仓况取不到的原因 = f"{type(e).__name__}: {e}"
+    else:
+        _仓况取不到的原因 = ""
+    if not 仓 and _仓况取不到的原因:
+        base = base + f"\n\n【仓况·取不到】{_仓况取不到的原因}（本次无仓况背景）"
+    return base + 仓 + 反馈 if (反馈 or 仓) else base
 
 
 async def _window(router: Router, idx: int, task: TaskSpec, dry: bool,

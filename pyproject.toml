@@ -1,6 +1,6 @@
 [project]
 name = "agentscope-orchestrator"
-version = "0.13.11"
+version = "0.13.20"
 description = "通用工程开发多智能体编排器：自然语言目标 → 机器计划 → 真模型产内容 → 机器判据门裁决（判据不由模型评）"
 requires-python = ">=3.12"
 
@@ -19,17 +19,68 @@ dependencies = [
     #   ⇒ agentscope 哪天不再拉它，MCP 服务器就**静默装不上**。
     #   直接依赖直接声明，是打包正确性，不是冗余。
     "mcp<2.0.0",
+    # ★★★★★ R291（真读数，2026-11-06，**干净 venv 装 wheel 后实测到的**）：
+    #   在干净的 Windows venv 里 `pip install agentscope_orchestrator-*.whl` 之后，
+    #   **9 个入口里有 2 个一敲就崩**：
+    #     orch-run.exe / orch-mcp.exe
+    #     ModuleNotFoundError: No module named 'pywintypes'
+    #         ← mcp/os/win32/utilities.py:22 `import pywintypes`
+    #   根因：`mcp` 在 Windows 上要 `pywin32`（提供 `pywintypes`），
+    #   而它**不是** `mcp` 硬声明的依赖。我本地 venv 里有它纯属**别的包顺手带进来的**
+    #   ⇒ 典型的「**我的机器上有** ≠ **装上就有**」。
+    #   这里必须按平台条件声明，否则 Windows 用户装完就少两个核心入口。
+    "pywin32>=306; sys_platform == 'win32'",
+    # ★★★★★ R547（verifier 在**只装声明依赖**的干净 venv 里实测到的账）：
+    #   `kg.py` 里 **直接 import** 了 `tree_sitter` / `lxml` / `json5`，
+    #   但它们此前**一个都没声明** ⇒ 严格按 Requires-Dist 装的机器上
+    #   `kg.适配器表()` 直接 `ModuleNotFoundError: No module named 'tree_sitter'`。
+    #   这就是 R291 那本账的同一页：**我的机器上有 ≠ 装上就有**（它们是别的包顺手带进来的）。
+    #   直接依赖直接声明，是打包正确性，不是冗余。
+    "tree_sitter>=0.21",
+    "lxml>=5",
+    "json5>=0.9",
 ]
 
 [project.optional-dependencies]
 # ★ 只有想用 agent 框架自带模型客户端时才需要（会拉 numpy 等重依赖）
 agentscope = ["agentscope==2.0.9"]
+# ★ R547：tree-sitter 的各语言 grammar。**不装也能跑**（`适配器表()` 会明写未装），
+#   装了才有「定义 + 提及」级的语法树解析。名单是**据实枚举**本机
+#   `site-packages/tree_sitter_*` 得来的，不是照文档猜的。
+parsers = [
+    "tree_sitter_bash",
+    "tree_sitter_c",
+    "tree_sitter_cpp",
+    "tree_sitter_css",
+    "tree_sitter_go",
+    "tree_sitter_html",
+    "tree_sitter_java",
+    "tree_sitter_javascript",
+    "tree_sitter_json",
+    "tree_sitter_markdown",
+    "tree_sitter_python",
+    "tree_sitter_rust",
+    "tree_sitter_toml",
+    "tree_sitter_typescript",
+    "tree_sitter_yaml",
+]
 
 [project.scripts]
 # ★ 第三方 `pip install` 后要知道敲什么命令（2026-10-13 补）。
 #   此前无 console_scripts ⇒ 装完只能靠读源码找入口。
 orch-goal = "agentscope_orchestrator.generic_goal:main"
 orch-run = "agentscope_orchestrator.unattended:main"
+# ★★★ 指向**任意文件夹** → 做成知识图谱（R537 补）。
+#   为什么必须有这条：`知库.py` 2026-10 就实现了三层（索引/按需全扫/按需深读），
+#   但**没有任何一条命令能调它** —— 只有测试和临时脚本调过。
+#   ⇒ 「任意项目启动自动建知识图谱」在交付形态上**等于不存在**。
+#   用法：`orch-kb <文件夹>` 建图谱并报「你有什么」；`--问 <词>` 报「在哪」。
+orch-kb = "agentscope_orchestrator.kb_cli:main"
+# ★★★ 给**任意文件夹**生成档案（R537 补）。为什么必须有这条：
+#   编排器的一切都从档案来（`REPO_ROOT = _prof.repo_root`），而档案是**人手写的**
+#   ⇒ 「任意项目启动」在交付上等于「你得先手写一份 yaml」—— 那不是程序，是文档作业。
+#   本入口扫一遍那个文件夹、认出语言/构建工具/源码根，把那份档案生成出来。
+orch-init = "agentscope_orchestrator.init_cli:main"
 # 装完先敲这个：一条命令告诉你能不能干活（自检 ≠ 全量回归）
 orch-check = "agentscope_orchestrator.selfcheck:main"
 orch-plan = "agentscope_orchestrator.auto_goal:main"

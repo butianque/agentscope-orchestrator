@@ -115,6 +115,49 @@ def _gate_wellformed(g: dict) -> str | None:
                 or g.get("must_not_contain") or g.get("mode")):
             return "whole_reading 门缺 must_contain/patterns/must_not_contain/mode"
         return None
+    # ★★★★★ R255（2026-11-05 · 计划器真用不了最常用的门）：
+    #   `_门字段表` 补 `test_counts` 等四类之后，**if 链没跟着补** ⇒
+    #   真读数（我直接调 plan_tasks）：一份规约里带
+    #     {"type": "test_counts", "cmd": [...]}
+    #   会直接抛
+    #     `AssertionError: R130：门类型 'test_counts' 通过了守卫却没被任何分支处理`
+    #   ⇒ **计划器根本没法用"测试通过数"这个门** —— 而那正是工程验收最常用的判据。
+    #   ★ 病与 R130b 同一句：「表说它合法，if 链说它非法」；反方向也发生了。
+    #   ⇒ 口径：**表里每一类都要有分支**，且分支只查"执行器真的要什么"（不收紧）。
+    if t in ("test_counts", "oracle"):
+        if not g.get("cmd"):
+            return f"{t} 门缺 cmd（要跑的测试/证明命令 argv）"
+        if g.get("cwd") is not None and not isinstance(g.get("cwd"), str):
+            return f"{t} 门 cwd 必须是字符串"
+        return None
+    if t == "differential":
+        if not g.get("cmd"):
+            return "differential 门缺 cmd（被测命令 argv）"
+        if not g.get("ref"):
+            return "differential 门缺 ref（参照命令 argv：黄金实现/旧实现/独立实现）"
+        return None
+    if t == "property":
+        if not g.get("cmd"):
+            return "property 门缺 cmd（被测命令 argv）"
+        if not g.get("cases"):
+            return ("property 门缺 cases（每个 case = 追加参数列表；"
+                    "要求在**全部** case 上成立）—— 没有 case 就没有属性，等于恒真门")
+        return None
+    if t == "regression_parity":
+        if not g.get("cmd"):
+            return "regression_parity 门缺 cmd（当前版要跑的命令 argv）"
+        if not g.get("baseline_cmd"):
+            return ("regression_parity 门缺 baseline_cmd（基线版要跑的命令 argv）"
+                    "—— 没有基线就只能无条件判绿，那不是回归判据")
+        return None
+    if t == "instance_agreement":
+        if not g.get("cmd"):
+            return "instance_agreement 门缺 cmd（要跑的测试命令 argv）"
+        return None
+    if t == "precondition":
+        if not (g.get("cmd") or g.get("in") or g.get("file")):
+            return "precondition 门缺 cmd/in/file（前提是什么都没写）"
+        return None
     # ★★★★★ R130d：这里原本还有**第二份**「未知门类型」报错（R130 第一版加的），
     #   而函数开头的守卫（`if t not in _门字段表`）已经覆盖了全部非法类型
     #   ⇒ 这一段**不可达**，是死代码 + 第二把尺子。
@@ -337,7 +380,7 @@ def rule_ascent(c: Carrier) -> tuple[list[str], int]:
 class Task:
     tid: str
     name: str
-    kind: str                       # pre_emit | constraint_check | errand | acceptance
+    kind: str   # pre_emit | constraint_check | errand | subgoal | acceptance
     gates: list[dict] = field(default_factory=list)   # 该任务的机器判据门（逐段合取）
     depends_on: list[str] = field(default_factory=list)
 
@@ -357,12 +400,116 @@ def acceptance_gates(c: Carrier) -> list[dict]:
 
     实现上：把每条判据门原样复用（同一 GateSpec、同一 evaluate），
     额外要求它必须带 `name` 以便逐条回执——验收由此可逐门归因，而不是一个布尔。"""
-    gs = [g for g in (c.gates or []) if isinstance(g, dict) and g.get("type")]
+    # ★★★★★ R270（2026-11-05 真读数）：**约束门不属于"目标达成"的合取**。
+    #   真证据：约束门 `{type:compile, constraint:"不许改 tests/", cmd:[git diff --quiet …]}`
+    #     被同时挂进验收：`accept::约束` / `accept::功能` 并列。
+    #   合取上是"安全"的（任一门红仍判未达成，实测 `{'accept::约束': True, 'accept::功能': False}`
+    #   ⇒ 全绿 False），**但它污染的是"这个读数是什么意思"**：
+    #     ① 约束是**边界条件**（不许破坏），不是**达成证据**（做成了什么）——
+    #        两类真值混在一个合取里，验收就不再回答"目标达成了吗"；
+    #     ② 归因被稀释：验收红时分不清是"没做成"还是"踩了边界"，
+    #        而这两种红的下一步动作完全不同（继续做 / 先回滚）。
+    #   修法：约束门只当约束门的，验收合取只取**非约束**判据门。
+    #   ★ 反向纪律：若全部判据门都带 constraint（没有真正的达成判据），
+    #     验收合取为空 ⇒ 上层按"无可验收"拒绝，**不许因为空就判绿**。
+    gs = [g for g in (c.gates or [])
+          if isinstance(g, dict) and g.get("type") and not g.get("constraint")]
     out: list[dict] = []
     for i, g in enumerate(gs):
         ng = dict(g)
         ng["name"] = f"accept::{g.get('name') or g.get('type') or i}"
         out.append(ng)
+    return out
+
+
+def _约束门269(c: Carrier, con: str) -> list[dict]:
+    """挑出**真属于这条约束**的门（R269）。
+
+    ★ 为什么必须这么挑（真读数，2026-11-05 · case02 真目标）：
+      原实现 `gates=list(c.gates or [])` 把**全部实现判据门**挂到每个
+      `constraint_check` 任务上。于是一个叫「不许改 tests/」的任务身上
+      挂着 `unittest discover` 和 `grep_required 月度退款额`。
+      两重后果：① 约束绿 ⇒ 看起来目标达成（**替实现判达标**）；
+                ② 约束任务依赖着全量判据 ⇒ 实现没做完时它必红，
+                   而 errand 依赖它 ⇒ **实现任务死锁跑不起来**。
+
+    ★ 判据：`GateSpec` 里显式写了 `constraint` 字段且与约束文本相关的门才算。
+      没写 ⇒ 这条约束**没有可机判的门**（空表），由上游充分性检查拦 ——
+      不许拿实现判据冒充约束判据。这条纪律与 R178「门缺字段可纠正」一致。
+    """
+    out: list[dict] = []
+    for g in (c.gates or []):
+        if not isinstance(g, dict):
+            continue
+        _c = g.get("constraint")
+        if not _c:
+            continue
+        # 粗匹配即可：约束文本互相包含，或门声明的 constraint 就是这条约束的序号/全文
+        if str(_c) == str(con) or str(_c) in str(con) or str(con) in str(_c):
+            out.append(g)
+    return out
+
+
+def plan_to_submissions(plan: dict) -> list[dict]:
+    """把机器计划翻成**可提交的任务序列**（R273）。
+
+    ★★★ 为什么必须做这一步（真读数，2026-11-05）：
+      `run_errand(unit_id, cmd, cwd, gates, name, priority, depends_on)`
+      —— **没有 `tid`，也没有 `kind`**。
+      而计划任务的字段是 `['tid', 'name', 'kind', 'gates', 'depends_on']`。
+      ⇒ 「计划 → 执行」这一段**根本没有接线**：
+        · `tid` 丢了 ⇒ 依赖链没法指回计划（调用方拿不到"计划内 id ↔ 真 job id"的映射，
+          R254 注释里那句"计划内 id 不是真 job id ⇒ 调用方无法照它接线"就是这个坑）；
+        · `kind` 丢了 ⇒ 执行期分不清"这是子目标汇总 / 约束检查 / 实现 / 验收"，
+          R269（约束不许替实现判达标）、R271/R272（子目标不许是装饰）在**真跑时全部失效**。
+
+    ⇒ 本函数输出**按 topo 序**的提交清单，每项给足执行侧要的字段，并且：
+      · `depends_on_plan`：本任务的**计划内**前置 tid（供调用方换成真 job id）；
+      · `will_run`：这一项**是否真的要起一个执行体**（`subgoal` / `acceptance` 是**汇总点**，
+        它们不干活，只等，所以 `will_run=False`——**避免把汇总点当任务派出去**）；
+      · `gates`：真判据门（子目标/验收带着各自的门，执行侧据此判）。
+
+    ★ 诚实边界：本函数**只做翻译，不提交**。提交要真 job id，只有执行层能生成。
+      「一段驱动不了的接线等于没有接线」——所以配套调用方式写在这里：
+        按返回顺序逐项提交，把前序 `tid` 用真 job id 替换后填进 `depends_on`。
+    """
+    if not isinstance(plan, dict):
+        return []
+    tasks = {t.get("tid"): t for t in (plan.get("tasks") or []) if isinstance(t, dict)}
+    topo = plan.get("topo") or list(tasks)
+    # ★★★★★ R274b（2026-11-05 真端到端抓的）：**"不提交的汇总点"不能出现在下游依赖里。**
+    #   真读数（按 submissions 清单驱动真仓）：
+    #     pre_0  will_run=False        ← 永不提交
+    #     task_0 will_run=True  deps=['pre_0']
+    #   ⇒ 下游等一个**永远不会通过的依赖** ⇒ **实现任务永久阻塞**，整棵目标树开不了工。
+    #   （我的驱动脚本里 `task_0` 报的是"上游未落地，停"，一开始我还以为那是
+    #     "合理等待"——直到发现 pre_0 根本不打算运行。）
+    #   口径：`depends_on` 只对**会落地的**依赖有意义。汇总点/发射点不落地，
+    #     把它们的 tid 交给下游 = 交了一个永远不会 satisfied 的闸。
+    #   ⇒ 翻译层就把它们剔掉，并在 `dropped_deps` 里如实交代（不许静默丢）。
+    _不落地 = {tid for tid in topo
+               if str((tasks.get(tid) or {}).get("kind") or "") not in
+               ("errand", "constraint_check")}
+    out: list[dict] = []
+    for tid in topo:
+        t = tasks.get(tid)
+        if not t:
+            continue
+        kind = str(t.get("kind") or "")
+        _原依赖 = [d for d in (t.get("depends_on") or [])]
+        _真依赖 = [d for d in _原依赖 if d not in _不落地]
+        out.append({
+            "tid": tid,
+            "kind": kind,
+            "name": str(t.get("name") or tid),
+            "gates": [g for g in (t.get("gates") or []) if isinstance(g, dict)],
+            "depends_on_plan": _真依赖,
+            "dropped_deps": [d for d in _原依赖 if d in _不落地],
+            # 只有真干活的任务才起执行体；汇总点只等依赖
+            "will_run": kind in ("errand", "constraint_check"),
+            "reason": ("" if kind in ("errand", "constraint_check")
+                       else f"{kind} 是汇总/发射点，不单独起执行体"),
+        })
     return out
 
 
@@ -382,17 +529,48 @@ def wire_tasks(c: Carrier) -> list[Task]:
     for i, con in enumerate(c.constraints):
         tid = f"con_{i}"
         constraint_tids.append(tid)
-        # ★ 修复（2026-10-12）：原用 `cmd: ["true"]` 恒真占位门。约束无真实判据时
-        #   就该没有门（上游充分性检查拦），而不是假绿门。
+        # ★★★★★ R269（2026-11-05 真读数抓的）：**约束任务不许挂实现判据门**。
+        #   真证据（case02 真目标，三条判据门）：
+        #     con_0 (constraint_check): name='不许改 tests/'
+        #       gates=[{'type':'compile','cmd':[...unittest...]},
+        #              {'type':'grep_required','pattern':'月度退款额'}, …]
+        #   —— 一个叫「不许改 tests/」的任务身上挂着**全部实现判据门**。
+        #   后果有两层，都是坏的：
+        #     ① 约束检查会**替实现判达标**：「约束任务绿了」看起来像「目标达成了」；
+        #     ② 约束任务的 gate 是全量判据 ⇒ 实现没做完时它必红 ⇒
+        #        下游 errand 依赖它 ⇒ **实现任务永远跑不起来**（死锁）。
+        #   ⇒ 约束任务只在**真有一条对应约束的门**时才挂门；没有就不挂（空 = 无门可判，
+        #     由上游充分性检查拦），**绝不拿实现判据冒充约束判据**。
         tasks.append(Task(tid=tid, name=con, kind="constraint_check",
-                          gates=list(c.gates or [])))
+                          gates=_约束门269(c, con)))
     errand_tids: list[str] = []
     pre_tids = [t.tid for t in tasks if t.kind == "pre_emit"]
+    # ★★★★★ R271（2026-11-05 真读数）：**子目标（父子目标嵌套）此前根本不存在**。
+    #   真读数：`auto_goal` 源码里 sub_goal/subgoal/子目标/children/parent 出现 **0 次**；
+    #     把两条带 `goal:"子目标A"` 的门喂进去 ⇒ 计划器把 `goal` 字段**原样保留却忽略**，
+    #     产出 [task_0 errand, task_1 errand, accept] —— 两条门被压平成**同级**实现任务。
+    #   后果：真仓上的大目标（case02 的「实现订单取消流程」其实由 service/inventory/report
+    #     三段组成）**无法表达"子目标整体达成"**。三段里任何一段做完，父目标可能被判完成，
+    #     而"子目标 A 全做完"这件事在这个数据结构里**没有位置**。
+    #   ⇒ 加一层：门可带 `goal` 字段（子目标名）。同名的门归到同一个子目标，
+    #     每个子目标生成一个 `subgoal` 汇总任务（依赖它的全部 errand），
+    #     acceptance 依赖**子目标**（没有子目标时才回退直接依赖 errand）。
+    #     ★ 零回退：不带 `goal` 门的计划与原来**逐字节一致**（子目标层不发生）。
+    _归271: dict[str, list[str]] = {}
     for i, g in enumerate(c.gates):
         tid = f"task_{i}"
         errand_tids.append(tid)
-        tasks.append(Task(tid=tid, name=f"实现#{i}", kind="errand",
+        _子 = str((g or {}).get("goal") or "").strip() if isinstance(g, dict) else ""
+        tasks.append(Task(tid=tid, name=(_子 or f"实现#{i}"), kind="errand",
                           gates=[g], depends_on=pre_tids + constraint_tids))
+        if _子:
+            _归271.setdefault(_子, []).append(tid)
+    _子目标tids: list[str] = []
+    for _k, (_名, _成员) in enumerate(_归271.items()):
+        _sid = f"subgoal_{_k}"
+        _子目标tids.append(_sid)
+        tasks.append(Task(tid=_sid, name=_名, kind="subgoal",
+                          gates=[], depends_on=list(_成员)))
     if c.acceptance:
         # ★ 修复（2026-10-12）：验收门原为 `cmd: ["true"]` 恒真占位 → 改为
         #   载体判据槽的合取（真值判据）。无判据槽 ⇒ 验收为空 ⇒ 不生成假绿验收任务。
@@ -401,7 +579,10 @@ def wire_tasks(c: Carrier) -> list[Task]:
             tasks.append(Task(
                 tid="accept", name=c.acceptance[0], kind="acceptance",
                 gates=acc_gates,
-                depends_on=errand_tids))
+                # R271：有子目标层时验收依赖**子目标**（"每段都整体达成"），否则回退直接依赖 errand。
+                depends_on=(_子目标tids + [t for t in errand_tids
+                                           if not any(t in m for m in _归271.values())])
+                if _子目标tids else errand_tids))
     return tasks
 
 
@@ -489,6 +670,16 @@ def plan_tasks(spec: dict) -> dict:
         raise ValueError(f"接线守恒违例：{why}")
     # ★ 拓扑序在**返回之前**算：成环 ⇒ 这里就抛，绝不发一份跑不起来的计划
     序 = topo_order(tasks)
+    # ★★★★★ R254（2026-11-05 · 目标树纪律）：**父目标不许假完成**。
+    #   口径：一个"目标"要能算**闭合**，必须满足三条，缺一条就不是完成：
+    #     ① 它的 acceptance 任务真的在计划里（不是空表）；
+    #     ② acceptance 任务的依赖**全部指向计划内的任务**（没有凭空依赖）；
+    #     ③ acceptance 必须能**沿依赖链追到每一个 errand**（任何一条实现任务
+    #        不在它的依赖闭包里 ⇒ 那个实现做没做都不影响"目标完成" ⇒ 可以假完成）。
+    #   真证据形状（本机可直接复现）：一份 gates 有 3 条的计划，若 acceptance 只依赖
+    #   其中 1 个 errand，另 2 个**做不做都判"目标闭合"** —— 这正是"父目标假完成"。
+    #   ⇒ 不改任何已有键（老调用方零影响），只多两个：`closed` 与 `uncovered`。
+    _闭 = _闭合检查(tasks, 序)
     return {
         "carrier": c.name,
         "rules": rules,
@@ -497,7 +688,73 @@ def plan_tasks(spec: dict) -> dict:
         "topo": 序,
         "conserved": True,
         "acceptance": c.acceptance,
+        "closed": _闭["closed"],
+        "uncovered": _闭["uncovered"],
     }
+
+
+def _闭合检查(tasks: list, 序: list) -> dict:
+    """父目标闭合机验：acceptance 必须沿依赖链覆盖**全部实现任务**。
+
+    返回 `{"closed": bool, "uncovered": [tid...], "why": str}`。
+    ★ 这是**机器算的**，不问模型"你觉得完成了吗"。
+    """
+    by_tid = {t.tid: t for t in tasks}
+    acc = [t for t in tasks if t.kind == "acceptance"]
+    if not acc:
+        return {"closed": False, "uncovered": [],
+                "why": "计划里没有 acceptance 任务 ⇒ 没有闭合点，不叫完成"}
+    # 从 accept 出发，反向收集全部可达依赖
+    可达: set = set()
+    栈 = [a.tid for a in acc]
+    while 栈:
+        _t = 栈.pop()
+        if _t in 可达:
+            continue
+        可达.add(_t)
+        for _d in (by_tid.get(_t).depends_on if by_tid.get(_t) else []):
+            栈.append(_d)
+    未知 = sorted(_t for _t in 可达 if _t not in by_tid)
+    实现 = [t.tid for t in tasks if t.kind == "errand"]
+    未覆盖 = sorted(_t for _t in 实现 if _t not in 可达)
+    if 未知:
+        return {"closed": False, "uncovered": 未覆盖,
+                "why": f"acceptance 依赖了计划外的任务：{未知}（凭空依赖）"}
+    if 未覆盖:
+        return {"closed": False, "uncovered": 未覆盖,
+                "why": (f"{len(未覆盖)} 个实现任务不在 acceptance 的依赖闭包里 ⇒ "
+                        f"它们做不做都判「目标完成」= **父目标可假完成**")}
+    # ★★★★★ R272（2026-11-05 真读数）：**子目标必须真被验，否则它只是装饰**。
+    #   真证据：上一轮加了 `subgoal` 汇总任务之后，
+    #     把整个子目标层砍掉、验收直接依赖 errand ⇒ `closed` **照样是 True**
+    #     （why: "acceptance 覆盖全部实现任务"）。
+    #   原因：本函数只统计 `kind == "errand"`，`subgoal` 既不算实现任务也不被验。
+    #   ⇒ 那一层"驱动不了"：计划里看着有分段，机器一个判据都不看它。
+    #   修：① 每个子目标也必须在可达闭包里（否则它做不做都判完成）；
+    #       ② 子目标的成员必须是**真实的 errand**，且成员不许"只属名字不属依赖"
+    #          （成员必须真在本子目标的 depends_on 里）。
+    子目标 = [t for t in tasks if t.kind == "subgoal"]
+    for _s in 子目标:
+        if _s.tid not in 可达:
+            return {"closed": False, "uncovered": [_s.tid],
+                    "why": (f"子目标 {_s.tid}（{_s.name}）不在 acceptance 的依赖闭包里 ⇒ "
+                            "这一段做不做都判「目标完成」= 子目标是装饰")}
+        _成员 = list(_s.depends_on or [])
+        if not _成员:
+            return {"closed": False, "uncovered": [_s.tid],
+                    "why": f"子目标 {_s.tid}（{_s.name}）没有任何成员任务 ⇒ 空子目标恒真"}
+        _假 = [_m for _m in _成员 if _m not in by_tid]
+        if _假:
+            return {"closed": False, "uncovered": [_s.tid],
+                    "why": f"子目标 {_s.tid} 依赖了计划外的任务：{_假}（凭空成员）"}
+        _非实现 = [_m for _m in _成员 if by_tid[_m].kind != "errand"]
+        if _非实现:
+            return {"closed": False, "uncovered": [_s.tid],
+                    "why": (f"子目标 {_s.tid} 的成员里有非实现任务 {_非实现} ⇒ "
+                            "子目标可以靠非实现任务凑绿")}
+    return {"closed": True, "uncovered": [],
+            "why": (f"acceptance 覆盖全部实现任务"
+                    + (f"与 {len(子目标)} 个子目标" if 子目标 else ""))}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -516,9 +773,223 @@ def plan_tasks(spec: dict) -> dict:
 _SELF_GATES下限 = 12
 
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# ★★★★ R535：**①→② 接线** —— 定计划**之前**先做真实盘点。
+#
+# 断点（实测）：`plan_tasks` 只吃规约 JSON，**不读任何盘点** ⇒
+#   计划里引用的路径对不对，规划阶段无从知道（186 条判据一条都没判过）。
+# 用户的原话是「任意项目启动**自动建知识图谱**，**根据**目标自动定计划」
+#   ⇒ 两层都在，**中间没接**。这里把它接上，并且**引用不存在的路径就拒发**。
+# ══════════════════════════════════════════════════════════════════════════
+
+def _抽路径(tasks) -> list:
+    r"""从计划的门里抽出**像路径的东西** → `[(tid, 原样, 相对路径)]`。
+
+    ★ 只认两类（**故意保守**，口径 344：不许声称没验过的事）：
+      · 门的 `cwd` —— 它**按定义**就是路径；
+      · `cmd` 里**含路径分隔符**（`/` 或 `\`）的参数。
+    ★ 不把裸 token 当路径：否则 `cargo --lib` / `pytest -q` 里的
+      `lib`、`q` 会被误判成路径 ⇒ **误报比漏报更坏**（口径 311：造出不存在的东西）。
+    """
+    出 = []
+    for t in (tasks or []):
+        tid = t.get("tid", "?")
+        for g in (t.get("gates") or []):
+            if not isinstance(g, dict):
+                continue
+            cwd = g.get("cwd")
+            if isinstance(cwd, str) and cwd.strip():
+                出.append((tid, "cwd", cwd.strip()))
+            for x in (g.get("cmd") or []):
+                s = str(x)
+                if "/" in s or "\\" in s:
+                    出.append((tid, "cmd", s))
+    return 出
+
+
+def _核对计划路径(计划: dict, 根) -> dict:
+    """计划引用的路径必须真在**索引里**或**盘上** —— 逐条对真值（R535）。
+
+    ★ 为什么对**两处**：索引是快照（口径 367），盘是当下；
+      索引里有而盘上没了 ⇒ 是**漂移**，要报出来但不算「凭空引用」。
+    ★ `cwd` 常写成**相对根**的目录；`cmd` 里的路径可能相对 `cwd` ⇒
+      两者都试，**试到哪个算哪个**，并把「怎么算出来的」记下来（口径 307）。
+    """
+    # ★★ 局部导入：本模块级**没有** `pathlib`（第三回栽在这上面 ——
+    #   判 187 是 `pathlib`、判 188 是 `re`、这里是 `pathlib`）。
+    #   ★ 口径：**别假设目标模块的模块级导入**；测试/接线代码自己带齐。
+    import pathlib
+    根 = pathlib.Path(根).resolve()
+    索 = pathlib.Path(计划.get("盘点", {}).get("索引文件") or "")
+    有索引 = set()
+    if 索.is_file():
+        import json as _j
+        有索引 = {_j.loads(x)[0] for x in 索.read_text(encoding="utf-8").splitlines() if x}
+    查了, 不存在, 限定 = [], [], {"索引里有但盘上没了": [], "在盘上但不在索引里": []}
+    占位 = []
+    for tid, 来自, 原样 in _抽路径(计划.get("tasks")):
+        # ★★★★ R535b：**占位符不是路径** —— `{repo}` / `{root}` 这类模板变量
+        #   在真计划里到处都是（`_selftest` 的夹具就是
+        #   `{"cmd": ["make"], "cwd": "{repo}"}`）。
+        #   ★ 不跳过的话，**每一份正常计划都会被误判成「引用了不存在的路径」而拒发**
+        #     ⇒ 这不是「判得严」，这是**把工具用坏**（口径 311：误报比漏报更坏）。
+        #   ⇒ 单列一栏 `占位符没查`，**明说没查**（口径 92：允许没查 + 必须说明）。
+        if "{" in 原样 and "}" in 原样:
+            占位.append({"tid": tid, "来自": 来自, "原样": 原样})
+            continue
+        正 = (根 / 原样.replace("\\", "/")).resolve()
+        try:
+            相 = 正.relative_to(根).as_posix()
+        except ValueError:
+            相 = None
+        索引有 = 相 is not None and (相 in 有索引 or any(x.startswith(相 + "/") for x in 有索引))
+        盘上有 = 正.exists() or 正.is_dir()
+        查了.append({"tid": tid, "来自": 来自, "原样": 原样,
+                   "在索引里": bool(索引有), "在盘上": bool(盘上有)})
+        if not 索引有 and not 盘上有:
+            不存在.append({"tid": tid, "来自": 来自, "原样": 原样})
+        elif 索引有 and not 盘上有:
+            限定["索引里有但盘上没了"].append(原样)
+        elif 盘上有 and not 索引有:
+            限定["在盘上但不在索引里"].append(原样)
+    return {
+        "查了": 查了,
+        "不存在": 不存在,
+        "占位符没查": 占位,
+        "★占位符为什么不算": "`{repo}`/`{root}` 是**模板变量**，由执行侧填 —— "
+                     "把它们当路径会**误杀每一份正常计划**（R535b 实测："
+                     "`_selftest` 的夹具 `cwd` 就是 `{repo}`）。**明说没查**，不假装查过。",
+        "★我只查了什么": "门的 `cwd` 与 `cmd` 里**含路径分隔符**的参数 —— "
+                    "其余 token（命令名/开关）**不当路径**，否则 `cargo --lib` "
+                    "会被误判（口径 344/311：误报比漏报更坏）",
+        "★对了两处": "**索引**（快照，口径 367）与**盘上**（当下）都要对；"
+                  "两者不一致的单独列在下面，不算「凭空引用」但**要留痕**",
+        "★索引与盘不一致": 限定,
+    }
+
+
+def 带盘点定计划(根, spec: dict, 打印=print) -> dict:
+    """①→② 接线：**先真实盘点，再定计划，再核对计划里引用的路径**（R535）。
+
+    ★ 返回 `plan_tasks(spec)` 的全部键 **+ 两个新键**（老调用方零影响）：
+      · `盘点`      —— `知库.盘点(根)`（秒级真实盘点）
+      · `★路径核对` —— 计划引用的路径逐条对真值
+    ★ **引用不存在的路径 ⇒ 当场抛** —— 与「成环 ⇒ 拒发」同款纪律：
+      **绝不发一份跑不起来的计划**（口径：计划是要执行的，不是展示品）。
+    """
+    try:
+        from . import 知库                       # 包内
+    except ImportError:                          # noqa: PERF203
+        import importlib
+        知库 = importlib.import_module("agentscope_orchestrator.知库")
+    盘 = 知库.盘点(根, 打印=打印)
+    计划 = plan_tasks(spec)
+    计划["盘点"] = 盘
+    核 = _核对计划路径(计划, 根)
+    计划["★路径核对"] = 核
+    if 核["不存在"]:
+        坏 = 核["不存在"][:4]
+        raise ValueError(
+            f"计划引用了**不存在的路径** ⇒ 拒发（{len(核['不存在'])} 条）：{坏}；"
+            f"★ 这不是「计划不好」，是**这份计划跑不起来** —— "
+            f"根是 `{盘['根']}`（文件 {盘['文件数']:,}），"
+            f"索引在 `{盘['索引文件']}`（口径 358：我这边查过的地方都在核对里）")
+    return 计划
+
+
 def _selftest() -> int:
     from pathlib import Path as _P130
     fails = []
+    # ★★★★★ R254：**父目标不许假完成** —— acceptance 必须覆盖全部实现任务。
+    #   这道齿要能报红：人为把 accept 的依赖砍到只剩一个 errand，
+    #   `closed` 必须变 False 并且**点名**哪些实现没被覆盖。
+    try:
+        _规254 = {"name": "闭合齿", "pre": ["原料"], "constraints": ["资源"],
+                  "gates": [{"type": "compile", "cmd": ["make"], "cwd": "{repo}"},
+                            {"type": "grep_required", "in": "src/a.py",
+                             "patterns": ["def f"]}],
+                  "acceptance": ["全绿"]}
+        _r254 = plan_tasks(_规254)
+        if not _r254.get("closed"):
+            fails.append(f"【R254】正常计划的环闭合被判否：{_r254.get('uncovered')}")
+        _实254 = [t["tid"] for t in _r254["tasks"] if t["kind"] == "errand"]
+        if len(_实254) < 2:
+            fails.append(f"【R254】齿的夹具只切出 {len(_实254)} 个实现任务 ⇒ 测不出假完成")
+        else:
+            class _T254:
+                def __init__(s, d):
+                    s.__dict__.update(d)
+            _砍254 = [dict(t) for t in _r254["tasks"]]
+            for _t in _砍254:
+                if _t["kind"] == "acceptance":
+                    _t["depends_on"] = _实254[:1]
+            _闭254 = _闭合检查([_T254(d) for d in _砍254], _r254["topo"])
+            if _闭254["closed"]:
+                fails.append("【R254】accept 只依赖一个实现任务，闭合却没被否 ⇒ 父目标可假完成")
+            if not _闭254["uncovered"]:
+                fails.append("【R254】闭合被否了却**没点名**未覆盖的任务 ⇒ 红得没法修")
+    except Exception as _e254:                    # noqa: BLE001
+        fails.append(f"【R254】齿自身异常：{type(_e254).__name__}: {_e254}")
+    # ★★★★★ R255：**表与 if 链必须逐类对齐** —— 每一类合法门都要有校验分支。
+    #   真读数：补 `test_counts` 进 `_门字段表` 之后，if 链没跟上 ⇒ 计划器一带
+    #   test_counts 门就直接抛「R130：通过了守卫却没被任何分支处理」⇒
+    #   **最常用的"测试通过数"门计划器用不了**。
+    #   这道齿的做法：把每一类的**最小合法门**都过一遍 `_gate_wellformed`，
+    #   任何一类抛异常/报未知，就是"表与实现不一致"。
+    _最小门255 = {
+        "compile": {"cmd": ["make"]},
+        "test_counts": {"cmd": ["make", "test"]},
+        "oracle": {"cmd": ["prove"]},
+        "differential": {"cmd": ["new"], "ref": ["old"]},
+        "property": {"cmd": ["x"], "cases": [["1"]]},
+        "regression_parity": {"cmd": ["new"], "baseline_cmd": ["old"]},
+        "instance_agreement": {"cmd": ["pytest"]},
+        "precondition": {"cmd": ["test", "-f", "a"]},
+        "grep_required": {"in": "a.py", "patterns": ["def f"]},
+        "grep_forbidden": {"in": "a.py", "patterns": ["TODO"]},
+        "scan_output": {"cmd": ["run"]},
+        "whole_reading": {"in": "a.py", "must_contain": ["x"]},
+        "axiom_footprint": {"cmd": ["check"]},
+        "kernel_statement": {"in": "a.lean", "must_contain": ["theorem"]},
+    }
+    for _t255, _g255 in _最小门255.items():
+        try:
+            _why255 = _gate_wellformed(dict(_g255, type=_t255))
+        except Exception as _ex255:               # noqa: BLE001
+            fails.append(f"【R255】门类型 {_t255} 的最小合法门**抛异常**"
+                         f"（表与 if 链不一致）：{type(_ex255).__name__}: {_ex255}")
+            continue
+        if _why255:
+            fails.append(f"【R255】门类型 {_t255} 的最小合法门被判非法：{_why255}")
+    _缺255 = set(_门字段表) - set(_最小门255)
+    if _缺255:
+        fails.append(f"【R255】`_门字段表` 里有类型没进这张齿表：{sorted(_缺255)}")
+    # ★★★★★ R256：**执行层的闭合闸**必须真的会拦（不然 `closed` 只是打印了一份真相）。
+    try:
+        from agentscope_orchestrator.taixu_mcp import accept_closed as _ac256
+    except Exception:                              # noqa: BLE001  MCP 层不在时跳过（不冒充验过）
+        _ac256 = None
+    if _ac256 is not None:
+        _好256, _ = _ac256(_r254)
+        if not _好256:
+            fails.append("【R256】正常计划被执行层闭合闸拒 ⇒ 会把对的目标也拦住")
+        _坏256 = dict(_r254, closed=False, uncovered=["task_1"])
+        _好256b, _why256 = _ac256(_坏256)
+        if _好256b:
+            fails.append("【R256】不闭合的计划被执行层放行 ⇒ 父目标仍可假完成")
+        elif "task_1" not in str(_why256):
+            fails.append(f"【R256】拦了但没点名未覆盖任务（红得没法修）：{_why256}")
+        _旧256 = {k: v for k, v in _r254.items() if k not in ("closed", "uncovered")}
+        if _ac256(_旧256)[0]:
+            fails.append("【R256】没有 closed 字段的旧计划被放行 ⇒ 无法证明闭合却照跑")
+    # 反向：该红的必须红（证明齿能报红，不是只求绿）
+    for _t255b, _g255b in (("property", {"cmd": ["x"]}),
+                           ("differential", {"cmd": ["x"]}),
+                           ("regression_parity", {"cmd": ["x"]}),
+                           ("test_counts", {})):
+        if not _gate_wellformed(dict(_g255b, type=_t255b)):
+            fails.append(f"【R255】{_t255b} 缺必填字段却没被判红 ⇒ 校验形同虚设")
     # ① 载体合法：完整规约通过；缺门/空名拒绝（carrier 律 + 未知拒绝）
     good = {"name": "g1", "pre": ["原料"], "constraints": ["资源"],
             "gates": [{"type": "compile", "cmd": ["make"], "cwd": ".", "expect_exit": 0}],
@@ -535,6 +1006,249 @@ def _selftest() -> int:
     # ★★★★★ R130：**合法门类型只能有一份**，且报错必须给清单。
     #   真证据：模型给 `type: "command"`，机器回「未知门类型：command」，
     #   一个字都没说合法的是什么 ⇒ 模型盲猜 3 次 ⇒ 诚实停机。
+    # ★★★★★ R274b：**"不提交的汇总点"不许出现在下游依赖里**。
+    #   真读数（按 submissions 清单驱动真仓）：
+    #     pre_0  will_run=False（永不提交）   task_0 will_run=True deps=['pre_0']
+    #   ⇒ 下游等一个永远不会通过的依赖 ⇒ **实现任务永久阻塞**，整棵树开不了工。
+    #   我第一眼还以为那是"合理等待"，直到发现 pre_0 根本不打算运行。
+    try:
+        _p274 = plan_tasks({"name": "r274b", "pre": ["仓可编译"],
+                            "gates": [{"type": "compile", "cmd": ["x"], "cwd": ".",
+                                       "goal": "段A"}],
+                            "acceptance": ["全绿"]})
+        _s274 = plan_to_submissions(_p274)
+        _不落274 = {x["tid"] for x in _s274 if not x["will_run"]}
+        for _x in _s274:
+            if not _x["will_run"]:
+                continue
+            _坏274 = [d for d in _x["depends_on_plan"] if d in _不落274]
+            if _坏274:
+                fails.append(f"【R274b】{_x['tid']} 依赖了永不提交的 {_坏274} "
+                             "⇒ 实现任务永久阻塞，整棵目标树开不了工")
+        # 剔掉的依赖必须如实交代（不许静默丢）
+        if any(_x["dropped_deps"] and not _x["depends_on_plan"] is None for _x in _s274):
+            _有丢 = [x for x in _s274 if x["dropped_deps"]]
+            if not _有丢:
+                fails.append("【R274b】剔掉了依赖却没进 dropped_deps ⇒ 静默丢依赖")
+        # 反向：真依赖（errand 之间的）不许被误剔
+        _p274c = plan_tasks({"name": "r274c", "gates": [
+            {"type": "compile", "cmd": ["x"], "cwd": ".", "goal": "段A"}],
+            "acceptance": ["全绿"]})
+        _s274c = {x["tid"]: x for x in plan_to_submissions(_p274c)}
+        if "subgoal_0" in _s274c and _s274c["subgoal_0"]["will_run"]:
+            fails.append("【R274b】汇总点被标成要跑")
+    except Exception as _e274:                    # noqa: BLE001
+        fails.append(f"【R274b】齿自身异常：{type(_e274).__name__}: {_e274}")
+    # ★★★★★ R273：**「计划 → 执行」这一段必须真接得上**。
+    #   真读数：run_errand(unit_id, cmd, cwd, gates, name, priority, depends_on)
+    #   —— **没有 tid，也没有 kind**；而计划任务字段是
+    #   ['tid','name','kind','gates','depends_on']。
+    #   ⇒ tid 丢了：调用方拿不到"计划内 id ↔ 真 job id"的映射（R254 注释里
+    #      "计划内 id 不是真 job id ⇒ 调用方无法照它接线"就是这个坑）；
+    #     kind 丢了：执行期分不清子目标/约束/实现/验收 ⇒
+    #      R269/R271/R272 三条纪律在**真跑时全部失效**。
+    try:
+        _p273 = plan_tasks({"name": "r273", "pre": ["仓可编译"],
+                            "constraints": ["不许改 tests/"],
+                            "gates": [{"type": "compile", "cmd": ["x"], "cwd": ".",
+                                       "goal": "段A"},
+                                      {"type": "grep_required", "in": "a.py",
+                                       "patterns": ["x"], "goal": "段A"},
+                                      {"type": "grep_required", "in": "b.py",
+                                       "patterns": ["y"]}],
+                            "acceptance": ["全绿"]})
+        _s273 = plan_to_submissions(_p273)
+        if not _s273:
+            fails.append("【R273】计划翻不出提交序列 ⇒ 计划到执行没有接线")
+        else:
+            if [x["tid"] for x in _s273] != list(_p273.get("topo") or []):
+                fails.append("【R273】提交序列没按 topo 序 ⇒ 执行序不受计划约束")
+            _有273 = {x["tid"]: x for x in _s273}
+            # 汇总点不许被派出去（否则拿 0 条门去跑）
+            for _k in ("subgoal_0", "accept"):
+                if _k in _有273 and _有273[_k]["will_run"]:
+                    fails.append(f"【R273】{_k}（{_有273[_k]['kind']}）被标成要真跑 "
+                                 "⇒ 汇总点会拿 0 条门去跑（空判据）")
+            # 真干活的必须被派
+            for _k in ("task_0", "task_1", "task_2", "con_0"):
+                if _k in _有273 and not _有273[_k]["will_run"]:
+                    fails.append(f"【R273】{_k}（{_有273[_k]['kind']}）没被标成要跑 "
+                                 "⇒ 实现任务不会被执行")
+            # 计划内依赖必须原样交出去（调用方才能换成真 job id）
+            # ★ R274b 之后口径变了：`pre_0`（pre_emit）永不提交 ⇒ 必须剔出下游依赖，
+            #   所以这里不能还要求 depends_on_plan 原样含 pre_0。
+            #   **正确的是：真依赖（con_0，会提交的）必须在，永不提交的必须在 dropped_deps 里。**
+            _t273 = _有273.get("task_0", {})
+            if "con_0" not in (_t273.get("depends_on_plan") or []):
+                fails.append("【R273】会提交的真依赖（con_0）没交出去 "
+                             "⇒ 调用方无法照它接真 job id")
+            if "pre_0" not in (_t273.get("dropped_deps") or []):
+                fails.append("【R273】永不提交的 pre_0 既没进依赖也没进 dropped_deps "
+                             "⇒ 依赖被静默丢了")
+            # 每项都必须有 kind（丢了 kind 就等于丢了纪律）
+            if any(not x.get("kind") for x in _s273):
+                fails.append("【R273】提交项缺 kind ⇒ 执行期分不清任务种类，"
+                             "R269/R271/R272 在真跑时全失效")
+    except Exception as _e273:                    # noqa: BLE001
+        fails.append(f"【R273】齿自身异常：{type(_e273).__name__}: {_e273}")
+    # ★★★★★ R272：**子目标必须真被验，否则它只是装饰**。
+    #   真读数：上一轮加了 subgoal 汇总任务后，验收**绕过**子目标直接依赖 errand
+    #   ⇒ 旧 `_闭合检查` 照样 closed=True（它只统计 kind=="errand"）。
+    #   口径：一段驱动不了的接线等于没有接线 —— 计划里看着有分段，
+    #   机器一个判据都不看它，那这一段做不做都判完成。
+    try:
+        _c272 = Carrier(name="r272", gates=[
+            {"type": "compile", "cmd": ["x"], "cwd": ".", "goal": "段A"},
+            {"type": "grep_required", "in": "a.py", "patterns": ["x"], "goal": "段A"},
+            {"type": "grep_required", "in": "b.py", "patterns": ["y"], "goal": "段B"}],
+            acceptance=["全绿"])
+        _ts272 = [dict(tid=t.tid, name=t.name, kind=t.kind,
+                       gates=list(t.gates), depends_on=list(t.depends_on))
+                  for t in wire_tasks(_c272)]
+
+        class _T272:
+            def __init__(s, d):
+                s.__dict__.update(d)
+
+        _序272 = [t["tid"] for t in _ts272]
+        _好272 = _闭合检查([_T272(d) for d in _ts272], _序272)
+        if not _好272.get("closed"):
+            fails.append(f"【R272】正常的子目标计划被判不闭合（{_好272.get('why')}）⇒ 齿夹具错")
+        # 架空虚设：验收绕过子目标、直接依赖 errand
+        _绕272 = [dict(d) for d in _ts272]
+        for _d in _绕272:
+            if _d["kind"] == "acceptance":
+                _d["depends_on"] = [x["tid"] for x in _ts272 if x["kind"] == "errand"]
+        _闭272 = _闭合检查([_T272(d) for d in _绕272], _序272)
+        if _闭272.get("closed"):
+            fails.append("【R272】验收绕过子目标直接依赖 errand 却判闭合 "
+                         "⇒ 子目标层是装饰（做不做都判完成）")
+        elif "subgoal" not in str(_闭272.get("why") or ""):
+            fails.append(f"【R272】红得没点名是哪个子目标（{_闭272.get('why')}）⇒ 红得没法修")
+        # 空子目标不许恒真
+        _空272 = [dict(d) for d in _ts272]
+        for _d in _空272:
+            if _d["kind"] == "subgoal" and _d["tid"] == "subgoal_0":
+                _d["depends_on"] = []
+        _闭272b = _闭合检查([_T272(d) for d in _空272], _序272)
+        if _闭272b.get("closed"):
+            fails.append("【R272】空子目标被判闭合 ⇒ 恒真空段")
+    except Exception as _e272:                    # noqa: BLE001
+        fails.append(f"【R272】齿自身异常：{type(_e272).__name__}: {_e272}")
+    # ★★★★★ R271：**子目标（父子目标嵌套）必须有位置**。
+    #   真读数：`auto_goal` 里 sub_goal/subgoal/子目标/children/parent 出现 **0 次**；
+    #   两条带 `goal:"子目标A"` 的门喂进去 ⇒ 被压平成**同级** errand，
+    #   "子目标 A 整体达成"这个判断在数据结构里没有位置。
+    #   真仓的大目标（三段：取消流程 / 库存释放 / 报表）就是这样表达不出来的。
+    try:
+        _c271 = Carrier(name="r271", pre=["仓可编译"],
+                        gates=[{"type": "compile", "cmd": ["x"], "cwd": ".", "goal": "取消流程"},
+                               {"type": "grep_required", "in": "a.py", "patterns": ["x"],
+                                "goal": "取消流程"},
+                               {"type": "grep_required", "in": "b.py", "patterns": ["y"],
+                                "goal": "报表"},
+                               {"type": "compile", "cmd": ["z"], "cwd": "."}],
+                        acceptance=["全绿"])
+        _ts271 = wire_tasks(_c271)
+        _sg271 = [t for t in _ts271 if t.kind == "subgoal"]
+        if len(_sg271) != 2:
+            fails.append(f"【R271】子目标层没生成（应 2 个，实得 {len(_sg271)}）"
+                         " ⇒ 大目标各段的整体达成无法表达")
+        else:
+            _d271 = {t.tid: list(t.depends_on) for t in _sg271}
+            if sorted(map(tuple, _d271.values()))[0] != ("task_0", "task_1") and \
+                    sorted(_d271.values(), key=len)[0] != ["task_0", "task_1"]:
+                fails.append(f"【R271】子目标成员不对 {_d271} ⇒ 同名门没归到同一段")
+            _acc271 = [t for t in _ts271 if t.kind == "acceptance"][0]
+            if not all(s.tid in _acc271.depends_on for s in _sg271):
+                fails.append(f"【R271】验收没依赖子目标（deps={_acc271.depends_on}）"
+                             " ⇒ 某段整体没达成也能判父目标闭合")
+            if "task_3" not in _acc271.depends_on:
+                fails.append("【R271】没有子目标的门被漏挂在验收外 ⇒ 它做不做都判完成")
+        # 反向：不带 goal 的旧计划**逐字节不变**（零回退），不许冒出 subgoal 任务
+        _c271b = Carrier(name="r271b", gates=[{"type": "compile", "cmd": ["x"], "cwd": "."}],
+                         acceptance=["全绿"])
+        if any(t.kind == "subgoal" for t in wire_tasks(_c271b)):
+            fails.append("【R271】无 goal 字段的旧计划也长出了子目标层 ⇒ 非零回退")
+    except Exception as _e271:                    # noqa: BLE001
+        fails.append(f"【R271】齿自身异常：{type(_e271).__name__}: {_e271}")
+    # ★★★★★ R270：**约束门不属于"目标达成"的合取**。
+    #   真读数：约束门 `{type:compile, constraint:"不许改 tests/"}` 被同时挂进验收
+    #   ⇒ `['accept::约束', 'accept::功能']` 并列。
+    #   合取上安全（任一门红仍判未达成，实测 {'accept::约束':True,'accept::功能':False}
+    #   ⇒ 全绿 False），但**污染的是"这个读数是什么意思"**：
+    #     ① 约束是边界条件（不许破坏），不是达成证据（做成了什么）；
+    #     ② 归因被稀释：验收红时分不清"没做成"还是"踩了边界"，
+    #        而这两种红下一步动作完全不同（继续做 / 先回滚）。
+    try:
+        _c270 = Carrier(name="r270", constraints=["不许改 tests/"],
+                        gates=[{"type": "compile", "cmd": ["x"], "cwd": ".",
+                                "constraint": "不许改 tests/"},
+                               {"type": "grep_required", "in": "a.py",
+                                "patterns": ["x"]}],
+                        acceptance=["全绿"])
+        _ts270 = wire_tasks(_c270)
+        _acc270 = [t for t in _ts270 if t.kind == "acceptance"]
+        if not _acc270:
+            fails.append("【R270】夹具没切出验收任务 ⇒ 测不出来")
+        else:
+            _名270 = [g.get("name") for g in (_acc270[0].gates or [])]
+            if any("约束" in str(n) for n in _名270):
+                fails.append(f"【R270】约束门混进了验收合取 {_名270} "
+                             "⇒ 边界条件被当成达成证据，归因被稀释")
+            if len(_acc270[0].gates or []) != 1:
+                fails.append(f"【R270】验收只该剩非约束判据门（实得 {_名270}）")
+        # 反向：全是约束门 ⇒ 无可验收 ⇒ 不生成验收任务，**不许假绿**
+        _c270b = Carrier(name="r270b", constraints=["不许改 tests/"],
+                         gates=[{"type": "compile", "cmd": ["x"], "cwd": ".",
+                                 "constraint": "不许改 tests/"}],
+                         acceptance=["全绿"])
+        _ts270b = wire_tasks(_c270b)
+        if any(t.kind == "acceptance" for t in _ts270b):
+            fails.append("【R270】只有约束门却生成了验收任务 ⇒ 无达成证据也能判闭合（假绿）")
+        _闭270 = _闭合检查(_ts270b, [t.tid for t in _ts270b])
+        if _闭270.get("closed"):
+            fails.append("【R270】只有约束门的计划被判闭合 ⇒ 假完成")
+    except Exception as _e270:                    # noqa: BLE001
+        fails.append(f"【R270】齿自身异常：{type(_e270).__name__}: {_e270}")
+    # ★★★★★ R269：**约束任务不许替实现判达标**。
+    #   真读数（case02 真目标，两条判据门 + 一条约束）：
+    #     con_0 (constraint_check) name='不许改 tests/'
+    #       gates=[{'compile': ...unittest...}, {'grep_required': '月度退款额'}]
+    #   —— 一个叫「不许改 tests/」的任务身上挂着**全部实现判据门**。
+    #   两重后果：① 约束绿 ⇒ 看起来目标达成（**替实现判达标**）；
+    #             ② 约束任务依赖全量判据 ⇒ 实现没做完时它必红，
+    #                而 errand 依赖它 ⇒ **实现任务死锁跑不起来**。
+    try:
+        _c269 = Carrier(name="r269", pre=["仓可编译"], constraints=["不许改 tests/"],
+                        gates=[{"type": "compile", "cmd": ["make"]},
+                               {"type": "grep_required", "in": "a.py",
+                                "patterns": ["x"]}],
+                        acceptance=["全绿"])
+        _ts269 = wire_tasks(_c269)
+        _con269 = [t for t in _ts269 if t.kind == "constraint_check"]
+        _err269 = [t for t in _ts269 if t.kind == "errand"]
+        if not _con269:
+            fails.append("【R269】齿的夹具没切出约束任务 ⇒ 测不出来")
+        else:
+            _挂269 = list(_con269[0].gates or [])
+            if _挂269:
+                fails.append(f"【R269】约束任务身上挂着 {len(_挂269)} 条实现判据门 "
+                             "⇒ 约束绿就看起来目标达成，且实现任务会被它卡死")
+        if len(_err269) != 2:
+            fails.append(f"【R269】判据门没切成对应的实现任务（实得 {len(_err269)}）")
+        # 正向：真写了 `constraint` 关联的门**必须**挂上去（不许一刀切删光）
+        _c269b = Carrier(name="r269b", constraints=["不许改 tests/"],
+                         gates=[{"type": "grep_forbidden", "in": "tests/a.py",
+                                 "patterns": ["TODO"], "constraint": "不许改 tests/"},
+                                {"type": "compile", "cmd": ["make"]}],
+                         acceptance=["全绿"])
+        _con269b = [t for t in wire_tasks(_c269b) if t.kind == "constraint_check"]
+        if _con269b and len(_con269b[0].gates or []) != 1:
+            fails.append("【R269】显式声明 `constraint` 关联的门没被挂到约束任务上 "
+                         "⇒ 一刀切删光（约束就没有可机判的门了）")
+    except Exception as _e269:                    # noqa: BLE001
+        fails.append(f"【R269】齿自身异常：{type(_e269).__name__}: {_e269}")
     _一130, _因130 = 门类型一致()
     if not _一130:
         fails.append(f"R130 ★ `_门字段表` 与 `gate_spec._run_one` 不一致：{_因130} "
@@ -688,6 +1402,10 @@ def main() -> int:
     #   计划器是 **0 模型调用** 的纯机器分解 ⇒ 适合让人先看"它会拆成什么"。
     ap.add_argument("--goal-json", default=None,
                     help="结构化规约 JSON（字符串或 @文件路径）；只做机器计划，不调模型")
+    ap.add_argument("--root", default=".",
+                    help="①→② 接线的**根**：定计划前先在这里真实盘点（默认当前目录）")
+    ap.add_argument("--no-inventory", action="store_true",
+                    help="★ 显式关掉盘点（默认**必须**盘点）；关掉时输出里会明写「没盘点」")
     ap.add_argument("--json", action="store_true", help="输出机器可读 JSON")
     args = ap.parse_args()
     if args.selftest:
@@ -703,9 +1421,43 @@ def main() -> int:
             print(f"规约 JSON 解析失败：{e}")
             return 2
         try:
-            plan = plan_tasks(spec)
-        except ValueError as e:
-            # ★ 守恒违例/载体不合法 → 计划器**拒发**（这是设计，不是崩溃）
+            # ★★★★★ R536g：**入口必须走接线后的那条路**（口径 388）。
+            #
+            #   真断点（2026-11-16 端到端跑 CLI 才抓到）：
+            #     `带盘点定计划` **写好了、判一百八十九也绿了**，
+            #     但**本入口调的还是 `plan_tasks(spec)`** ⇒
+            #     用户敲 `orch-plan --goal-json …` **走的是老路：一步盘点都没有** ✗
+            #     ⇒ **「舱内有个能用的函数」≠「装机后敲命令走这条路」**。
+            #   ★ 判据测的是**函数**（单元），这里断的是**入口**（端到端）——
+            #     只有真敲一次命令才能发现（口径 388）。
+            #   ★ `--no-inventory` 是**显式**逃生门：关掉也**必须在输出里写明没盘点**，
+            #     不许让「没盘点」看起来像「盘点过了、没问题」（口径 92）。
+            # ★ R542：先把「根」这个参数本身验干净，别让下游的内部 assert 代劳。
+            #   参数级错误要报成**参数级**的话，不要报成内部断言。
+            if not args.no_inventory:
+                import pathlib as _pl542          # ★ 局部导入：本模块不在顶层 import pathlib
+                _根 = _pl542.Path(str(args.root))
+                if not _根.exists():
+                    print(f"计划器拒发：--root 指向的目录**不存在**：{_根}\n"
+                          f"  ⇒ 计划是要被执行的，根都不存在就没有可执行的作业面。\n"
+                          f"  ⇒ 换个已存在的目录，或先 `orch-init <文件夹>` 生成档案。")
+                    return 2
+                if not _根.is_dir():
+                    print(f"计划器拒发：--root 不是目录：{_根}")
+                    return 2
+            if args.no_inventory:
+                plan = plan_tasks(spec)
+                plan["盘点"] = {"做没做": "没做（--no-inventory）",
+                                "★后果": "计划里引用的路径**没有对过真值**"}
+            else:
+                plan = 带盘点定计划(args.root, spec)
+        except (ValueError, AssertionError) as e:
+            # ★ 守恒违例/载体不合法/计划引用了**不存在**的路径 → 计划器**拒发**
+            #   （这是设计，不是崩溃 —— R535 起「拒发」也包含路径核对不过）
+            # ★ R542：`AssertionError` 也必须在这里兜住。实测 `--root` 指到不存在的目录时，
+            #   `知库.盘点` 里那句 `assert 根.is_dir()` 会**穿出去变成裸栈** ⇒
+            #   用户看到 Python Traceback，会以为程序坏了，其实是他给的参数不存在。
+            #   口径：**拒发就明说拒发，并说清哪个参数不对**。
             print(f"计划器拒发：{e}")
             return 1
         if args.json:
@@ -715,6 +1467,37 @@ def main() -> int:
             print(f"守恒     : {plan.get('conserved')}")
             print(f"规则空间 : {plan.get('rule_space')}")
             print(f"验收判据 : {plan.get('acceptance')}")
+            盘 = plan.get("盘点") or {}
+            # ★★★ R537：这里原来问的是 `做没做` / `根数` —— **生产方（`知库.盘点`）
+            #   从来不设这两个键** ⇒ 真读数明明是好的，屏幕上却永远显示 `？` 和 `?`
+            #   （实测：外来项目 `D:\tools` 已扫出 10,362 个文件，这一行仍写 `根 ? 个`）。
+            #   ★ 这就是「问对了地方吗」的反面（口径 383）：**读数取错了键，
+            #   和没有读数在屏幕上看不出区别**。现在按生产方真实给的键取。
+            有盘 = isinstance(盘.get("文件数"), int)
+            if 有盘:
+                print(f"盘点     : 根 {盘.get('根', '?')} · "
+                      f"文件 {盘['文件数']:,} · 后缀 {盘.get('后缀种数', '?')} 种 · "
+                      f"{盘.get('总字节', 0) / 1048576:.1f}MB · "
+                      f"建索引 {盘.get('耗时秒', '?')} 秒"
+                      + (f" · ★{盘.get('★后果')}" if 盘.get("★后果") else ""))
+            else:
+                print(f"盘点     : {盘.get('做没做', '★没盘点')} · "
+                      f"根 {盘.get('根数', '?')} 个 · 文件 {盘.get('文件数', '?')} 个"
+                      + (f" · ★{盘.get('★后果')}" if 盘.get("★后果") else ""))
+            核 = plan.get("★路径核对") or plan.get("路径核对") or {}
+            if 核:
+                # ★ R537：生产方给的是 `查了`（列表），不是 `核对了` —— 键名不匹配
+                #   和「没读数」在屏幕上长得一模一样（口径 383）。数它。
+                print(f"路径核对 : 核对 {len(核.get('查了') or [])} 条 · "
+                      f"不存在 {len(核.get('不存在') or [])} 条 · "
+                      f"占位符没查 {len(核.get('占位符没查') or [])} 条"
+                      + (f" · ★索引外 {len(核.get('索引里没有') or [])} 条"
+                         if 核.get("索引里没有") else ""))
+                if 核.get("★索引与盘不一致"):
+                    坏 = {k: v for k, v in 核["★索引与盘不一致"].items() if v}
+                    if 坏:
+                        print("           ★ 索引与盘不一致：" + " · ".join(
+                            f"{k} {v}" for k, v in 坏.items()))
             print(f"任务数   : {len(plan.get('tasks') or [])}")
             for t in (plan.get("tasks") or []):
                 dep = ",".join(t.get("depends_on") or []) or "-"

@@ -85,11 +85,6 @@ def _coerce(target) -> tuple[Path, str]:
 最近降级原因: list[str | None] = [None]
 
 
-def _audit_dir(path: Path) -> Path:
-    """兼容旧 API：Path 为工程根，返回 <root>/.orchestrator。"""
-    d = path / ".orchestrator"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
 
 
 def claim_batch(target) -> int:

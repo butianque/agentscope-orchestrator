@@ -50,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 #   `ImportError: attempted relative import with no known parent package`。
 #   后果不是"少个入口"：`checks/自举齿探针.py` 的反自证基线（未改时应绿）
 #   因此**一直红**，而那条红被当成"探针自身有问题"放过了 ——
-#   于是这个探针**整年不带齿**（红错地方就没人再追）。
+#   于是这个探针**不带齿**（红错地方就没人再追）。
 #   修法只在**脚本模式**下补包名与搜索路径：不碰任何语义、不影响 `-m` 调用。
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
@@ -341,7 +341,16 @@ def _证据违规点(证据: str) -> list[tuple[str, int]]:
 
 
 def _红门违规点(红条目: list) -> frozenset:
-    """一组红门条目 → 违规点集合（判据自己的度量）。空集 = 算不出度量。"""
+    """一组红门条目 → 违规点集合（判据自己的度量）。空集 = 算不出度量。
+
+    ★ R232（2026-11-05 跨项目真跑）：原来只从证据**文本**里解析违规点
+      （`E0284::msg::符号::文件` 那类格式）。而 `whole_reading` 这类门的证据是
+      `{"file": "src/case01/ledger.py", "cause": "结构键缺失|冲正 #"}` ——
+      **文件在字段里，不在文本里** ⇒ 解析出空集 ⇒ 调用方当成"算不出度量"
+      ⇒ `_增量应用` 直接 `return {}`（**一个文件都不应用**）⇒ 模型改对了也不落盘。
+      ⇒ 兜底：文本解析不出时，用 `file` + 证据摘要造一个**稳定可比的违规点**。
+        它不需要与 `E0284::…` 同构，只要**同一文件的事实在两轮之间可比**即可。
+    """
     点: set = set()
     for a in (红条目 or ()):
         if not isinstance(a, dict):
@@ -349,6 +358,57 @@ def _红门违规点(红条目: list) -> frozenset:
         ev = str(a.get("err") or a.get("cause") or "")
         if ev:
             点.update(_证据违规点(ev))
+        # ★★★★★ R240（2026-11-05 多文件真跑）：**测试失败的身份是"哪条测试"**。
+        #   真证据：service.py 与 inventory.py 一起应用后，违规点数 1 → 1「不是同一集合」
+        #   ⇒ 判"没进展"⇒ 全回退。而实际上失败测试从 4 条降到 2 条（**真进展**）。
+        #   ★ 根因：位置点解析（`E0284::…` 那套）对 Python 的 unittest 输出**解析不出**，
+        #     退化成兜底身份 `门::门名::文件` —— 粒度是"哪个门在哪个文件上红"，
+        #     而判据要的是"**哪几条用例在红**"。同一族老病：**手里那个量不是要的那个量**。
+        #   ★ 口径：有 `ERROR: <用例id>` / `FAIL: <用例id>` 就用**用例身份**（单调、可比）；
+        #     一条用例修好 ⇒ 它从集合里消失 ⇒ 真子集变小 ⇒ 该文件必须被保留。
+        _用例240 = set()
+
+        def _抽用例(_t: str) -> set:
+            _出 = set()
+            for _m in re.finditer(r"^(?:ERROR|FAIL):\s*(\S+)", _t, re.M):
+                _出.add("用例::" + _m.group(1))
+            return _出
+
+        _用例240 |= _抽用例(ev)
+        _用例240 |= _抽用例(str(a.get("cause") or ""))
+        # ★★★★★ R245（2026-11-05 复跑 A3 真读数）：**身份必须分层**。
+        #   原文：`✗ service.py：点数变少（5 → 2）但**不是真子集**：原违规点没全消、
+        #   又新增了 2 个（如 用例::test_cancel_flow） ⇒ 这是**交换**不是进展`
+        #   ★ `用例::test_cancel_flow` 是「**整份模块导入失败**」——它是**模块层**的事，
+        #     和"哪条用例失败"**不是同一层级**。混在一个集合里比子集 ⇒ 必然误判：
+        #     模块导入一修好，具体用例才露出来，看起来像"新增了违规点"。
+        #   ⇒ 口径：**两个层各算各的**：模块层全消 = 真进展（模型把导入链修好了）。
+        #     集合前缀区分：`模块::<模块名>` / `用例::<用例 id>`。
+        _模块240 = set()
+        for _m in re.finditer(r"(?:FailedTest\.)?([\w.]+)\s*\(unittest\.loader\._FailedTest", ev):
+            _模块240.add("模块::" + _m.group(1))
+        for _m in re.finditer(r"Failed to import test module:\s*(\S+)", ev):
+            _模块240.add("模块::" + _m.group(1).strip())
+        # ★ R245b：**先把用例层算出来再决定走哪层**。第一版在算用例之前就
+        #   `continue` 了 ⇒ 用例身份永远进不了集合（`_抽用例` 白写，
+        #   我自己的判据当场抓出来：`3 条`与`2 条`身份相同、不是真子集）。
+        #   这是老病重演：**"算了、存了，但没送出去"**。
+        if _模块240:
+            点 |= _模块240
+            continue                       # 模块层有错时，用例层读数没意义（先修导入）
+        if _用例240:
+            点 |= _用例240
+            continue                       # 用例层：一条修好 ⇒ 集合严格变小
+        if not _证据违规点(ev):
+            # 文本里没有违规点（或没有证据文本）⇒ 用「门 + 文件」当点。
+            # ★ R233：身份里**不许放 cause 文本**。真事（2026-11-05 case01 真跑）：
+            #   第一版把 `cause` 拼进身份 ⇒ 同一个文件应用后门因由措辞变了
+            #   （`结构键缺失|冲正 #` → 另一条门的 `退出码不符|…`）⇒ 违规点 1→2，
+            #   `_增量应用` 判「变多」⇒ **把改对的文件回退了**，主树一个字节没动。
+            #   身份要的是「同一个事实两轮里是不是同一个」，不能把它写成"措辞快照"。
+            _f = str(a.get("file") or "").strip().replace("\\", "/")
+            if _f:
+                点.add(f"门::{a.get('gate') or '?'}::{_f}")
     return frozenset(点)
 
 
@@ -357,6 +417,21 @@ def _红门违规点(红条目: list) -> frozenset:
 #   不能（计数/告警/纯阈值）⇒ 才可能是历史债。
 #   真证据：第 107 次真跑把 `cargo_test_lib_no_run`（目标门）豁免掉 ⇒ **假收敛**。
 def _有定位208(_a: dict) -> bool:
+    """这条红门**指得出该改哪里**吗（指得出 = 本次任务的责任，不许当历史债豁免）。
+
+    ★ R232（2026-11-05 跨项目真跑撞出来的洞）：原来只看证据文本里有没有
+      `E0284::msg::符号::文件` / `--> path:line` 这类**违规点**，**漏了 `file` 字段**。
+      真证据（case01 靶子仓）：红门条目是
+        `{"gate": "ledger_required_structures", "file": "src/case01/ledger.py",
+          "ok": false, "cause": "结构键缺失|冲正 #"}`
+      —— 文件字段**明明白白**，只是 `cause` 不含行号 ⇒ `_证据违规点` 解析不出点
+      ⇒ 判"不可归因" ⇒ R208 把它当历史债豁免 ⇒ `ledger_required_structures` 红着
+      **也判 converged**，而主树一个字节没改（产物只停在 work/ 窗口副本里）。
+      ⇒ 口径：**有 `file` 字段就是有定位**（"字段有" ≠ "文本里解析得出"，
+        这正是主缺陷族第 11 次那个病的又一次复现）。
+    """
+    if str(_a.get("file") or "").strip():
+        return True
     _文208 = ""
     for _k208 in ("err", "cause", "missing", "must_not_hits", "expected", "actual"):
         _v208 = _a.get(_k208)
@@ -839,6 +914,8 @@ def _增量应用(adopted: dict, 基线: frozenset, round_root: Path,
     red: list = []
     留: list = []
     退: list = []
+    # ★ R538h：逐文件循环是否因**全绿（终点）**早停 —— 那之后整批兜底不得再试。
+    _已全绿76 = False
     当前 = 基线
     # ★★★★★ R76：**先量一次"改之前"**。
     #   逐文件裁决要判"**这条门（主体是它）翻绿了吗**"，就必须有一个"改之前"的
@@ -851,7 +928,7 @@ def _增量应用(adopted: dict, 基线: frozenset, round_root: Path,
     前red: list = []
     try:
         前res, 前red = _score_files(
-            round_root, deliverables, file_root=REPO_ROOT, repo_root=REPO_ROOT)
+            round_root, deliverables, file_root=round_root, repo_root=round_root)
     except Exception as _e76:             # noqa: BLE001
         _log(f"[generic] ★ R76 改前量取失败（退回只按违规点判）："
              f"{type(_e76).__name__}: {_e76}")
@@ -866,16 +943,16 @@ def _增量应用(adopted: dict, 基线: frozenset, round_root: Path,
             _log(f"[generic]   ↳ {rel}：机器拒收的产物 ⇒ **不写主树**"
                  f"（{_是拒收产物(text)}）")
             continue
-        bk = _backup_file(rel)
+        bk = _backup_file(rel, round_root)
         try:
-            _apply_file(rel, text)
+            _apply_file(rel, text, round_root)
         except Exception as e:            # noqa: BLE001 写不进 ⇒ 回退这一个，不炸整轮
             _log(f"[generic]   ↳ {rel}：写入失败（{type(e).__name__}）⇒ 回退该文件")
             _rollback_file(bk)
             退.append(rel)
             continue
         r_this, red_this = _score_files(
-            round_root, deliverables, file_root=REPO_ROOT, repo_root=REPO_ROOT)
+            round_root, deliverables, file_root=round_root, repo_root=round_root)
         点 = _红门违规点(red_this)
         # ★★★★★ R46（**我自己 R43 的洞** · 2026-10-15 自审抓出）：
         #   `_增量可判` 要求"违规点**非空**且真子集变小"。而**最后一个**文件
@@ -931,6 +1008,21 @@ def _增量应用(adopted: dict, 基线: frozenset, round_root: Path,
         #     （`_后76` 含红门键，红着就非空）。这是它的终点，必须保留。
         #     而「改前量得到」的情形已由 `_进步76`（∅ ⊊ 非空）覆盖，不必重复。
         _清空76 = (_前76 is None) and not _后76
+        # ★★★★★ R250（2026-11-05 dry 闭环⑥ 抓出）：**"全绿"必须是有范围的**。
+        #   真读数（自造反向用例）：把一个**已实现**的 service.py 换成空壳，
+        #   日志印 `✓ src/shop/service.py：**判据全绿** ⇒ **保留**`、
+        #   `独立复跑 绿=True`，而那一刻**测试根本没跑起来**（ImportError: 没有 取消）
+        #   ⇒ unittest discover 打印 `Ran 0 tests … OK`（退出码 0）⇒ 判"全绿"。
+        #   ★ 这是**用"没测量"冒充"测量通过"**，比"没进展"危险得多：
+        #     它会让"把仓改坏"的产物被留着，而且日志长得像成功。
+        #   ⇒ 口径：`全绿` 要**排掉"零条用例"**。
+        _零用例250 = bool(__import__("re").search(r"\bRan\s+0\s+tests\b", "\n".join(
+            str((_x or {}).get("err") or (_x or {}).get("cause") or "")
+            for _x in (red_this or ())))) or _本项目零用例250(rel, r_this)
+        全绿 = bool(r_this) and all(r_this.values()) and not _零用例250
+        if _零用例250:
+            _log(f"[generic]   ✗ {rel}：**零条用例被跑起来**（Ran 0 tests / 或门输出为空）"
+                 f"⇒ 这不是绿，是**没测量** ⇒ 不许留")
         if 全绿 or _进步76 or _清空76 or _增量可判(当前, 点):
             _因76 = ("**判据全绿**" if 全绿 else
                      (f"该文件主体的门 {len(_前76)} → {len(_后76)}（严格变小）"
@@ -955,6 +1047,10 @@ def _增量应用(adopted: dict, 基线: frozenset, round_root: Path,
             前res, 前red = r_this, red_this
             results, red = r_this, red_this
             if 全绿:
+                # ★ R538h：**已达终点** —— 后面的"整批兜底"也不许再试
+                #   （R46b 的语义：目标已达成 ⇒ 多余的改动不许进主树，
+                #    也不许再为它们跑一遍门）。
+                _已全绿76 = True
                 # ★ R46b：**已达终点 ⇒ 停**。剩下的文件不必再试。
                 #   ① 正确性：目标已达成，剩下的改动**不需要**；
                 #   ② 成本：每试一个文件都要**跑一遍全部门**
@@ -1018,20 +1114,59 @@ def _增量应用(adopted: dict, 基线: frozenset, round_root: Path,
     #   「该回退的文件没回退」「全绿后没有早停」）。而 R43 是对的：
     #   **能归因的坏文件必须回退**（R89 代偿拒收同理）。
     #   ⇒ 只有「逐文件一个都没保留」时才试整批 —— 那时只可能是跨文件连锁。
+    # ★★★★★ R252（2026-11-05 可重复性跑 A3 的结构性缺陷）：
+    #   **只在"逐文件全退"时才试整批，太窄。**
+    #   真读数：service.py 与 inventory.py **一起**才让整库测试 5 → 0，
+    #   但逐个试时 —— 先 inventory（4→2 变小，保留），再 service（相对新基线
+    #   2→1 里**新增了一条用例身份**）⇒ 判"交换"⇒ 回退 ⇒ **正确答案被拆散否掉**。
+    #   而 R180 的整批兜底**根本没被调用**（`留` 非空）。
+    #   ⇒ 口径修正：整批**不是"逐文件全败后的兜底"，而是"当参与者 ≥2 时并列的判据"**：
+    #     只要整批一上就全绿（或真子集变小），那就是"跨文件共同决定"的实锤，
+    #     逐文件裁决**无权否决它**。顺序：逐文件（能归因就归因）→ 整批（能全成就全成）。
     _候选180 = {k: v for k, v in adopted.items() if not _是拒收产物(v)}
-    if (not 留) and 基线 and len(_候选180) >= 2:
+    # ★ R538h：已达终点（逐文件全绿早停）⇒ **不试整批**。
+    #   否则会把"多余的改动"重新写进主树、并白跑一次门（R46b 的齿咬的就是这个）。
+    _整批可试252 = (not _已全绿76
+                    and tuple(sorted(_候选180)) != tuple(r for r, _ in 留))
+    if 基线 and len(_候选180) >= 2 and _整批可试252:
         _批bk180: list = []
         try:
             for _r180, _t180 in _候选180.items():
-                _批bk180.append((_r180, _backup_file(_r180)))
-                _apply_file(_r180, _t180)
+                _批bk180.append((_r180, _backup_file(_r180, round_root)))
+                _apply_file(_r180, _t180, round_root)
             _批res180, _批red180 = _score_files(
-                round_root, deliverables, file_root=REPO_ROOT, repo_root=REPO_ROOT)
+                round_root, deliverables, file_root=round_root, repo_root=round_root)
             _批点180 = _红门违规点(_批red180)
             _批全绿180 = (bool(_批res180)
                           and all(bool(x) for x in _批res180.values()))
-            _批好180 = (_批全绿180 or _增量可判(基线, _批点180)
-                        or (bool(基线) and not _批点180))
+            # ★★★★★ R538g：**整批必须证明"它比已经保留的那部分更好"**，
+            #   否则它只是**借用**已保留文件的功劳，却把没贡献的文件一起留下
+            #   ⇒ 把没被验证过的改动写进主树（正是 R43/R89 要拦的）。
+            #   ★ 为什么这条收口是对的：R252 给整批的正当性只有一句 ——
+            #     「跨文件**共同**决定」。共同决定 = 整批做到了逐文件做不到的事
+            #     ⇒ 就必须在读数上**严格更好**，而不是打平。
+            #   ★ 实测形态（work/R536/探R43.py，逐文件保留 好.rs 后）：
+            #     当前树（= 基线 + 已保留）违规点 = 1，整批也是 1
+            #     ⇒ 打平 ⇒ **不得覆盖** ⇒ 坏.rs 照旧回退。
+            _当前点180 = None
+            try:
+                _现res180, _现red180 = _score_files(
+                    round_root, deliverables, file_root=round_root,
+                    repo_root=round_root)
+                _当前点180 = _红门违规点(_现red180)
+            except Exception as _e538g:       # noqa: BLE001 量不到 ⇒ 退回老行为
+                _log(f"[generic] ★ R538g 整批增量判据量不到（不阻断，按老口径试整批）："
+                     f"{type(_e538g).__name__}: {_e538g}")
+            _批有增量180 = (_当前点180 is None
+                            or len(_批点180) < len(_当前点180))
+            _批好180 = (_批全绿180
+                        or (_批有增量180
+                            and (_增量可判(基线, _批点180)
+                                 or (bool(基线) and not _批点180))))
+            if not _批好180 and _当前点180 is not None:
+                _log(f"[generic] ★ R538g 整批**没有增量**（已被逐文件保留的部分"
+                     f"就是 {len(_当前点180)} 处，整批 {len(_批点180)} 处，未严格更少）"
+                     f"⇒ **不覆盖逐文件裁决**（R252 的正当性是「共同决定」，打平不算）")
             if _批好180:
                 _log("[generic] ★★★ R180 **整批成立**："
                      f"{len(_候选180)} 个文件一起改 ⇒ 违规点 {len(基线)} → "
@@ -1685,6 +1820,25 @@ try:
 except ValueError:
     _瞬时等待预算秒 = 1800.0
 
+def _是上游空包(e: BaseException) -> bool:
+    """★ R258c：`JSONDecodeError: Expecting value: line 1 column 1 (char 0)` 属于**上游瞬时**。
+
+    为什么不能算终态：上游回的 `HTTP 200` 体里是
+    `{"error":{"message":"上游服务异常，请稍后重试"}}` —— 它**明确说了"稍后重试"**，
+    而 SDK 的解析层拿不到 `choices` 时抛的就是这个 JSONDecodeError。
+    把它判终态 = **把"上游让我等"读成"本机代码坏了"**，一趟任务当场归零。
+
+    诚实边界：这是**按类型+消息**判的，不是猜 —— 只有"包体根本不是 JSON"才归这里；
+    真的数据结构错（键缺失、类型不对）仍然是终态，不许被这条盖住。
+    """
+    import json as _j
+    if isinstance(e, _j.JSONDecodeError):
+        return True
+    _s = f"{type(e).__name__}: {e}"
+    return ("Expecting value: line 1 column 1" in _s
+            or "Expecting value: line 1 column 1 (char 0)" in _s
+            or "返回的不是模型回复" in _s)
+
 
 def _退避163(第几次: int, 已等: float) -> float:
     """★ R163：本次该退避多少秒。**退避这件事只有这一处实现**（R117）。
@@ -1699,9 +1853,17 @@ def _退避163(第几次: int, 已等: float) -> float:
       而**把其中一处改回常数它咬不住**（实测无齿）。
       抽成函数后，齿能**直接调用它、看输出序列** —— 测的是结果，不是过程里的词。
     """
-    _等 = min(_瞬时退避秒 * (2 ** min(max(1, int(第几次)) - 1, 4)),
-              _瞬时退避封顶秒)
-    return min(_等, max(1.0, _瞬时等待预算秒 - max(0.0, 已等)))
+    # ★★★★★ R243：**先快试 3 次（2/4/6 秒），再长退避**。
+    #   真读数（case02 复跑 A4）：一次上游抖动上等满 1800 秒、连续失败 9 次才停机。
+    #   多数抖动是秒级（502/504/连接 reset），20→40→80→160→300 的曲线等于睡着了等。
+    #   总预算不变（仍是有界 1800s），只是把钱花在更有希望的地方。
+    try:
+        from agentscope_orchestrator.resilience import 快重试策略 as _快243
+        return _快243(_瞬时等待预算秒)(第几次, 已等)
+    except Exception:                              # noqa: BLE001  兜底回老行为
+        _等 = min(_瞬时退避秒 * (2 ** min(max(1, int(第几次)) - 1, 4)),
+                  _瞬时退避封顶秒)
+        return min(_等, max(1.0, _瞬时等待预算秒 - max(0.0, 已等)))
 
 
 def _不动点因由187(verdict: str, 候选数: int, 保留数: int, why: str) -> str:
@@ -1734,7 +1896,22 @@ def _是瞬时的(e: BaseException) -> tuple[bool, str]:
     """
     _s186 = f"{type(e).__name__}: {e}"
     _low186 = _s186.lower()
-    
+
+    # ── ⓪ **本机代码缺陷不是"上游抖动"**（R239 · 2026-11-05 多文件真跑）──
+    #   真事故：我新加的代码里引用了不存在的变量 `work` ⇒ `NameError`，
+    #   分类器把它当"未识别 ⇒ 保守按瞬时" ⇒ **有界重试 9 次、白等 1802 秒**，
+    #   最后日志还写「上游持续不可用，不是代码缺陷」——**归因反了**。
+    #   ★ 口径：**自己代码里的错重试一万次也一样**。这类异常必须**立刻停机并如实报**，
+    #     否则「无人值守」会退化成「无人值守地空转半小时」。
+    if isinstance(e, (NameError, UnboundLocalError, TypeError, AttributeError,
+                      KeyError, IndexError, SyntaxError, ImportError,
+                      ZeroDivisionError, RecursionError)):
+        # ★ 注意：这里**不能**调 `_因186` —— 它定义在本段**下面**，
+        #   第一版直接调用 ⇒ `UnboundLocalError`（我自己被自己抓了一次：
+        #   日志里 `cannot access local variable '_因186'`）。早返回的因由要自包含。
+        return (False, f"终态（{type(e).__name__} / 无码：这是**本机代码缺陷**，"
+                       f"重试不会改变它）")
+
     # ── ① **码只从结构化位置读**（R186）──────────────────────────
     #   旧实现：`for k in ("401","403",…): if k in low` —— **子串**。
     #   真事故：请求 id `…114037731…` 含 `403` ⇒ 瞬时 500 被判终态 403。
@@ -1756,6 +1933,17 @@ def _是瞬时的(e: BaseException) -> tuple[bool, str]:
         return (类 == "瞬时", f"{类}（{词} / {_码串186}：{说明}）")
     
     # ── ② 终态**词**：配置错/权限/模型不存在 —— 重试 100 次也一样 ──
+    # ★★★★★ R246（2026-11-05 上游整段不可用 · 我直连实测）：
+    #   **"HTTP 200 但包体是 error"** 必须按**包体**分，不能按状态码分。
+    #   实测原文（我绕过编排器直接打通道）：
+    #     HTTP 200 data: {"error":{"message":"上游服务异常，请稍后重试 …","type":"new_api_error"}}
+    #     HTTP 200 data: {"error":{"message":"无权访问 国模 源头 超低倍率 分组 …"}}
+    #   前者**瞬时**（等一等会好）；后者**终态**（换分组/换模型才行，重试一万次也 403）。
+    #   而现在两者都落到"未识别 ⇒ 保守按瞬时"⇒ **终态的那类会白等 30 分钟**。
+    for _k246 in ("无权访问", "无权限", "分组", "quota 不足", "余额不足", "额度不足"):
+        if _k246 in _s186:
+            return (False, f"终态（{_k246} / {_码串186}：这是**换分组/换模型/充值**的事，"
+                           f"不是等一等能好的）")
     for _k186 in ("invalid_api_key", "model_not_found", "insufficient_quota",
                   "invalid_request_error", "authentication", "permission denied"):
         if _k186 in _low186:
@@ -1964,7 +2152,23 @@ def _门态文本(res, red, 上限字符: int = 8000) -> tuple[str, list[str]]:
     # ★★★★★ R36：**机器先把必改文件抽出来**，放在最前面、单独成块。
     #   真跑实测：把 14 条 `文件:行号` 埋在 8000 字符输出里 ⇒ 规划器**根本没看**，
     #   改从符号快照里猜了 3 个完全不相干的文件。⇒ 机器的活别派给模型。
-    必改 = _证据必改文件("\n".join(str(r.get("err") or "") for r in (red or [])))
+    # ★★★★★ R242：**必改清单从"全部证据字段"抽**，不只 `err`。
+    #   真读数（case02 可重复性跑 A3）：红门条目是
+    #     `{"gate": "unittest_all_green", "file": "…", "cause": "退出码不符|期望0实得1", "rc": 1, "err": …}`
+    #   而规划器 prompt 里的「必改文件」块是**空的**（`_门态文本` 的必改 = []）——
+    #   就因为它只读 `err`，而这次证据落在别的键上。
+    #   同一个病第三次：**"字段里没有"被当成"事实没有"**。
+    _证文 = "\n".join(
+        str(_r.get(_k) or "") for _r in (red or [])
+        for _k in ("err", "cause", "missing", "expected", "actual", "output", "stdout", "stderr"))
+    必改 = _证据必改文件(_证文)
+    # ★ R242b：文本里抽不出时，用**失败栈改动面**兜底（同一把尺子，不另立一套）
+    if not 必改:
+        try:
+            必改 = [p for p in _失败栈改动面236(red, REPO_ROOT, None)
+                    if not p.startswith(("tests/", "test/"))]
+        except Exception:                                  # noqa: BLE001
+            必改 = []
     块 = _必改清单块(必改)
     if 块:
         段.insert(0, 块)
@@ -2344,7 +2548,54 @@ def _结构包文本(根: str, 目标: str, 红证据) -> str:
         if not isinstance(表, 符号表):
             表 = 符号表()
             _记忆表缓存[根] = 表
-        表.同步(根)
+        # ★★★★★ R537f：**按档案声明的记忆范围同步，而不是扫整个仓库根**
+        #   （2026-11-17，三块读数合起来才看清这个病）：
+        #     ① 栈转储：自检的时间全耗在下面这一句 `表.同步(根)`；
+        #     ② `枚举源文件(仓根)` 在「跳过表为空」时要走 **180 秒还没枚举完**
+        #        （R537c 已修成 33 秒，但那仍是每次调用都要付的价）；
+        #     ③ 而同一份档案里**早就声明好了**该扫什么：
+        #          source.roots=('src',) · source.skip 26 项（含 work/products/target…）
+        #          memory 段 8 个（src/**/*.rs、**/*.lean、…/**/*.py …）
+        #   ⇒ 原来那句全仓默认扫，**把档案明说「跳过」的目录也索引了**，
+        #     又没按各段的 globs 收窄 —— 同一份档案两处口径不一致。
+        #   ★ 前提：只在「传进来的根 == 档案 repo_root」时套档案范围。
+        #     自检用的是**临时夹具根**，套档案范围会枚举落空 ⇒ 反而退回全仓扫。
+        #     任何异常也退回原行为（上下文增强**绝不许**把整跑搞挂）。
+        _候选537 = None
+        try:
+            from . import mem_live as _ml537
+            from . import profile as _pf537
+
+            _档537 = _pf537.get_profile()
+            if (str(getattr(_档537, "repo_root", "")) == str(根)
+                    and list(getattr(_档537, "memory", None) or ())):
+                from pathlib import Path as _P537
+
+                _仓537 = _P537(str(_档537.repo_root))
+                _跳537 = set(getattr(getattr(_档537, "source", None),
+                                     "skip", None) or ())
+                _候537: list = []
+                _见537: set = set()
+                for _d537 in _档537.memory:
+                    for _r537 in (_d537.get("roots") or ["."]):
+                        for _g537 in (_d537.get("globs") or ["**/*"]):
+                            for _p537, _rel537 in _ml537._枚举声明(
+                                    _仓537, str(_r537), str(_g537), _跳537):
+                                if _rel537 not in _见537:
+                                    _见537.add(_rel537)
+                                    _候537.append((_p537, _rel537))
+                if _候537:
+                    _候选537 = _候537
+        except Exception as _e537:                      # noqa: BLE001 增强失败退回原口径
+            import logging as _lg537
+            _lg537.getLogger("orchestrator").info(
+                "[generic] 按档案记忆范围同步失败（退回全仓扫）：%s: %s",
+                type(_e537).__name__, _e537)
+            _候选537 = None
+        if _候选537 is None:
+            表.同步(根)
+        else:
+            表.同步(根, 候选=_候选537)
 
         洞们: list = []
         条目 = 红证据 if isinstance(红证据, list) else []
@@ -2843,6 +3094,257 @@ def _解依赖(声明: str, by_path: dict, by_key: dict) -> tuple[list[int], str
     if len(候选) == 1:
         return [候选[0]], ""
     return list(候选), ""
+
+
+_代码后缀236 = (".py", ".rs", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".c", ".h", ".cpp")
+
+# ★ R244：**判据/配置文件不是交付物** —— 不许让被判方改判据（冻结区那条纪律）。
+_判据文件前缀244 = ("tests/", "test/", "spec/", "specs/", "benches/", "__tests__/")
+_判据文件名244 = ("conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "Makefile")
+
+
+def _是判据文件244(rel: str) -> bool:
+    路径 = str(rel or "").replace("\\", "/")
+    名 = Path(路径).name
+    return (路径.startswith(_判据文件前缀244)
+            or 名 in _判据文件名244
+            or 名.startswith(("test_", "spec_"))
+            or 名.endswith(("_test.py", "_test.rs", ".test.ts", ".test.js")))
+
+
+def _过滤判据文件244(deliverables: list[dict]) -> tuple[list[dict], list[str]]:
+    """把规划器写进交付物的**判据文件**摘掉（并大声报出）。"""
+    留, 摘 = [], []
+    for d in (deliverables or []):
+        if _是判据文件244(d.get("path") or ""):
+            摘.append(str(d.get("path")))
+        else:
+            留.append(d)
+    return 留, 摘
+
+
+def _失败栈改动面236(红条目: list, repo_root, src_roots) -> list[str]:
+    r"""从**项目验收门的失败证据**里读出「必须改哪些文件」（仓内相对路径）。
+
+    ★ R237（2026-11-05 多文件真跑撞出来的核心缺陷）：
+      目标是「实现订单取消流程」，正确解要同时改
+      `service.py`（取消逻辑）、`inventory.py`（归还库存）、`report.py`（补 `月度退款额`）。
+      而规划器只切出**一个**交付物 `report.py` ⇒ 机器只产/只留这一个文件
+      ⇒ `unit_tests_green=False` 而运行报"交付成功"。
+      ⇒ 缺口在**任务切分**：模型看不到"还需要改谁"。
+      ★ 但机器看得到：项目验收门的失败栈里**逐字写着**
+        `File "...\shop\inventory.py", line 21, in 释放 / NotImplementedError`
+        `ImportError: cannot import name '月度退款额' from 'shop.report'`
+      ⇒ 口径：**失败栈就是读得出来的改动面**，不许靠模型猜。
+        这是「建图是索引期的事，不是问答期的事」的同一条：读得出的事实不要问模型。
+    """
+    import re as _re
+
+    根 = Path(str(repo_root)).resolve()
+    出: list[str] = []
+
+    def _加(p: str) -> None:
+        s = str(p or "").replace("\\", "/").strip()
+        if not s:
+            return
+        try:
+            # ★ R240b：相对路径要**以仓根为基准**解析。第一版直接 `Path(s).resolve()`
+            #   ⇒ 它按**当前工作目录**解析 ⇒ `src/shop/report.py` 落在仓外 ⇒
+            #   `relative_to(根)` 抛异常被吞 ⇒ **import 换算出的文件全被丢掉**
+            #   （真读数：改动面只有 service.py，report.py 明明正则在文本里命中了）。
+            _p = Path(s)
+            if not _p.is_absolute():
+                _p = 根 / _p
+            rel = _p.resolve().relative_to(根).as_posix()
+        except Exception:                      # noqa: BLE001  仓外的路径不补
+            return
+        if _是判据文件244(rel):            # ★ R249：判据文件不是改动面（dry 闭环抓出）
+            return
+        if rel not in 出:
+            出.append(rel)
+
+    for _a in (红条目 or ()):
+        if not isinstance(_a, dict):
+            continue
+        # ★★★★★ R276c（真读数抓的）：**门自己声明了"该改哪个文件"，这里却读不出来**。
+        #   真证据：{"type":"grep_required","in":"src/a.py","patterns":["VALUE = 42"]}
+        #   —— 这就是"改哪个文件"的**直接答案**，可实测改动面仍然是 []，
+        #   因为本函数此前只从**失败栈文本**里挖路径；文本门（grep_required /
+        #   whole_reading / grep_forbidden / kernel_statement）压根**没有失败栈**。
+        #   ⇒ 后果：close_loop 在文本门红的那一档算不出改动面 ⇒ 派不出改码 ⇒ 闭环断在这里。
+        #   口径：**门自己声明的目标文件比失败栈更权威**（失败栈是推断，`in` 是声明）。
+        #     所以先取声明，再用失败栈补。
+        #   ★ R276c-fix（我自己抓的）：**只认 `in`，不许认 `file`。**
+        #     真证据：cargo 的红条目带 `file: "repo"`（仓目录名），
+        #     而 `gate_spec.evaluate` 的文档写着
+        #       `audit 条目 = {"gate":门名, "file":被测文件名, ...}`
+        #     —— 那是"**被测**的文件"，可以是仓名/整个 crate，**不是要改的文件**。
+        #     第一版把 `file` 也当改动面 ⇒ 改动面里混进 `repo` ⇒ 判十五
+        #     `_面[0]` 拿到 `repo` ⇒ 拼出 `repo/repo` ⇒ 判据当场炸。
+        #     ⇒ 只有 `in`（文本门 `grep_required` 等的目标文件）是**声明式改动面**。
+        for _k0 in ("in",):
+            _v0 = _a.get(_k0)
+            if isinstance(_v0, str) and _v0.strip():
+                _加(_v0)
+            elif isinstance(_v0, list):
+                for _x0 in _v0:
+                    if isinstance(_x0, str) and _x0.strip():
+                        _加(_x0)
+        # ★ 不许在这里 `json.dumps` 拼证据文本：它会把引号转义成 `\"`，
+        #   于是 `File "` 这个特征**永远匹配不上**（我第一版就是这么空转的）。
+        #   口径：「不要猜数据的形状」—— 证据是**纯文本**，按纯文本取。
+        _文 = "\n".join(str(_a.get(_k) or "") for _k in
+                        ("err", "cause", "missing", "expected", "actual"))
+        # ★★★ R266b（真工具链抓的）：**先剥 ANSI 转义再解析**。
+        #   真读数：`cargo check --message-format=short` 的真实字节是
+        #     'src\util.rs:1:26: \x1b[1m\x1b[91merror[E0425]\x1b[0m: cannot find value …'
+        #   —— 诊断词前面**插着颜色转义**，任何 `error` 正则都匹配不上。
+        #   而人在终端里看到的是彩色的 "error[E0425]"，于是在屏幕上"明明有错"、
+        #   程序里却一条都认不出。**「看得见」与「读得到」不是一回事。**
+        #   ⇒ 统一剥 CSI 序列（不只 cargo：编译器/测试器在 TTY 与管道下都可能带色）。
+        _文 = _re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", _文)
+        # ★★★ R265（2026-11-05 真读数）：**只认 Python 的两种格式 ⇒ 谈不上"任意真实仓"**。
+        #   真读数：七种真实错误格式喂进去，只有 pytest 那一种算得出改动面，其余六种全空：
+        #     Rust(cargo `error[E0308] --> src/lib.rs:10:5`)   ⇒ []
+        #     Go(`main_test.go:12:` / `FAIL  pkg`)            ⇒ []
+        #     TS(`src/app.ts(12,7): error TS2322`)            ⇒ []
+        #     Java(`src/A.java:12: error:`)                   ⇒ []
+        #     C++(`src/a.cpp:12:5: error:`)                   ⇒ []
+        #     Python(unittest `File "/abs/…/x.py", line 12`) ⇒ []
+        #   ⇒ 每个语言按它**自己的**真实器输出格式取（不是猜，是各编译器/测试器的文档格式）。
+        #   ★ 顺序有讲究：带 `(行,列)` 的要先于裸 `路径:行`，否则会被截断成怪路径。
+        for _m in _re.finditer(r'File\s+"([^"]+)"', _文):          # Python traceback 帧
+            _加(_m.group(1))
+        for _m in _re.finditer(r"^\s*-->\s+(\S+?):\d+", _文, _re.M):   # Rust: cargo/rustc
+            _加(_m.group(1))
+        for _m in _re.finditer(r"^\s*\S*?(\S+\.(?:rs|go|ts|tsx|js|jsx|java|c|h|cpp|py))"
+                               r"\((\d+),\d+\):", _文, _re.M):        # TS/tsc: path(行,列):
+            _加(_m.group(1))
+        # ★ R265b（真读数抓的）：**后缀替选必须长的在前**。
+        #   第一版写成 `(?:java|c|cpp|…)` ⇒ `src/a.cpp:12:5:` 被非贪婪前缀吃成 `src/a.c`，
+        #   接着要匹配 `:(\d+)` 却撞上 `pp:` ⇒ **C/C++ 一条都认不出**（真读数：C++ ⇒ []）。
+        #   这类错在别的语言上还会再来一次（`.ts` vs `.tsx`、`.js` vs `.jsx`），
+        #   所以统一**按长度降序**排，并把正则收尾钉在 `(?![\w.])` 上。
+        # ★ R265c（真读数抓的第三遍）：可选列号**不能**写成 `(?::(\d+):(?::\d+:)?)`。
+        #   在 `src/a.cpp:12:5: error:` 上这个组整体失配 ⇒ C/C++ 又全灭（真读数：⇒ []）。
+        #   ⇒ 把行号/列号**拆成扁平的可选段**：`:\d+` 后面 `(?::\d+)?` 再 `:`。
+        # ★★★ R266（真工具链抓的）：**诊断词不能只认英文**。
+        #   真读数（2026-11-05，本机真 gcc/clang/javac/cargo）：
+        #     clang `src/a.c:1:21: error: use of undeclared identifier`   ⇒ ['src/a.c'] ✅
+        #     javac（中文 locale）`src\A.java:1: 错误: 找不到符号`            ⇒ []          ❌
+        #     cargo --message-format=short `src\util.rs:1:26: error[E0425]:` ⇒ []         ❌
+        #   ⇒ 两个真缺口：① 非英文诊断词（中文 locale 是**出厂默认**）；
+        #                 ② Rust short 格式的诊断词后面跟 `[E0425]`，不是裸 `error:`。
+        #   口径：**判据词要按「它是不是一条诊断」判，不是按「它是不是英文 error」判。**
+        #   所以这里放成「错误/错误:/錯誤/warning/警告/FAIL/panic/error[E…]」，且允许中文。
+        for _m in _re.finditer(
+                r"^\s*(\S+?\.(?:tsx|jsx|cpp|java|ts|js|go|rs|py|h|c))"
+                r":\d+(?::\d+)?:\s*"
+                r"(?:error|warning|panic|note|FAIL|错误|錯誤|警告|错误:|致命错误)"
+                r"(?:\[[A-Z]\d+\])?", _文, _re.M):
+            _加(_m.group(1))                        # path:行[:列]: 诊断（多语言 + 非英文 locale）
+        for _m in _re.finditer(r"^\s*(\S+?_test\.go):(\d+)", _文, _re.M):   # Go 测试失败行
+            _加(_m.group(1))
+        for _m in _re.finditer(r"cannot import name '[^']+' from '([^']+)'", _文):
+            _mod = _m.group(1).replace(".", "/")                   # shop.report → shop/report
+            for _r in (list(src_roots or ()) or ["src"]):
+                for _c in (f"{_r}/{_mod}.py", f"{_mod}.py"):
+                    if (根 / _c).exists():
+                        _加(_c)
+                        break
+    return 出
+
+
+def _指令带证据263(rel: str, 红条目: list, 上限: int = 1800) -> str:
+    """把**判据门说的原话**写进这个文件的改法指令（R263）。
+
+    ★ 为什么必须这么做（真读数，2026-11-05）：
+      case02 的真实红灯 = `ImportError: cannot import name '月度退款额' from 'shop.report'`，
+      而旧指令只有一句泛话"由失败栈定位到本文件：它必须一起改"。
+      模型看到的是泛话 ⇒ 只能猜（历史真事故：把 `已退金额` 写成 `已退`）。
+      **证据不进指令，等于把定位白做了。**
+
+    ★ 取舍：只挑**提到这个文件**的红条目（按路径/模块名匹配），最多两条，
+      总长截到 `上限` —— 指令不是日志，塞满会把真正的改动要求挤掉。
+    """
+    _rel = str(rel).replace("\\", "/")
+    _模块 = _rel.rsplit(".", 1)[0].replace("/", ".")          # src/shop/report.py → src.shop.report
+    _名 = _rel.rsplit("/", 1)[-1]
+    _根 = _模块.split(".")[-1]                                # report
+    选中: list[str] = []
+    for 条 in (红条目 or []):
+        if not isinstance(条, dict):
+            continue
+        证 = str(条.get("err") or "") + "\n" + str(条.get("cause") or "")
+        if _名 in 证 or _模块 in 证 or f"'{_根}'" in 证 or f".{_根} " in 证 or f"shop.{_根}" in 证:
+            选中.append(f"[门 {条.get('gate')}] {条.get('cause')}\n{条.get('err') or ''}".strip())
+        if len(选中) >= 2:
+            break
+    头 = ("由项目验收门的失败栈定位到本文件：它必须一起改，否则跨文件契约仍红。\n"
+          "★ 下面是**判据门说的原话**（照它改，不要另起一套命名/口径）：\n")
+    if not 选中:
+        return 头 + "（这条红门没有点名本文件；按门的要求补齐与它相关的契约。）"
+    # ★★★ R263b（真读数抓的）：**证据要留结论行，不是留栈顶**。
+    #   第一版 `[:上限]` 从头上截，于是最关键的那行
+    #     `ImportError: cannot import name '月度退款额' from 'shop.report'`
+    #   **被栈顶那十几行 File "pytest/unittest 内部路径" 挤掉了** ——
+    #   模型看到一大堆框架内部路径，却看不到"缺哪个名字"。
+    #   ⇒ 先抽**结论行**（异常类型 + "cannot import" / "is not defined" …），
+    #     把结论行放最前，再放截断后的正文。
+    def _结论行(文本: str) -> list[str]:
+        键 = ("cannot import", "is not defined", "no attribute", "NameError",
+              "ImportError", "ModuleNotFoundError", "AttributeError", "TypeError",
+              "ValueError", "KeyError", "AssertionError", "SyntaxError")
+        出 = []
+        for _l in 文本.splitlines():
+            _s = _l.strip()
+            if not _s or _s.startswith(("File \"", "^", "Traceback", "---", "===")):
+                continue
+            if any(k in _s for k in 键):
+                出.append(_s[:300])
+        return 出[:6]
+    _结论: list[str] = []
+    for _段 in 选中:
+        _结论 += _结论行(_段)
+    _头带结论 = 头
+    if _结论:
+        # 去重保序
+        _见, _去重 = set(), []
+        for _c in _结论:
+            if _c not in _见:
+                _见.add(_c)
+                _去重.append(_c)
+        _头带结论 += "★★ 结论行（先看这几行）：\n" + "\n".join(f"  {c}" for c in _去重) + "\n--- 原始证据 ---\n"
+    _剩 = max(400, 上限 - len(_头带结论))
+    return (_头带结论 + "\n---\n".join(选中))[:_剩] if _剩 < 上限 else (_头带结论 + "\n---\n".join(选中))[:上限]
+
+
+def _补齐改动面236(deliverables: list[dict], spec: dict, repo_root,
+                   红条目: list, src_roots) -> tuple[list[dict], list[str]]:
+    """规划器漏掉的必改文件，从失败栈补进交付物集合（**只补仓内已存在的代码文件**）。"""
+    已有 = {str(d.get("path") or "").replace("\\", "/") for d in (deliverables or [])}
+    补: list[dict] = []
+    for _rel in _失败栈改动面236(红条目, repo_root, src_roots):
+        if _rel in 已有 or not _rel.endswith(_代码后缀236):
+            continue
+        # ★ 判据文件**不是**交付物：不许让被判方去改判据（冻结区那条纪律）。
+        _名 = Path(_rel).name
+        if (_rel.startswith(("tests/", "test/", "spec/", "specs/"))
+                or _名.startswith(("test_", "spec_")) or _名.endswith(("_test.py", "_test.rs"))):
+            continue
+        if not (Path(str(repo_root)) / _rel).exists():
+            continue
+        # ★★★ R263（2026-11-05 真读数）：**指令里必须带红门原话**。
+        #   真证据：case02 的真实红灯是
+        #     ImportError: cannot import name '月度退款额' from 'shop.report'
+        #   而旧指令只有一句"由失败栈定位到本文件：它必须一起改" ——
+        #   **没有一个字说"要补 月度退款额"**。模型拿到的就是这么一句泛话，
+        #   于是它去猜数据形状（历史真事故：把 `已退金额` 写成 `已退`）。
+        #   口径：**证据不进指令，等于把定位白做了**。
+        补.append({"path": _rel, "focus": 0,
+                   "agent_instruction": _指令带证据263(_rel, 红条目),
+                   "gates": spec.get("gates") or [], "depends_on": [], "machine": None})
+    return list(deliverables or []) + 补, [d["path"] for d in 补]
 
 
 def _parse_deliverables(spec: dict) -> list[dict]:
@@ -3353,7 +3855,15 @@ def _clamp_timeout(gates) -> list:
 
 
 def _score_gates(workdir: Path, file: Path, gates,
-                 repo_root: Path | None = None) -> tuple[dict, list]:
+                 repo_root: Path | None = None,
+                 cwd_根: Path | None = None) -> tuple[dict, list]:
+    """★ R251b：新增 `cwd_根` —— **门命令的 cwd 基准**。
+
+    为什么要它：门规格里常把 `cwd` 写成**创建时的绝对路径**（档案门就是这样）。
+    增量裁决期间仓可以在运行期变（自检/多仓共用一个进程），
+    这时"cwd 指向 A 仓、被判文件在 B 仓"⇒ 门在 A 仓上跑 ⇒ 判的是**别的仓**。
+    ⇒ 口径：给了 `cwd_根` 就把**落在旧仓里的 cwd 重定位**到新根（只换前缀，不改子路径）。
+    """
     """对单个落盘文件执行全部机器判据门，返回 (results:{门名:bool}, red_audit)。
 
     每门 cwd 缺省设成 workdir（主树工程任务缺省设 repo_root）；超时经 _clamp_timeout 护栏。
@@ -3366,6 +3876,11 @@ def _score_gates(workdir: Path, file: Path, gates,
         cwd = g.get("cwd")
         if cwd is None or str(cwd) in ("", "."):
             g["cwd"] = str(repo_root if repo_root is not None else workdir)
+        elif cwd_根 is not None:
+            _c = str(cwd).replace("{repo}", str(cwd_根))
+            # ★ 只重定位"看起来指向前一个仓"的绝对路径：取 `cwd_根` 之前的仓前缀不可知，
+            #   所以用**判据文件所在根**对齐：若 cwd 不以 cwd_根 开头，就用 cwd_根 本身。
+            g["cwd"] = _c if _c.startswith(str(cwd_根)) else str(cwd_根)
         elif repo_str is not None:
             g["cwd"] = str(cwd).replace("{repo}", repo_str)
         cmd = g.get("cmd")
@@ -3534,8 +4049,18 @@ def _score_files(workdir: Path, deliverables: list[dict],
         g_res: dict = {}
         g_red: list = []
         # ① 逐文件的门：照旧真跑（含 {file} 的文本/行为门）
+        # ★★★★★ R251（2026-11-05 dry 闭环⑥ 抓出，**最危险的一类**）：
+        #   **逐件的门在沙箱副本里跑，与文件无关的门也在沙箱里跑 ⇒ 主树写了什么都没人看。**
+        #   真读数（自造反向用例）：把已实现的 `service.py` 换成空壳，
+        #   日志印 `✓ service.py：**判据全绿** ⇒ **保留**`，
+        #   而**主树里躺着空壳、测试三条 errors**。
+        #   根因：门命令的 `cwd` 是**绝对路径 = 主树**，但 `workdir` 是沙箱副本；
+        #   `_score_gates` 用 `workdir` 当"临时副本"，而门自己 `cd` 到了主树。
+        #   ⇒ 沙箱与门看的**不是同一棵树** ⇒ 等于**没测**。
+        #   ⇒ 口径：增量裁决期间，门的求值根一律是**主树**（`file_root`）——
+        #     逐文件用 `f`（已在主树），共享门用 `base`。沙箱只在**产出侧**用。
         if 逐件:
-            _r, _d = _score_gates(workdir, f, 逐件, repo_root=repo_root)
+            _r, _d = _score_gates(base, f, 逐件, repo_root=repo_root, cwd_根=base)
             g_res.update(_r)
             g_red.extend(_d)
         # ② 与文件无关的门：按规格身份**只求值一次**，本窗内复用
@@ -3545,7 +4070,7 @@ def _score_files(workdir: Path, deliverables: list[dict],
             except (TypeError, ValueError):
                 k = repr(g)
             if k not in 缓存:
-                缓存[k] = _score_gates(workdir, f, [g], repo_root=repo_root)
+                缓存[k] = _score_gates(base, f, [g], repo_root=repo_root, cwd_根=base)
             _r, _d = 缓存[k]
             g_res.update(_r)
             g_red.extend(_d)
@@ -3861,6 +4386,90 @@ def _detect_repo_scope(spec: dict, all_gates: list) -> bool:
     return any("{repo}" in json.dumps(g, ensure_ascii=False) for g in all_gates)
 
 
+# ★ R234（2026-11-05 case01 真跑）：**模型自撰的门命令可能根本跑不起来**。
+#   真证据：派生门是 `["python","-m","pytest","-q","tests"]`，而目标仓的
+#   解释器里**没有 pytest** ⇒ 红因由是 `No module named pytest`。
+#   机器把它当"红门"算进工作量和收敛判定 ⇒ 模型永远修不好（错的不是产物），
+#   最终交付时项目门仍是红，却因为"历史债"逻辑放行 ⇒ **空交付也算成功**。
+#   口径：**工具/模块不存在 ≠ 红门**，那是**门规格非法**。处理顺序：
+#     ① 能换成同义且真能跑的命令（pytest → unittest discover）⇒ 换掉，记读数；
+#     ② 换不了 ⇒ 从门集移除并**大声报出**（不许静默留着当红门）。
+_门不可用特征 = (
+    "no module named", "is not recognized", "不是内部或外部命令",
+    "command not found", "no such file or directory", "无法将",
+    "not recognized as", "executable file not found",
+)
+
+
+def _门命令不可用(详情) -> bool:
+    _文 = json.dumps(详情, ensure_ascii=False, default=str).lower()
+    return any(_k in _文 for _k in _门不可用特征)
+
+
+def _门可用性矫正(spec: dict, repo_root) -> tuple[dict, list[dict]]:
+    """把"跑不起来的门"换成能跑的等价门，换不了就摘掉并记录。**不改判据语义**。"""
+    from agentscope_orchestrator import gate_spec as _gs
+    修: list[dict] = []
+    门们 = list(spec.get("gates") or [])
+    留: list[dict] = []
+    for _g in 门们:
+        if not isinstance(_g, dict):
+            留.append(_g)
+            continue
+        _类型 = str(_g.get("type") or "")
+        _cmd = _g.get("cmd")
+        if _类型 != "compile" or not isinstance(_cmd, list) or not _cmd:
+            留.append(_g)
+            continue
+        _g试 = dict(_g)
+        if str(_g试.get("cwd") or "") in ("", "{repo}", "."):
+            _g试["cwd"] = str(repo_root)
+        try:
+            # ★ 注意 `evaluate` 的返回形状是 `(results: {门名: bool}, red: list[dict])`，
+            #   不是 `(bool, 详情)`。第一版按后者解包 ⇒ `_ok` 拿到的是**非空 dict**
+            #   （恒 truthy）⇒ 每一条门都被当成"能跑"⇒ 矫正函数等于没跑。
+            #   这是本项目主缺陷族那条：**不要猜数据的形状，去读它的生产者**。
+            _res, _红 = _gs.evaluate(_g试, Path(repo_root), Path(repo_root))
+            _ok = bool(_res) and all(v is True for v in _res.values())
+            _详情 = {"red": _红, "res": _res}
+        except Exception as _e:                      # noqa: BLE001
+            留.append(_g)
+            continue
+        if _ok or not _门命令不可用(_详情):
+            留.append(_g)
+            continue
+        # ① 换同义命令：**任何测试运行器**跑不了（pytest 没装 / 命令名写错）⇒
+        #    该仓有 tests/ 就用 unittest discover（标准库自带，必有）
+        _像测 = any(("pytest" in str(x)) or ("test" in str(x).lower())
+                    or ("unittest" in str(x)) for x in _cmd)
+        _替 = None
+        if _像测 and (Path(repo_root) / "tests").is_dir():
+            _替 = {"type": "compile", "name": _g.get("name") or "tests_green",
+                   "cwd": _g.get("cwd", "{repo}"),
+                   "cmd": ["python", "-m", "unittest", "discover", "-s", "tests", "-q"],
+                   "expect_exit": 0}
+        if _替 is not None:
+            try:
+                _ok2, _详情2 = _gs.evaluate(_替, Path(repo_root), Path(repo_root))
+            except Exception:                        # noqa: BLE001
+                _ok2, _详情2 = False, {"err": "替换门也跑不了"}
+            if not _门命令不可用(_详情2):
+                for _k, _v in _g.items():
+                    if _k not in ("cmd", "type", "name", "cwd"):
+                        _替.setdefault(_k, _v)
+                留.append(_替)
+                修.append({"gate": _g.get("name"), "动作": "替换命令",
+                           "旧": _cmd, "新": _替["cmd"],
+                           "因": "工具/模块在原环境不存在（不是产物错）"})
+                continue
+        # ② 摘掉
+        修.append({"gate": _g.get("name"), "动作": "移除",
+                   "旧": _cmd, "因": "命令跑不起来且无可替换（门规格非法）"})
+    spec = dict(spec)
+    spec["gates"] = 留
+    return spec, 修
+
+
 def _repo_file_context(rel: str, cap: int = _REPO_CTX_CAP) -> str:
     """读主树仓库当前文件内容（机制①：执行/回炉智能体看到真实源码再改）。
     文件不存在 → 空串；超 cap 截断并明确标注：未注入的后缀必须逐字保留，
@@ -4057,10 +4666,86 @@ def _指纹(p: Path) -> str:
         return ""
 
 
-def _backup_file(rel: str) -> dict:
-    """主树文件应用前备份到 .audit_trail/generic_backup/。返回 {path, backup, existed}。"""
-    p = REPO_ROOT / rel
-    b = BACKUP_DIR / rel
+def _本项目零用例250(rel: str, r_this) -> bool:
+    """★ R250b：门"绿"了但**这门对这个文件根本没测到东西** —— 不许当绿。
+
+    判据（三条都是"测量缺失"的形状，不是"通过"）：
+      ① 门结果里没有任何与本文件相关的真值（`r_this` 为空）；
+      ② 输出里出现 `Ran 0 tests`；
+      ③ 输出为空字符串（跑了但没吐任何东西）。
+    真证据：把 service.py 换成空壳后 `unittest discover` 因 ImportError 而
+    `Ran 0 tests … OK` ⇒ 退出码 0 ⇒ 老判据判"全绿 ⇒ 保留"。
+    """
+    import re as _re250
+    if not r_this:
+        return True
+    for _v in (r_this or {}).values():
+        _t = str(_v or "")
+        if _re250.search(r"\bRan\s+0\s+tests\b", _t):
+            return True
+    return False
+
+
+def _备份根246(根: "Path | str | None" = None) -> Path:
+    r"""★ R248（2026-11-05 撞出来的真缺陷）：**备份目录必须跟着仓走**。
+
+    真读数：dry 闭环自检把 `REPO_ROOT` 指到一个临时仓之后，
+    `_backup_file` 仍然往**模块常量** `BACKUP_DIR`（= 本仓 `.audit_trail/…`）里写 ⇒
+    `PermissionError: [WinError 5] 拒绝访问 …\.audit_trail\generic_backup\src\shop`（原文）。
+    ★ 根因是同一个老病：**"常量在导入那一刻就定死了"，而仓可以在运行期变** ——
+      于是"在 A 仓上备份、往 B 仓写"，失败信息还长得像"权限问题"。
+    ⇒ 口径：备份根 = `ORCH_STATE_DIR`（若有）或 `<REPO_ROOT>/.audit_trail/generic_backup`。
+    """
+    import os as _os246
+    # ★★★★★ R267（真 cargo 端到端齿抓出来的）：**优先级错了**。
+    #   真读数：在临时 Rust 仓上跑 `_增量应用`，`判十五` 报出
+    #     backup = '<ORCH_STATE_DIR>\generic_backup\src\util.rs'
+    #   而**被判仓是那个临时仓** ⇒ 备份落到了测试状态目录里。
+    #   根因：`ORCH_STATE_DIR` 分支排在 `根`（被判仓）**前面**。
+    #   R246 当初次序是"状态目录优先"，那是因为当时只有解释器自己一个仓；
+    #   一旦要"在任意真实仓上干活"，**备份必须落在被判的那个仓里**，
+    #   否则「回滚」引用的是另一个树的字节，回滚本身就是假的。
+    #   ⇒ 次序改成：**被判仓优先**；没有才用 ORCH_STATE_DIR；再没有才 REPO_ROOT。
+    if 根 is not None:
+        try:
+            return Path(str(根)).resolve() / ".audit_trail" / "generic_backup"
+        except Exception:                          # noqa: BLE001
+            pass
+    _st = str(_os246.environ.get("ORCH_STATE_DIR") or "").strip()
+    if _st:
+        try:
+            return Path(_st).resolve() / "generic_backup"
+        except Exception:                          # noqa: BLE001
+            pass
+    # ★★★ R264（2026-11-05 真读数）：**兜底也必须跟着"被判的那个仓"走**。
+    #   真证据：在一个**临时副本仓**上跑 `_增量应用`，
+    #     PermissionError: [WinError 5] …\<工具仓>\.audit_trail\generic_backup\src\shop
+    #   —— 备份落到了**工具自己的仓根**（REPO_ROOT 模块常量），而改的是那个副本仓。
+    #   这正是 R248 修过一次的同一个病：**"常量在导入那一刻就定死了，而仓可以在运行期变"**。
+    #   R248 只把 `ORCH_STATE_DIR` 那一支接上了；**没有 ORCH_STATE_DIR 时仍然回到工具仓**，
+    #   于是"在 A 仓上备份、往 B 仓写"原样复发。
+    #   ⇒ 兜底改成：给了 `根`（= 本次被判的仓）就用它；否则才回 REPO_ROOT。
+    if 根 is not None:
+        try:
+            return Path(str(根)).resolve() / ".audit_trail" / "generic_backup"
+        except Exception:                          # noqa: BLE001
+            pass
+    try:
+        return Path(str(REPO_ROOT)).resolve() / ".audit_trail" / "generic_backup"
+    except Exception:                              # noqa: BLE001
+        return BACKUP_DIR
+
+
+def _backup_file(rel: str, 仓根: "Path | str | None" = None) -> dict:
+    """主树文件应用前备份到 `.audit_trail/generic_backup/`。返回 {path, backup, existed}。
+
+    ★ R264：`仓根` 是**本次被判的那个仓**。不传则回落到 `REPO_ROOT`（老行为）。
+      真读数：不传时在临时仓上跑会把备份写进**工具自己的仓** ⇒ PermissionError，
+      且失败信息长得像"权限问题"，而真相是"备份根写错了树"。
+    """
+    _根 = Path(str(仓根)).resolve() if 仓根 is not None else REPO_ROOT
+    p = _根 / rel
+    b = _备份根246(_根) / rel
     b.parent.mkdir(parents=True, exist_ok=True)
     existed = p.is_file()
     if existed:
@@ -4335,7 +5020,7 @@ def _落盘拷贝(src: Path, tgt: Path) -> None:
     tgt.write_bytes(src.read_bytes())
 
 
-def _apply_file(rel: str, text: str) -> Path:
+def _apply_file(rel: str, text: str, 仓根: "Path | str | None" = None) -> Path:
     """把候选内容写入主树文件（先由 _backup_file 留痕）。
 
     ★★★★★ R22：写 **`text.encode("utf-8")` 的原始字节**，不做行尾翻译。
@@ -4344,7 +5029,13 @@ def _apply_file(rel: str, text: str) -> Path:
         没碰过的 `Cargo.toml` LF 11）⇒ 对 git 而言整个文件都变了、
         「判过的字节」与「留下的字节」不是同一份。
     """
-    p = REPO_ROOT / rel
+    # ★ R264：**写进「被判的那个仓」，不是工具自己的仓**。
+    #   真读数：在 case02 副本上跑 _增量应用 ⇒ `src/shop/report.py：写入失败（PermissionError）`
+    #   —— 因为这里写的是 `REPO_ROOT / rel`（工具仓）。
+    #   而同一条链上 `_score_files(round_root, …)` 又在**副本**里判分 ⇒
+    #   "往 A 写、在 B 判" ⇒ 判据永远红 ⇒ 正确的产物被回退。
+    _根 = Path(str(仓根)).resolve() if 仓根 is not None else REPO_ROOT
+    p = _根 / rel
     # ★★★★★ R54（真跑抓出的缺口 · 2026-10-16）：**写之前先核对指纹**。
     #   【现象】运行期间 `src/判据/mod.rs`、`src/模块甲/mod.rs` 的 mtime
     #     落在本轮里，而它们**根本不在交付物清单里**；且 `cargo test` 的
@@ -4456,6 +5147,104 @@ def _项目门是否放行(基线: dict | None, 现: dict | None) -> tuple[bool,
                 + " 由绿转红 ⇒ 这是本次任务的责任", 坏)
     return (True, "项目门**未变坏**（基线里绿的门仍绿，红的门是主树历史债，"
                   "不是本次任务的责任）⇒ 放行", [])
+
+
+_回执兜底: "Path | None" = None
+
+
+def _写回执行(行: str) -> "Path | None":
+    """往共享回执追加一行；**共享那份被占用时改落本趟专属文件**（R537b）。
+
+    ★ 为什么不能只打一行日志就算了（实测 2026-11-17）：
+      `.audit_trail/generic_receipt.jsonl` 被另一个编排器进程**独占**
+      （追加与 `r+b` 都 PermissionError），而目录可写。
+      原行为是「只告警、之后每一次写都失败」⇒ **整趟零回执**，
+      而 `orch-log` 是空的 —— 用户看到的是"什么都没跑"。
+    ★ 证据可以换地方落，但**必须说落在哪**（口径 92）：
+      否则「有回执」和「没回执」在用户眼里长得一模一样。
+    返回真正写进去的路径；两份都写不进 ⇒ None（如实返回，不假装成功）。
+    """
+    global _回执兜底
+    try:
+        _RECEIPT.parent.mkdir(parents=True, exist_ok=True)
+        with _RECEIPT.open("a", encoding="utf-8") as f:
+            f.write(行 + "\n")
+        return _RECEIPT
+    except OSError as e:
+        if _回执兜底 is None:
+            import os as _os
+            import time as _t
+
+            _名 = (f"{_RECEIPT.stem}.本趟_{_os.getpid()}"
+                   f"_{_t.strftime('%Y%m%d_%H%M%S')}{_RECEIPT.suffix}")
+            # ★★★★★ R537g：**兜底不能只落在「同一个目录的兄弟文件」上**。
+            #   实测（2026-11-17）：仓库 `.audit_trail` 的 ACL 是
+            #     `00:(RX)`（目录本身**只读**）+ `Everyone:(I)(CI)(DENY)`
+            #   ⇒ **在它里面连新文件都建不出来**（`PermissionError`），
+            #     而共享那份 `generic_receipt.jsonl` 同时被别的进程独占。
+            #   「改落同目录兄弟文件」于是**两条路一起死** ⇒ 整趟零回执。
+            #   ⇒ 依次试：① 同目录兄弟（最贴近原证据）② **状态区**（可写）。
+            #     挑第一个真能写的；挑不出来才如实返回 None。
+            _点: list = [_RECEIPT.parent / _名]
+            try:
+                from . import profile as _pf537g
+
+                _点.append(_pf537g.STATE_ROOT / "audit" / _名)
+            except Exception:                       # noqa: BLE001 增强失败不影响主路
+                pass
+            for _c in _点:
+                try:
+                    _c.parent.mkdir(parents=True, exist_ok=True)
+                    with _c.open("a", encoding="utf-8") as _f:
+                        _f.write(行 + "\n")
+                    _回执兜底 = _c
+                    break
+                except OSError:
+                    continue
+            if _回执兜底 is not None:
+                _log(f"[generic] ★★ 共享回执写不进去（{type(e).__name__}：{e}）"
+                     f" ⇒ 本趟回执**改落到** {_回执兜底}"
+                     f"（★ `orch-log` 读的是共享那份 ⇒ 看不到本趟；这是如实说，"
+                     f"不是修好了）")
+        if _回执兜底 is None:
+            return None
+        try:
+            with _回执兜底.open("a", encoding="utf-8") as f:
+                f.write(行 + "\n")
+            return _回执兜底
+        except OSError:
+            return None
+
+
+class _哑客户端:
+    """**0-LLM 模式（`--dry` / `--dry-machine`）的占位客户端。**
+
+    ★★★★★ R537（干净环境真跑抓出的缺陷，2026-11-16）
+
+      症状：装完 0.13.13 在**没有 `aaa` 密钥**的机器上跑
+        `orch-goal --dry-machine`  ⇒  `RuntimeError: channel['aaa'] key not found`
+        `orch-goal --dry` / `--dry-multi` / `--dry-rework` / `--selftest` 同样全红。
+
+      根因：`--dry*` 是**不需要任何模型的离线闭环**（喂已知正确件走一遍判门），
+        但 `GoalRunner.__init__` 原来**无条件** `build_client(...)`，
+        而且是一句列表推导 —— **任何一对**建不起来就整段抛异常。
+      ⇒ 后果不是"少一个功能"，是**换台机器装完就一条都跑不了**，
+        而它本来一条通道都不需要。
+
+      ★ 这里为什么不直接给 `None`：`None` 真被调到只会抛
+        `AttributeError: 'NoneType' object has no attribute ...` ——
+        那是在说"我的代码坏了"，而事实是"这一步本来就不该有客户端"。
+        给这个对象能把**为什么没有**说出来（口径 92：允许没有 + 必须说明）。
+    """
+
+    def __init__(self, 槽: str, 原因: str):
+        self.槽 = 槽
+        self.原因 = 原因
+
+    def __getattr__(self, 名: str):
+        raise RuntimeError(
+            f"槽 `{self.槽}` 是**占位客户端**（0-LLM 模式或没有可用密钥），"
+            f"不能真调模型。原因：{self.原因}")
 
 
 class GoalRunner:
@@ -4583,14 +5372,46 @@ class GoalRunner:
         #     与 R18 一致：硬死才排除，读不到仍试）。
         #   ⇒ 槽名用 `通道:模型` ⇒ **每个模型独立记失败与冷却**，
         #     一个模型坏掉不会把同通道的好模型一起拖下水。
-        self.pairs = [(slot, build_client(c, m))
-                      for slot, c, m in live_model_pairs(channels,
-                                                         self.channel_report)]
+        # ★★★★★ R537：**逐对容错建 client**（原来是一句列表推导，任何一对失败就全炸）。
+        #   实测（干净环境 0.13.13）：配置里第一个通道 `aaa` 没有密钥 ⇒
+        #     `orch-goal --dry-machine` → `RuntimeError: channel['aaa'] key not found`
+        #   —— 而 `--dry*` 是**0-LLM 的离线闭环，一条通道都不需要**。
+        #   ⇒ 两个错叠在一起：
+        #     ① 缺密钥的通道把**别的活通道一起拖死**（单点故障不可降级）；
+        #     ② 离线自检被绑上了网络凭据 ⇒ **换台机器装完就一条都跑不了**。
+        #   修法：建不起的**如实记账并跳过**；一对都建不起时，
+        #     0-LLM 模式用占位客户端接着走（本来就不调模型），
+        #     真要调模型才报错（那时缺密钥确实做不了）。
+        _候选对 = live_model_pairs(channels, self.channel_report)
+        self.pairs = []
+        self._建不起 = {}
+        for _slot, _c, _m in _候选对:
+            try:
+                self.pairs.append((_slot, build_client(_c, _m)))
+            except Exception as _e:                        # noqa: BLE001
+                self._建不起[_slot] = f"{type(_e).__name__}: {_e}"
+        if self._建不起:
+            self.channel_report["建不起client"] = dict(self._建不起)
+            _log("[generic] ★ 建不起客户端的槽（跳过，不影响别的槽）："
+                 + "；".join(f"{k}（{str(v).splitlines()[0][:70]}）"
+                             for k, v in self._建不起.items()))
+        _要模型 = not (self.dry or self.dry_machine)
+        if not self.pairs and not _要模型:
+            _因 = ("0-LLM 模式（--dry / --dry-machine）本来不调模型；"
+                   "占位只是为了槽表非空，真被调到时会给这句话")
+            if _候选对:
+                self.pairs = [(_s, _哑客户端(_s, _因)) for _s, _c, _m in _候选对]
+            else:
+                self.pairs = [("(无通道·0-LLM 占位)", _哑客户端("(无通道)", _因))]
+            _log("[generic] 0-LLM 模式：用**占位客户端**接着跑（本模式不调模型）"
+                 f" · 槽 {len(self.pairs)} 个")
         if not self.pairs:
             raise RuntimeError(
                 f"没有真实可用的 (通道,模型) 对（已探 {self.channel_report.get('probed')} "
                 f"个通道 / {self.channel_report.get('probed_pairs')} 个模型）。"
-                f"逐条原因：{self.channel_report.get('dead') or '（见报告）'}")
+                f"逐条原因：{self.channel_report.get('dead') or '（见报告）'}"
+                + ("；★ 建不起客户端：" + "；".join(self._建不起.values())
+                   if self._建不起 else ""))
         _log("[generic] 可用模型槽（failover 目标）："
              + "；".join(n for n, _ in self.pairs))
         # ★★★★★ R72（2026-10-17）：**渠道源 —— 持续加载 + 自适应重探。**
@@ -4607,8 +5428,18 @@ class GoalRunner:
             _槽源 = self.渠道源
 
             def _刷新槽():
-                return [(n, build_client(c, m))
-                        for n, c, m in _槽源.刷新()]
+                # ★ R537：刷新出来的通道**也可能建不起客户端**（没密钥/端点废）——
+                #   原来一句列表推导 ⇒ **任何一对**失败就抛穿 Router。
+                #   与 `__init__` 同一口径：建不起的跳过并记账，别拖死活槽。
+                _对 = []
+                for _n, _c, _m in _槽源.刷新():
+                    try:
+                        _对.append((_n, build_client(_c, _m)))
+                    except Exception as _e:                # noqa: BLE001
+                        self._建不起[_n] = f"{type(_e).__name__}: {_e}"
+                if not _对 and (self.dry or self.dry_machine):
+                    return list(self.pairs)     # 0-LLM：保住占位槽，别把槽表清空
+                return _对
 
             # 启动时先强制刷一次（把上面那次一次性探活的结论纳入持续加载口径）
             self.渠道源.刷新(强制=True)
@@ -4689,6 +5520,55 @@ class GoalRunner:
         if event.get("kind") == "delivered":
             self._delivered_products = list(event.get("products") or [])
             self._delivered_gates = dict(event.get("final_gates") or {})
+
+        # ══════════════════════════════════════════════════════════════════
+        # ★★★★★ R300 【口径门接线】—— 回执 = 编排器对外的**结论出口**
+        # ══════════════════════════════════════════════════════════════════
+        # 用户当面指出（2026-11-06）：
+        #   「你连我刚说的话，应该变成门给你自己输出内容结论把关的东西都没有做好，
+        #     上一句刚说完，问题出去答案立刻偏移。连这个最基本的都没做好，后面的怎么做？」
+        #
+        # 真事故：我在章程里写下「写不出红的判据的规矩不是规矩是装饰」，
+        #   紧接着就输出了一条**推卸型结论**（把编排器自己的问题归因给被研发项目）。
+        #   **拦住它的是用户，不是门。**
+        # ⇒ 所以口径门必须**接在产出路径上**，不能只是一个能查的函数。
+        #   （判十一的红话就是这个：「这些函数写了但没人调用（装饰品，不是能力）」）
+        #
+        # 为什么**不整条拦下**：回执是**证据**（见下面 5294 行同一条口径）。
+        #   丢了证据就没法复核。⇒ 做法是：**把被拦的那句改掉 + 在回执里留下拦的证据**。
+        #   这样「结论漂了」不可能静默通过——读到回执的人**必然**看见那条拦。
+        _结论文段 = ("verdict", "verdict_note", "因由", "原因", "note", "说明")
+        try:
+            from . import 口径门 as _kj300
+        except Exception:                              # noqa: BLE001
+            _kj300 = None
+            _log("[口径门] ★ 口径门导入失败 ⇒ **本次结论没被把关**（不等于没问题）")
+        if _kj300 is not None:
+            _命中300: list[dict] = []
+            for _k300 in _结论文段:
+                _v300 = event.get(_k300)
+                if not (isinstance(_v300, str) and _v300.strip()):
+                    continue
+                # ★ 走**硬门**（`必须过` 命中就抛），不是软查 ——
+                #   判十一的红话是「写了但没人调用（装饰品，不是能力）」。
+                #   这里就是要它真的当门用：抛出来 ⇒ 下面接住 ⇒ 标注 + 留证。
+                try:
+                    _kj300.必须过(_v300)
+                    continue
+                except ValueError:
+                    pass
+                _r300 = _kj300.查(_v300)
+                for _h300 in _r300["命中"]:
+                    _命中300.append({"字段": _k300, "id": _h300["id"],
+                                     "规矩": _h300["规矩"], "命中": _h300["命中"]})
+                # 把被拦的那句话标出来（原话保留，便于复核）
+                event[_k300] = "【口径门拦下】" + _v300
+            if _命中300:
+                event["口径门"] = {"ok": False, "命中": _命中300,
+                                 "口径": "结论漂了；原话已保留，前缀标记为【口径门拦下】"}
+                _log("[口径门] ★ 回执结论被拦 "
+                     + "；".join(f"{x['id']}@{x['字段']}" for x in _命中300))
+
         line = json.dumps(event, ensure_ascii=False)
         # ★ 真跑抓出：回执目录若被外部删掉（或档案声明的目录还没建），
         #   `open("a")` 直接 `FileNotFoundError` ⇒ **把整趟跑崩在写回执上**，
@@ -4696,13 +5576,9 @@ class GoalRunner:
         #   ⇒ 写之前确保目录在（一次 mkdir，幂等，代价可忽略）。
         #   ★ 这不是"掩盖错误"：回执是**证据**，证据目录缺失时应该
         #     **补建并继续**，而不是让整趟任务死在一个 I/O 细节上。
-        try:
-            _RECEIPT.parent.mkdir(parents=True, exist_ok=True)
-            with _RECEIPT.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except OSError as _e_emit:
-            _log(f"[generic] ★ 回执写盘失败（不阻断本趟判定）："
-                 f"{type(_e_emit).__name__}: {_e_emit}")
+        if _写回执行(line) is None:
+            _log("[generic] ★ 回执**两处都写不进**（共享那份被占用，本趟兜底也不行）"
+                 " ⇒ 本趟没有留下回执")
         # ★ R158：每次回执都更新心跳（见 `_心跳` 的注释）
         self._心跳(str(event.get("kind") or ""))
         _log(f"[receipt] {line}", flush=True)
@@ -4907,6 +5783,18 @@ class GoalRunner:
         return False
 
     async def _plan(self) -> None:
+        # ★★★★★ R243：**通道单点要在第一屏就说出来**。
+        #   真读数（本机）：live=['qww']；dead: aaa/ggg/mf 缺 key、dddddd 三个模型全 403。
+        #   而这件事此前只出现在 router 的 WARNING 里 ⇒ 事后复盘会把它读成
+        #   "模型不行/判据太严"。⇒ 启动即报，并给出"缺 key / 分组无权"两类修法。
+        try:
+            from agentscope_orchestrator.resilience import 单通道告警 as _告247
+            _w247 = _告247()
+            if _w247:
+                _log(f"[generic] {_w247}")
+                self._emit({"kind": "channel_degraded", "work": 0, "detail": _w247})
+        except Exception as _e247:                    # noqa: BLE001
+            _log(f"[generic] R243 通道读数不可用（不阻断）：{_e247}")
         if self.dry:
             _sp = (_DRY_MACHINE_SPEC if self.dry_machine
                    else _DRY_MULTI_SPEC if self.dry_multi else _DRY_SPEC)
@@ -5145,6 +6033,22 @@ class GoalRunner:
                 raise ValueError("门源唯一断言失败（派生门集外混入非 derive_gates(P) 门）："
                                  + "；".join(viol))
             self.spec["gates"] = derived        # 唯一门源落地
+            # ★ R234：派生门的命令必须**真能跑**（工具缺失 ≠ 产物红）
+            try:
+                self.spec, _门修234 = _门可用性矫正(self.spec, REPO_ROOT)
+                if _门修234:
+                    for _x in _门修234:
+                        _log(f"[generic] ★ R234 门命令不可用 → {_x['动作']}："
+                             f"{_x.get('gate')}｜旧 {_x.get('旧')}｜"
+                             f"新 {_x.get('新') or '（无）'}｜{_x.get('因')}")
+                    self._emit({"kind": "gate_command_unusable_fixed",
+                                "work": 0, "detail": _门修234[:6]})
+                    # ★ R538（【R110】）：**不许裸读 `self.spec[...]`** ——
+                    #   `self.spec` 可能是 `{}`，裸下标抛 KeyError ⇒ 整趟死
+                    #   （真跑实测 `重规划失败：'gates'`）。判据本体用 AST 认这条。
+                    derived = (self.spec or {}).get("gates")
+            except Exception as _e234:            # noqa: BLE001
+                _log(f"[generic] ★ R234 门可用性矫正未跑（不阻断）：{_e234}")
             self.pred = pred
             self.pred_derived_gates = derived
         # ★★★★★ R82 / R83：目标断言门 —— **必须在这里注入**。
@@ -5179,6 +6083,43 @@ class GoalRunner:
         #   各调一次模型且每次都从磁盘读原文件 ⇒ 同文件被独立改 4 次、后写覆盖前写
         #   ⇒ 8/12 次调用纯重复，且留下的不是最好的那份、是**最后一份**。
         self.deliverables = _去重交付物189(self.deliverables)
+        # ★★★★★ R244（2026-11-05 复跑 A3 真读数）：**交付物白名单**。
+        #   轮1 的交付物里出现了 `tests/test_cancel_flow.py`（判据文件！）
+        #   与 4 个不相干文件 ⇒ 全被打回，一轮白跑。
+        #   口径：判据/配置文件**不许当交付物**（判据不得由被判方改），
+        #   且摘掉时必须**大声报出**（静默过滤 = 让人以为规划器没问题）。
+        try:
+            self.deliverables, _摘244 = _过滤判据文件244(self.deliverables)
+            if _摘244:
+                _log(f"[generic] ★ R244 交付物里混进了**判据文件** ⇒ 已摘掉"
+                     f"（判据不得由被判方改）：{_摘244}")
+                self._emit({"kind": "deliverable_whitelist_filtered",
+                            "work": 0, "removed": _摘244,
+                            "kept": [d["path"] for d in self.deliverables]})
+        except Exception as _e244:                   # noqa: BLE001
+            _log(f"[generic] ★ R244 交付物白名单未生效（不阻断）：{_e244}")
+        # ★★★★★ R237：**规划器漏掉的必改文件，从失败栈补回来**。
+        #   多文件目标最容易死在这里：模型只切一个文件 ⇒ 跨文件契约永远不绿，
+        #   而机器手里明明有"谁在报错"的读数。放在去重之后、拓扑排序之前。
+        try:
+            _红236 = list(_门态缓存.get("红") or [])
+            _sr236: list = []
+            try:
+                from agentscope_orchestrator.profile import get_profile as _gp236
+                _sr236 = list(getattr(_gp236(), "source_roots", ()) or ())
+            except Exception:                       # noqa: BLE001
+                _sr236 = []
+            _前236 = [str(d["path"]) for d in self.deliverables]
+            self.deliverables, _补236 = _补齐改动面236(
+                self.deliverables, spec, REPO_ROOT, _红236, _sr236 or ["src"])
+            if _补236:
+                _log(f"[generic] ★★★★★ R237 规划器漏了必改文件 ⇒ "
+                     f"从项目验收门失败栈补进交付物：{_补236}"
+                     f"（原交付物 {_前236}）")
+                self._emit({"kind": "deliverables_expanded_from_traceback",
+                            "work": 0, "added": _补236, "before": _前236})
+        except Exception as _e236:                  # noqa: BLE001
+            _log(f"[generic] ★ R237 失败栈补改动面未生效（不阻断）：{_e236}")
         order, ok, why = _topo_sort(self.deliverables)
         if not ok:
             raise ValueError(f"文件依赖拓扑违例：{why}")
@@ -6428,7 +7369,19 @@ class GoalRunner:
                         _log(f"[generic]   ↳ {rel}：机器拒收的产物 ⇒ **不写主树**"
                              f"（{_是拒收产物(text)}）")
                         continue
-                    _apply_file(rel, text)
+                    # ★ R538c：目标根必须是 **REPO_ROOT**，不是 `self.round_root`。
+                    #   这一段的配对是「`_backup_file(rel)`（默认根 REPO_ROOT）
+                    #   → 应用 → `_score_files(..., file_root=REPO_ROOT, repo_root=REPO_ROOT)`
+                    #   → `finally` 里 `_rollback_file(bk)`（还原 REPO_ROOT）」，
+                    #   注释也写明「备份→**应用主树**→判门→回滚」。
+                    #   ⇒ 写进 `self.round_root` 会「备份主树、却改隔离树」：
+                    #     判门读主树 ⇒ **正当内容也判红**（自检当场咬住：
+                    #     【R32】★ 假红：正当内容下判别门未判绿）。
+                    #   （原代码这里是**裸名** `round_root` —— 那是模块级
+                    #     `_增量应用(...)` 的形参，被抄进方法时既没加 `self.`
+                    #     也没换成正确的那个根；自检先报 NameError、补上 `self.`
+                    #     后立刻暴露真正的错是"根选错了"。两处都必须修。）
+                    _apply_file(rel, text, REPO_ROOT)
                 results, red = _score_files(
                     wdir, self.deliverables, file_root=REPO_ROOT, repo_root=REPO_ROOT)
             finally:
@@ -6570,7 +7523,8 @@ class GoalRunner:
                     _log(f"[generic] ★ R216 **原地重交**：{len(_重交216)} 个文件的产出与**已被否过的**"
                          f"逐字相同 ⇒ 不再花一轮评分，直接判否：{_重交216[:4]}")
                     self._emit({"kind": "duplicate_candidate_rejected",
-                                "work": work, "files": _重交216[:6]})
+                                "work": int(getattr(self, "_当前轮242", 0) or 0),
+                                "files": _重交216[:6]})
                 # ★★★★★ R220：**产出体积塌缩 ⇒ 直接拒收，不许写进树。**
                 #   真证据（第 120 次真跑现场 work/zh_compiler/task/r11/）：
                 #     `示例工程/基础集/时序拓扑注入.rs` → **0KB**（原 58KB）
@@ -6597,7 +7551,8 @@ class GoalRunner:
                     _log(f"[generic] ★ R220 **产出体积塌缩 ⇒ 拒收**（不许写进树）："
                          f"{[(x['file'], x['原行'], x['新行']) for x in _缩220[:3]]}")
                     self._emit({"kind": "shrunken_candidate_rejected",
-                                "work": work, "detail": _缩220[:6]})
+                                "work": int(getattr(self, "_当前轮242", 0) or 0),
+                                "detail": _缩220[:6]})
                 results, round_red, _留43, _退43 = _增量应用(
                     adopted, 基线, self.round_root, self.deliverables, 回退详情=_台177)
                 # ★ R177：本轮回退台账（每轮覆盖 ⇒ 模型看到的是「上一轮」）
@@ -6622,7 +7577,8 @@ class GoalRunner:
                 if getattr(self, "_跳193", 0):
                     _log(f"[generic] ★ R193/R196 本轮共**跳过 {self._跳193} 个交付物**"
                          f"（本轮它们没有红门证据 ⇒ 已经是对的，不动）")
-                    self._emit({"kind": "workface_converged", "work": work,
+                    self._emit({"kind": "workface_converged",
+                                "work": int(getattr(self, "_当前轮242", 0) or 0),
                                 "skipped": self._跳193,
                                 "reason": "作业面按当前红证据收敛：无红证据的交付物不产出"})
                     self._跳193 = 0          # 用后即清（只属于本轮）
@@ -6724,7 +7680,11 @@ class GoalRunner:
                             continue
                         # ★ R54：别人改过 ⇒ 跳过这一个文件（不覆盖、不炸整轮）
                         try:
-                            _apply_file(rel, text)
+                            # ★ R538c：同 `_window_score` —— 应用目标必须是 **REPO_ROOT**。
+                            #   本段的配对是 `_backup_file(rel)`（默认根 REPO_ROOT）
+                            #   → 应用 → `_score_files(..., file_root=REPO_ROOT)` 的判门，
+                            #   写隔离树会让「备份主树、改隔离树」，判门读主树 ⇒ 假红。
+                            _apply_file(rel, text, REPO_ROOT)
                         except 并发改动错 as _e54:
                             _log(f"[generic]   ↳ {rel}：{_e54}")
                             continue
@@ -6887,6 +7847,18 @@ class GoalRunner:
                 _已等163 = (0.0 if _规划起163 is None
                             else __import__("time").monotonic() - _规划起163)
                 # ★ R163/R167：判据是**为了等它好转忍了多久**。
+                # ★★★★★ R258c（2026-11-05 读 case02 真回执时发现的**分类错误**）：
+                #   现场原文（`_crossrepo_case02/.audit_trail/generic_receipt.jsonl`）：
+                #     channel_degraded（只有 1 条活通道）
+                #     → plan_transient_retry 第 10、11 次
+                #     → **plan_error: JSONDecodeError: Expecting value: line 1 column 1**
+                #   即：上游回 `HTTP 200 + {"error":"上游服务异常"}` ⇒ 包体是错误包 ⇒
+                #   SDK 解析层抛 JSONDecodeError ⇒ `_是瞬时的()` 把它判**终态** ⇒ 规划直接 return 1。
+                #   ★ 这是**分类错误**，不是上游问题：上游已经明确说了"请稍后重试"，
+                #     而我把"解析不出模型回复"当成"代码缺陷"。
+                #   ⇒ 口径：**JSONDecodeError / 空包体 / 响应不是模型回复 = 上游瞬时的另一种脸**，
+                #     进重试；只有真正解析不了的东西才归终态。
+                _瞬 = _瞬 or _是上游空包(e)
                 if _瞬 and _已等163 < _瞬时等待预算秒:
                     if _规划起163 is None:
                         _规划起163 = __import__("time").monotonic()
@@ -7031,6 +8003,7 @@ class GoalRunner:
             _轮起163 = None
             while True:
                 try:
+                    self._当前轮242 = work      # ★ R242：事件里要能报出轮号（此前 _round 里引用未定义的 work）
                     ok, adopted, alignment, round_results, round_red = await self._round(
                         content, red_audit_prev)
                     break
@@ -7138,8 +8111,29 @@ class GoalRunner:
             self._append_records(results, red_audit_prev)
             red_audit_prev = red
             content = adopted
-
-            # Δ(P) 结构偏差 + C5 曾绿单点映射
+            # ★★★★★ R237b（2026-11-05 多文件真跑）：**每一轮都按最新失败栈补改动面**。
+            #   只在规划期补一次是不够的：第 1 轮的失败栈只能指出**先断的那一处**
+            #   （`service.取消` 的 NotImplementedError），改完它之后，
+            #   第 2 轮的失败栈才指向 `inventory.释放`。
+            #   ⇒ 交付物集合必须**跟着证据走**，否则第 2 轮还在重复产同一份文件。
+            try:
+                _sr237: list = []
+                try:
+                    from agentscope_orchestrator.profile import get_profile as _gp237
+                    _sr237 = list(getattr(_gp237(), "source_roots", ()) or ())
+                except Exception:                    # noqa: BLE001
+                    _sr237 = []
+                _前237 = [str(d["path"]) for d in self.deliverables]
+                self.deliverables, _补237 = _补齐改动面236(
+                    self.deliverables, self.spec, REPO_ROOT, red or [], _sr237 or ["src"])
+                if _补237:
+                    _log(f"[generic] ★★★★★ R237b 本轮失败栈指出新的必改文件 ⇒ "
+                         f"补进交付物：{_补237}（原 {_前237}）")
+                    self._emit({"kind": "deliverables_expanded_from_traceback",
+                                "work": int(getattr(self, "_当前轮242", 0) or 0),
+                                "added": _补237, "before": _前237})
+            except Exception as _e237:               # noqa: BLE001
+                _log(f"[generic] ★ R237b 按失败栈补改动面未生效（不阻断）：{_e237}")
             # ★★★★★ R207：**门级基线** —— 基线主树上就红的门，不许否决收敛。
             #   真证据（第 106 次真跑第 2/3 轮，门真值原文）：
             #     `（全库）@no_unused_mut_warnings=False`
@@ -7849,7 +8843,14 @@ class GoalRunner:
                         "adopted": {p: t[:200] for p, t in (content or {}).items()}})
 
             if action == "deliver":
-                return await self._deliver(work, results, alignment)
+                _rc238 = await self._deliver(work, results, alignment)
+                # ★ R238b：`_deliver` 返回 -1 = 「项目验收门仍红但我还有轮次」
+                #   ⇒ **不交付、继续下一轮**（改动已保留在主树，接着收敛）。
+                #   多文件目标天生需要多轮：第 1 轮改掉 service.py 之后，
+                #   失败栈才会指向 inventory.py —— 一轮改不完不是失败，是次序。
+                if _rc238 == -1:
+                    continue
+                return _rc238
 
             if action == "stop":
                 # ★ 接线（2026-10-12）：**先尝试换门集（状态转移），再谈停机**。
@@ -8741,6 +9742,85 @@ class GoalRunner:
                     _log(f"[generic]   ✗ {a.get('gate')}: "
                          f"{str(a.get('err') or a.get('cause') or '')[:140]}")
                 return 1
+            # ★★★★★ R235（2026-11-05 case01 真跑）：**一个文件都没落地，不许说"已保留在主树"**。
+            #   真证据（那趟的原话）：
+            #     `主树工程收敛交付 @轮1: 文件已保留在主树 …_crossrepo_case01`
+            #     `"live_in_repo": []`   ← 主树一个字节没改（产物只在 work/ 与 products/）
+            #   根因不是模型不行：是「产物全被回退 + 门被判据层豁免」两件事叠在一起，
+            #   于是一个**零改动的运行**报成功退出码 0。这比失败更坏：失败会让人再试，
+            #   假成功会让人以为已经做完。
+            #   口径：**交付必须能被主树上的字节见证**（有文件真被写且保留）。
+            if not backups:
+                # ★ R241（2026-11-05 可重复性真跑 A）：**第一轮全被回退 ≠ 任务失败**。
+                #   真读数（case02 回退到红基线后从零跑）：
+                #     轮1 只切出 report.py；模型那份把违规点 1 → 5 ⇒ 机器拒收 ⇒ 保留 0
+                #     ⇒ 这里直接 `return 1` ⇒ **本该在第 2 轮补上 service.py 的机会被砍掉**。
+                #   ⇒ 只要还有轮次，"一个都没落地"就应该**继续下一轮**（本轮失败照实记事件），
+                #     只在**最后一轮**才判否。否则无人值守跑不过"首轮不顺"的常见情形。
+                if work < self.max_work:
+                    self._emit({"kind": "no_file_applied_continue", "work": work,
+                                "final_gates": results,
+                                "reason": "本轮无落地但有剩余轮次 ⇒ 继续下一轮",
+                                "tokens_chars": self._tok_chars})
+                    _log(f"[generic] ★★ R241 本轮一个文件都没落地，但还有 {self.max_work - work} 轮 ⇒ "
+                         f"不判否、继续第 {work + 1} 轮")
+                    self._active_backups = []
+                    return -1
+                self._emit({"kind": "no_file_applied", "work": work,
+                            "final_gates": results,
+                            "products": [str(out / d["path"]) for d in self.deliverables],
+                            "live_in_repo": [],
+                            "reason": "本轮没有任何改动被保留在主树上"
+                                      "（候选产物全被回退或根本没产出）⇒ 「交付」不成立",
+                            "tokens_chars": self._tok_chars})
+                _log("[generic] ★★ 交付判否：**主树上一个文件都没落地**"
+                     "（live_in_repo 为空）⇒ 不叫交付、退出码 1。"
+                     "产物留在 products/，要人看的是「为什么全被回退」而不是「已完成」。")
+                return 1
+            # ★★★★★ R238（2026-11-05 多文件真跑）：**项目验收门红着，不许叫"交付成功"**。
+            #   真证据（case02 多文件靶）：`轮1 … unit_tests_green=False` →
+            #   `主树工程收敛交付 @轮1 … 文件已保留在主树` / `exit 0`。
+            #   它保留的是 `report.py` 一个文件，而取消流程要在 service/inventory/report
+            #   三处同改才可能绿 ⇒ 只落地 1/3，测试全红，却报成功。
+            #   ★ 根因是 R78 的口径「项目门基线红 ⇒ 未变坏就放行」被用在了
+            #     **本次任务正要求它变绿**的场合 —— 历史债放行把"目标没达成"也放过去了。
+            #   ★ 口径：放行只用于**推动进度**（改动保留、下一轮继续），
+            #     **不许**用于判成功。缺省 false；档案显式写
+            #     `accept_red_project_gates: true` 才允许红着交付（承认历史债的仓）。
+            _红项238 = [str(k) for k, v in (_acc_res or {}).items() if v is not True]
+            _容红238 = False
+            try:
+                from agentscope_orchestrator.profile import get_profile as _gp238
+                _容红238 = bool(getattr(_gp238(), "accept_red_project_gates", False))
+            except Exception:                        # noqa: BLE001
+                _容红238 = False
+            if _红项238 and not _容红238:
+                # ★ 还有轮次 ⇒ **不交付，继续下一轮**（改动保留在主树，接着收敛）。
+                #   多文件目标天生需要多轮：第 1 轮改掉 service.py 之后，
+                #   失败栈才会指向 inventory.py —— 一轮改不完不是失败，是次序。
+                if work < self.max_work:
+                    self._emit({"kind": "project_gate_red_continue", "work": work,
+                                "project_gates": _acc_res,
+                                "red_project_gates": _红项238,
+                                "kept": [bk["path"] for bk in backups],
+                                "tokens_chars": self._tok_chars})
+                    _log(f"[generic] ★★ R238 项目验收门仍红 {_红项238} ⇒ "
+                         f"**不交付、继续第 {work + 1} 轮**"
+                         f"（本轮已保留 {len(backups)} 个文件的改动）")
+                    self._active_backups = []
+                    return -1
+                self._emit({"kind": "partial_delivery", "work": work,
+                            "final_gates": results,
+                            "project_gates": _acc_res,
+                            "red_project_gates": _红项238,
+                            "live_in_repo": [bk["path"] for bk in backups],
+                            "products": [str(out / d["path"]) for d in self.deliverables],
+                            "reason": "项目验收门仍红 ⇒ 不许叫交付成功（改动已保留，可继续下一轮）",
+                            "tokens_chars": self._tok_chars})
+                _log(f"[generic] ★★ R238 项目验收门仍红 {_红项238} ⇒ "
+                     f"**判部分交付**（已保留 {len(backups)} 个文件的改动，退出码 1，"
+                     f"不谎称达标）。要继续收敛请再跑一轮 / 调大 --max-work。")
+                return 1
             self._emit({"kind": "delivered", "work": work, "final_gates": results,
                         "alignment": alignment, "repo_scope": True, "products": [
                             str(out / d["path"]) for d in self.deliverables],
@@ -8892,6 +9972,59 @@ _DRY_TEST_CONTENT = (
 )
 
 
+def _墙钟闸544(秒: float, 写回执=None) -> "object":
+    """★ R544：到点就**先写回执再硬退出**，保证「再慢也有一句裁决」。
+
+    ★ 为什么必须 os._exit：循环可能正阻塞在**没有超时的** subprocess.run 里
+      （真跑真门就是这样），抛异常根本执行不到。
+      口径 390：慢的机制等于没有的机制 —— 一道纸做的闸不算闸。
+    """
+    import json as _j
+    import os as _os
+    import threading as _th
+    import time as _t
+
+    def _到点():
+        try:
+            if 写回执 is not None:
+                写回执(_j.dumps({"ts": _t.strftime("%Y-%m-%d %H:%M:%S"),
+                                 "kind": "wall_timeout",
+                                 "wall_s": 秒,
+                                 "detail": ("★★ 墙钟超时：已跑 "
+                                            f"{秒:.0f} 秒仍未到终态 ⇒ 按预算**主动停**。"
+                                            "这不是「任务没做到」，是「这一趟没跑完」"
+                                            "（未到终态）。加预算：--max-wall 或 "
+                                            "ORCH_MAX_WALL_S"),
+                                 "exit_code": 4}, ensure_ascii=False))
+        except Exception:                    # noqa: BLE001 回执写不进去也要退
+            pass
+        try:
+            import sys as _s
+            print(f"[generic] ★★ R544 墙钟超时（{秒:.0f}s 未到终态）⇒ 退出码 4，"
+                  f"回执已写。★ 这是「未到终态」，不是「未达标」。", file=_s.stderr)
+            _s.stderr.flush()
+        except Exception:                    # noqa: BLE001
+            pass
+        _os._exit(4)
+
+    _卫 = _th.Timer(float(秒), _到点)
+    _卫.daemon = True
+    _卫.start()
+    return _卫
+
+
+def _墙钟预算544(a) -> float:
+    """--max-wall > ORCH_MAX_WALL_S > 默认 1800 秒；0 或负数 = 关。"""
+    import os as _os
+    _v = getattr(a, "max_wall", None)
+    if _v is None:
+        try:
+            _v = float(_os.environ.get("ORCH_MAX_WALL_S", "") or 1800)
+        except ValueError:
+            _v = 1800.0
+    return float(_v)
+
+
 def _parser() -> argparse.ArgumentParser:
     """CLI 解析器 —— 抽成函数，使**自检门能走真解析器**（含全部默认值），
     而不是另写一份 `Namespace` 假样本戊（那正是 TS-381 漏检的成因）。"""
@@ -8919,6 +10052,10 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--dry-machine", action="store_true",
                     help="机器自生成样例：交付物带结构真值 ⇒ 0-LLM 组装源码（真跑判门）")
     ap.add_argument("--selftest", action="store_true", help="跑纯机器自检门")
+    # ★ R544：墙钟预算（秒）。超时 ⇒ 先写 wall_timeout 回执再退出码 4。
+    #   口径 390：再慢必须有上界，且上界到了要**给裁决**，不是无声停在那里。
+    ap.add_argument("--max-wall", dest="max_wall", type=float, default=None,
+                    help="整趟墙钟预算（秒）；0=关；默认走 ORCH_MAX_WALL_S，再默认 1800")
     return ap
 
 
@@ -8946,13 +10083,16 @@ def main(argv=None) -> int:
     #   ⇒ 开头写 `run_start`（含 pid），结尾在 `finally` 里写 `run_end`
     #     （含退出码/异常类型）。★ 被 SIGKILL 时 finally 也跑不到 ——
     #     那正是「心跳停了但**没有** run_end」这个组合的意义。
+    # ★ R544：在 run_start 之后、_build_runner 之前**起闸**。
+    _预算544 = _墙钟预算544(a)
+    if _预算544 > 0:
+        _墙钟闸544(_预算544, 写回执=_写回执行)
+        _log(f"[generic] ★ R544 墙钟预算 {_预算544:.0f}s"
+             f"（超时退出码 4 · 改预算：--max-wall 或 ORCH_MAX_WALL_S）")
+
     def _写回执158(事件: dict) -> None:
-        try:
-            _RECEIPT.parent.mkdir(parents=True, exist_ok=True)
-            with _RECEIPT.open("a", encoding="utf-8") as _f158:
-                _f158.write(json.dumps(事件, ensure_ascii=False) + "\n")
-        except OSError as _e158:
-            _log(f"[generic] ★ R158 回执写盘失败（不阻断）：{_e158}")
+        # ★ R537b：走统一兜底（共享回执被别的进程独占时改落本趟专属文件）
+        _写回执行(json.dumps(事件, ensure_ascii=False))
 
     _写回执158({"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "kind": "run_start", "pid": os.getpid(),
@@ -9108,6 +10248,72 @@ def _build_runner(a) -> "GoalRunner":
 _心跳宽限秒 = 60.0
 
 
+def _pid还在(pid) -> bool:
+    """**只探存在，绝不动它**。返回 pid 对应的进程现在是否还活着。
+
+    ★★★★★ R538f（2026-11-17 · 自检【R160】④ 顺藤摸出来的**真事故**）：
+
+      **`os.kill(pid, 0)` 在 Windows 上不是可靠的探活** —— 对一个
+      **明明白白活着**的进程，它会抛异常，于是被判成「已不存在」。
+
+      ★ 实测取证（复现脚本 work/R536/探四态脱离.py，两种上下文各跑一次）：
+        · 普通进程（有控制台 / Start-Process）：`os.kill(自己,0)` 通过 ⇒ 判「不知」✓
+        · **DETACHED_PROCESS（无人值守就是这么起的）**：
+            `os.kill(自己,0)` ⇒ `OSError: [WinError 87] 参数错误`
+          ⇒ `判活` 返回「被杀了」✗ —— 而那个 pid 就是**正在跑这一趟的自己**。
+        ★ 顺带记一笔**我走过的弯路**：一开始我看到"探针脚本什么都没留下就消失"，
+          就断言 `os.kill(pid,0)` 会 `TerminateProcess` **把目标杀掉**。
+          最小取证（work/R536/探kill最小.py，带控制台）**推翻了这个结论**：
+          四步全落盘、退出码 0 ⇒ 它**不会**杀进程。
+          真凶是**上表第二行**（脱离上下文下 WinError 87）。
+          「现象像什么」不等于「原因是什么」——先做能判死活的最小取证。
+
+      ★★ 为什么这是真事故，不是一条齿红：
+        1. **无人值守跑都是脱离控制台起的**（否则宿主一关就没）。
+           ⇒ 在这种上下文里 `判活` **永远**判「被杀了」，
+           而 R160 存在的**唯一目的**就是区分「还在跑」与「被杀了」。
+        2. 「不知」这一态**永远走不到** ⇒ 「量不到」被压成「必红」
+           （R139 的老毛病）。最坏的形态：一趟正常在跑的活被 `orch-log`
+           报成「被杀了」，人于是去重启它 ⇒ 两个进程同时写主树。
+        3. 自检拿**自己的 pid** 去查 ⇒ 它测的正是这条路 ⇒ 所以它红得对。
+
+      ★ 修法：Windows 用**与信号/控制台无关**的只读句柄探活：
+        `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION=0x1000)`
+        + `GetExitCodeProcess() == STILL_ACTIVE(259)` + `CloseHandle`。
+        该句柄**不含 PROCESS_TERMINATE**，也不走
+        `GenerateConsoleCtrlEvent` 那条路 ⇒ 不依赖有没有控制台。
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    import os as _os
+    if _os.name == "nt":
+        try:
+            import ctypes as _ct
+            _k32 = _ct.WinDLL("kernel32", use_last_error=True)
+            # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000（**不含** PROCESS_TERMINATE）
+            _h = _k32.OpenProcess(0x1000, False, pid)
+            if not _h:
+                return False        # 打不开 ⇒ 当作不存在（有权限限制时也走这里）
+            try:
+                _码 = _ct.c_ulong()
+                if not _k32.GetExitCodeProcess(_h, _ct.byref(_码)):
+                    return False
+                return _码.value == 259      # STILL_ACTIVE
+            finally:
+                _k32.CloseHandle(_h)
+        except Exception:                        # noqa: BLE001 探活不许把整趟带崩
+            return False
+    try:
+        _os.kill(pid, 0)            # POSIX 上这里确实只是探活
+    except OSError:
+        return False
+    return True
+
+
 def 判活(回执文件=None, 心跳文件=None, 现在: float | None = None) -> dict:
     """读回执+心跳，判定**最近一趟**的状态。返回 {状态, 因由, ...}。
 
@@ -9178,11 +10384,9 @@ def 判活(回执文件=None, 心跳文件=None, 现在: float | None = None) ->
     if _pid is None:
         报告.update({"状态": "不知", "因由": "没有心跳也没有回执（从未跑过？）"})
         return 报告
-    _活 = True
-    try:
-        _os.kill(int(_pid), 0)          # 只探存在，不发信号
-    except (OSError, ProcessLookupError, PermissionError, ValueError):
-        _活 = False
+    # ★ R538f：**不许用 `os.kill(pid, 0)`** —— Windows 上它是 TerminateProcess，
+    #   会把被检查的那个进程杀掉（自检拿自己的 pid 查 ⇒ 自杀；见 `_pid还在`）。
+    _活 = _pid还在(_pid)
     if _活:
         # ★★ 第四态：进程还在，但心跳已过期 ⇒ **不许判死**
         报告.update({"状态": "不知",
@@ -11799,9 +13003,14 @@ def _selftest() -> int:
             _调用32: list[str] = []
             _真apply = globals()["_apply_file"]
 
-            def _记apply(rel, text, _真=_真apply, _记=_调用32):
+            # ★ R538：夹具签名必须跟得上被替身的真函数（`_apply_file(rel, text, 仓根=None)`）。
+            #   原夹具只有两个形参 ⇒ 真调用传第 3 个参数（仓根 Path）时，
+            #   那个 Path **绑到了 `_真` 上** ⇒ `_真(rel, text)` 变成
+            #   `TypeError: 'WindowsPath' object is not callable`。
+            #   （与【R38】`_记score` 缺 `cwd_根` 是同一类病：夹具落后于被替身者。）
+            def _记apply(rel, text, 仓根=None, _真=_真apply, _记=_调用32):
                 _记.append(str(rel))
-                return _真(rel, text)
+                return _真(rel, text, 仓根)
 
             globals()["_apply_file"] = _记apply
             try:
@@ -12204,7 +13413,11 @@ def _selftest() -> int:
             _计38 = {"n": 0}
             _真score = globals()["_score_gates"]
 
-            def _记score(workdir, file, gates, repo_root=None, _真=_真score, _c=_计38):
+            # ★ R538（【R38】）：真 `_score_gates` 后来新增了 `cwd_根`，
+            #   这个夹具没跟上 ⇒ `TypeError: unexpected keyword argument 'cwd_根'`。
+            #   夹具签名必须**跟得上被替身的那个函数**（否则自检报的是自己）。
+            def _记score(workdir, file, gates, repo_root=None, cwd_根=None,
+                         _真=_真score, _c=_计38):
                 _c["n"] += len(list(gates))
                 return _真(workdir, file, gates, repo_root=repo_root)
 
@@ -13573,9 +14786,27 @@ def _selftest() -> int:
         #   ★ 这里必须用"**目标提到、清单里没有**、但**磁盘上存在**"的文件 ——
         #     否则 `记 in 已交` 会先 `continue`，**根本走不到 exists 那一跳**，
         #     这条齿就变成无齿的（`_验R81齿.py` ② 注入当场抓出来过）。
-        _缺81c = _目标点名而清单没有(
-            "参考 src/模块甲/mod.rs 的写法，写 out/x81.py",
-            [{"path": "out/x81.py"}])
+        # ★ R538e：这条齿要求 `src/模块甲/mod.rs` **真的在盘上**
+        #   （它验的是「已存在的文件不得被要求成交付物」）。而本仓库
+        #   `src/模块甲/` **整个目录都不存在** ⇒ 齿断言的"已存在"没人保证
+        #   ⇒ **永远红**。夹具自己造临时仓当 REPO_ROOT，不动真实仓库。
+        import tempfile as _tf81
+        import shutil as _sh81
+        _根81 = Path(_tf81.mkdtemp(prefix="r81_"))
+        _存81 = globals().get("REPO_ROOT")
+        try:
+            (_根81 / "src" / "模块甲").mkdir(parents=True)
+            (_根81 / "src" / "模块甲" / "mod.rs").write_bytes(b"pub fn f() {}\n")
+            globals()["REPO_ROOT"] = _根81
+            _缺81c = _目标点名而清单没有(
+                "参考 src/模块甲/mod.rs 的写法，写 out/x81.py",
+                [{"path": "out/x81.py"}])
+        finally:
+            if _存81 is None:
+                globals().pop("REPO_ROOT", None)
+            else:
+                globals()["REPO_ROOT"] = _存81
+            _sh81.rmtree(_根81, ignore_errors=True)
         if _缺81c:
             fails.append(f"【R81】★ 把**已存在**的文件当成缺交（实得 {_缺81c}）"
                          f"⇒ 每个改源码的任务都会被无端回喂")
@@ -13644,7 +14875,12 @@ def _selftest() -> int:
         if not re.search(r"^ *_探针93 = probe_mod\.探针包\(", _源码, re.MULTILINE):
             fails.append("【R93】★ `_produce_window` 没调 `探针包` ⇒ "
                          "模块写好了但没接线（R85 的教训）")
-        if not re.search(r"prompt = _exec_prompt\(self\.goal, self\.spec, d, deps, repo_ctx,\s*\n\s*_探针93\)",
+        # ★ R538d：正则**不许钉死"到 `_探针93)` 为止"** —— 那个函数后来又长了
+        #   参数（R157 的 `_结构包157`），于是这条齿把**已经接好的线**判成没接
+        #   （实测：L7122-7123 明明写着 `_探针93, _结构包157`）。
+        #   ★ 齿要认的是「探针**在位**」，不是「它是不是最后一个参数」——
+        #     后者会随每一次加参数而假红（假红比漏报更坏，口径 311）。
+        if not re.search(r"prompt = _exec_prompt\(self\.goal, self\.spec, d, deps, repo_ctx,\s*\n\s*_探针93\s*[,)]",
                          _源码):
             fails.append("【R93】★ 探针查了但**没传进** `_exec_prompt` ⇒ "
                          "白查（R86 的教训：算出来了却没用上）")
@@ -14085,16 +15321,25 @@ def _selftest() -> int:
                 return _sp91.run([sys.executable, str(_门91), 名, str(_d91), "判据_"],
                                  capture_output=True, timeout=300)
 
+            # ★ R538i：失败时**必须带证据**（rc + 输出），否则无从判断是
+            #   "门判反了" / "子进程没起来" / "夹具没写对"。见文件末尾注释。
+            def _证91(r):
+                _o = ((r.stdout or b"") + (r.stderr or b"")).decode("utf-8", "replace")
+                return (f"｜rc={r.returncode}｜门文件={_门91.is_file()}"
+                        f"｜夹具a.rs={(_d91 / 'a.rs').is_file()}"
+                        f"｜输出={_o.strip()[:220]}")
+
             # ① 断言里**真的调了** ⇒ 判绿
             _r91a = _跑91("判据_真_行为被见证")
             if _r91a.returncode != 0:
                 fails.append("【R91】★ 断言里真的调了接口，见证门却判**红** ⇒ "
-                             "恒红门，任务永远不可能收敛")
+                             "恒红门，任务永远不可能收敛" + _证91(_r91a))
             # ② ★ 名字点名了但**没调** ⇒ 必须判红（真跑那条假 green 的形态）
             _r91b = _跑91("判据_假_行为被见证")
             if _r91b.returncode == 0:
                 fails.append("【R91】★ 名字点名了 `判据_假`、断言里只写 `assert!(true)`，"
-                             "见证门却判**绿** ⇒ 它还是只看「测试通过了」")
+                             "见证门却判**绿** ⇒ 它还是只看「测试通过了」"
+                             + _证91(_r91b))
             elif "【R91】" not in (_r91b.stdout or b"").decode("utf-8", "replace"):
                 fails.append("【R91】★ 判红了但没点名 R91（红错地方 = 无齿）")
             # ③ ★ 边界：名字**没点名**任何接口 ⇒ **不适用**（零回退，不猜意图）
@@ -14341,9 +15586,27 @@ def _selftest() -> int:
     #   它在无人值守里就是**概率生效**的 —— 这等于没有。
     try:
         # ① 真跑那种**人工**目标：`路径:行号` 精确点名一个已存在文件 ⇒ 必须补上
-        _人工87 = ("把 src/模块甲/模块丙.rs:165 里那个判据接上生产路径，"
-                   "让它真的参与裁决。")
-        _补87 = _补必改标记(_人工87)
+        # ★ R538e：① ② 都要求 `src/模块甲/模块丙.rs` **真的在盘上**
+        #   （`_补必改标记` 里有 `(REPO_ROOT/记).is_file()` 这一跳，防幻觉路径）。
+        #   而本仓库 `src/模块甲/` 不存在 ⇒ 实得"没补上"**不是产品缺陷**
+        #   ⇒ 先造临时仓再判（与【R32】同一手法，不动真实仓库）。
+        import tempfile as _tf87
+        import shutil as _sh87
+        _根87 = Path(_tf87.mkdtemp(prefix="r87_"))
+        _存87 = globals().get("REPO_ROOT")
+        try:
+            (_根87 / "src" / "模块甲").mkdir(parents=True)
+            (_根87 / "src" / "模块甲" / "模块丙.rs").write_bytes(b"pub fn f() {}\n")
+            globals()["REPO_ROOT"] = _根87
+            _人工87 = ("把 src/模块甲/模块丙.rs:165 里那个判据接上生产路径，"
+                       "让它真的参与裁决。")
+            _补87 = _补必改标记(_人工87)
+        finally:
+            if _存87 is None:
+                globals().pop("REPO_ROOT", None)
+            else:
+                globals()["REPO_ROOT"] = _存87
+            _sh87.rmtree(_根87, ignore_errors=True)
         if "【必改文件】src/模块甲/模块丙.rs" not in _补87:
             fails.append(f"【R87】★ 人工目标点名 `模块丙.rs:165`（已存在），"
                          f"却**没补上必改标记** ⇒ R86 那条判据对它等于不存在")

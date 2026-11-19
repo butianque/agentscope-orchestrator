@@ -116,3 +116,6 @@ leanprobe_*/
 ls_lock_*/
 kb判据-*/
 _pV_*/
+
+# 知识图谱生成缓存（约 10 MB，可重建）
+src/.kg/

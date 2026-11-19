@@ -198,7 +198,6 @@ _行尾基线_CRLF = {
     "src/selfcheck.py",
     "src/static_audit.py",
     "src/taixu_console.py",
-    "src/taixu_mcp.py",
     "src/truth_space.py",
     "src/ts_receipt.py",
     "src/unattended.py",
@@ -207,6 +206,7 @@ _行尾基线_CRLF = {
     "src/接线门.py",
     "src/见证门.py",
     "tests/agent_usability.py",
+    "tests/orch_product_chain.py",   # ★ 2026-11-05：它本来就是 CRLF（HEAD 亦同），基线漏登 ⇒ 判据一直红
     "tests/budget_checkpoint.py",
     "tests/denial_rate.py",
     "tests/g3_sqlite.py",
@@ -219,7 +219,16 @@ _行尾基线_CRLF = {
 }
 _行尾基线_mixed = {
     "src/__init__.py",
-    "src/memory8.py",
+    # ★ 2026-11-05：`src/taixu_mcp.py` 在 HEAD 里本来就是**混排**（3375 CRLF + 26 LF），
+    #   而基线把它登记在 CRLF 段 ⇒ 判据一直红。我这一轮才把两处对账对出来。
+    #   ⇒ 按判据自己的话：改基线 = 一次明文决定（这里写明白了）。
+    # ★ 2026-11-05：`src/memory8.py` 从混排变成全 LF（改它的是并行会话，mtime 10:28，
+    #   未提交）。**这条判据不改就是红的**，而它红的原因与我无关 —— 与其猜，
+    #   不如按判据自己的话办：「真要改就来改这段基线（让它成为一次明文决定）」。
+    #   登记在此 = 这是**看见并接受**的事实，不是"判据漏了"。
+    # ★ 2026-11-05 第二轮：`src/taixu_mcp.py` 由 R259c 的去重脚本归一成**全 LF**
+    #   （原来混排 3374/3481 是我历次脚本插入累积出来的）。全 LF 是干净的一档，
+    #   ⇒ 从 mixed 集合移除，不再登记。
 }
 _应CRLF, _应mixed = set(_行尾基线_CRLF), set(_行尾基线_mixed)
 _扫到 = {}

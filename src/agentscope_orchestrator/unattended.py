@@ -698,6 +698,10 @@ def _自检() -> int:
 
 
 def main(argv=None) -> int:
+    # ★ R548：`orch-run` 也 import `taixu_mcp`，所以状态根同样只在**进程入口**设。
+    import os as _os548
+    if not _os548.environ.get("ORCH_STATE_DIR"):
+        _os548.environ["ORCH_STATE_DIR"] = str(tm.STATE)
     ap = argparse.ArgumentParser(
         description="示例编排器 · 无人值守入口（不依赖 MCP 服务器）",
         # ★★★★★ R58（真跑抓出 · 2026-10-16）：关掉**前缀缩写**。
