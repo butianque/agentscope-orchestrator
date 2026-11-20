@@ -15,6 +15,7 @@ cache/
 jobs/
 products/
 work/
+checks/
 _smoke_state/
 tests/_run_all_state/
 
@@ -43,9 +44,14 @@ __pycache__/
 *.pyc
 *.pyo
 
-# 打包中间物（wheel 本体在 dist/ 里，属于交付物，**不**忽略）
+# 打包中间物（wheel 本体在 dist/orchestrator-<版本>/ 里，属于交付物，**不**忽略）
 packaging/build/
 *.egg-info/
+# ★ R556：`dist/wheels/` 是 `打wheel.py` 的**暂存区**（历史遗留），不是交付物。
+#   交付物是 `dist/orchestrator-<版本>/`（含自己的 wheels/ 子目录 + SHA256SUMS）。
+#   实测：不忽略时每打一次轮子就多一个 `??`，混在"注入留残为零"的核对里很难看
+#   （2026-11-20 真撞上：4 个未跟踪的 .whl 被读成"留残"）。
+dist/wheels/
 
 # 自检/判据引擎在被测仓 cwd 下造的临时目录（`%TEMP%` 不可写时会回落到 cwd）
 orch-selfcheck-*/
@@ -117,5 +123,25 @@ ls_lock_*/
 kb判据-*/
 _pV_*/
 
-# 知识图谱生成缓存（约 10 MB，可重建）
+# 知识图谱生成缓存（约 10 MB，可重建；不进版本库）
 src/.kg/
+
+# ★ R592：包根运行期残渣的**类别**（每次跑都会再生，逐个删是循环）
+#   真读数（2026-11-21）：pip-metadata-* ×45、pip-unpack-* ×46、orch_gate_*.lock ×11、
+#   r91_*、.kb_autoseed、kb/_index.json、blind_spots/、chain/、checkpoints/、slots/。
+#   100+ 个 `??` 会把真改动淹掉 —— 这次 `tools/安全改写.py` 这个**新交付物**
+#   就混在残渣里差点没提交。噪声也是缺陷。
+pip-metadata-*/
+pip-unpack-*/
+orch_gate_*.lock
+r91_*/
+.kb_autoseed
+kb/_index.json
+blind_spots/
+chain/
+checkpoints/
+slots/
+# 每次 CI 跑出的回执（`receipts/` 里已跟踪的 538 个历史回执是交付内容，忽略规则对它们无效）
+receipts/ci-*.json
+receipts/ci-*.md
+memory8.sqlite3

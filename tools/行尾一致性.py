@@ -185,7 +185,7 @@ def main() -> int:
     if 失败:
         print(f"判定=不达标（{len(失败)} 个文件）")
         print("  修法：改文件必须 `read_bytes → decode → 改 → encode → write_bytes`，")
-        print("        并**还原成原行尾**；仓里已有现成工具 `work/R536/安全改写.py`（`替换()`）。")
+        print("        并**还原成原行尾**；仓里已有现成工具 `tools/安全改写.py`（`替换()`）。")
         return 1
     态 = "判定=OK" if not 只判纯度 else "判定=OK（② 未验）"
     print(f"{态}；{len(文件)} 个文件行尾纯净 · 与 git 期望形态一致 · 无双重翻译")

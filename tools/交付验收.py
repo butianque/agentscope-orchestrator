@@ -174,7 +174,14 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     #   ③不许出现 `\r\r\n`（write_text 事故指纹）。
     dict(id="56", 名="行尾一致性（纯 CRLF 或纯 LF · 与 HEAD 一致 · 无双重翻译）",
          argv=["python", "tools/行尾一致性.py"], expect="zero",
-         must=["判定=OK", "没有文件的行尾被改动", "0 处"], max_s=180),
+         must=["判定=OK", "与 git 期望形态一致", "0 处"], max_s=180),
+    # ★ #57 文档脚本可达（R591 · 2026-11-21 加入）：文档点名的**脚本**必须存在且随仓走。
+    #   两次真事故同一个根因：文档/判据依赖的东西住在**不会随仓走**的目录里
+    #   （R584 登记表放 work/；R591 改写器放 work/R536/）。
+    #   只判脚本后缀（运行期产物 .json/.jsonl 不判），不判 `src/`（那是目标仓的路径）。
+    dict(id="57", 名="文档脚本可达（点名的脚本存在 ∧ 已进 git）",
+         argv=["python", "tools/文档脚本可达.py"], expect="zero",
+         must=["判定=OK", "全部可达"], max_s=120),
     # ★ #49 离线装可用（2026-11-19 加入）：install.ps1 承诺"从 wheels/ 离线装（不联网也能装）"，
     #   但 wheels/ 里只有编排器自己的轮子 ⇒ 干净机器上离线装装出 doctor=64（缺 pyyaml/httpx/mcp）。
     #   判据：#46/#48 都只测"已装/部署目录"，没人测"按发货承诺装一遍能不能用" —— 这就是那一栏。
@@ -253,6 +260,30 @@ def _规约文件() -> pathlib.Path:
     return 文
 
 
+# ★ R586：Windows 的 NTSTATUS 退出码在十进制下完全不可读（0xC000013A = 3221225786）。
+#   实测：`#5` 报「退出码 3221225786」，单看这个数字**查不出下一步该做什么** ——
+#   而它其实是 STATUS_CONTROL_C_EXIT（被外部终止），单独重跑同一条就 PASS 353.6s。
+#   ⇒ 退出码后面直接跟上含义；认不出的照实写「未收录」（不猜）。
+_退出码含义 = {
+    3221225786: "0xC000013A = STATUS_CONTROL_C_EXIT：**被外部终止**（Ctrl+C / 控制台关闭 / 上层杀进程）"
+                "⇒ 不是它自己算错，先看是不是并发跑或被杀",
+    3221225477: "0xC0000005 = STATUS_ACCESS_VIOLATION（段错误）",
+    3221225725: "0xC00000FD = STATUS_STACK_OVERFLOW",
+    3221226505: "0xC0000409 = STATUS_STACK_BUFFER_OVERRUN（快速失败）",
+    -9: "被本判据按墙钟上限杀掉（口径 390）",
+    -1: "进程未能启动或被信号终止",
+}
+
+
+def _退出码(rc: int) -> str:
+    """`rc` 的十进制 + 十六进制 + 含义（认不出就写未收录，不猜）。"""
+    if rc in _退出码含义:
+        return f"{rc}（{_退出码含义[rc]}）"
+    if rc < 0 or rc >= 0xC0000000:
+        return f"{rc}（0x{rc & 0xFFFFFFFF:08X} · 含义未收录 ⇒ 别猜，把 .out/.err 原文贴出来）"
+    return str(rc)
+
+
 def _跑(项: dict, 全新根: pathlib.Path) -> tuple[str, str, float, str]:
     """返回 (判定, 摘要, 秒, 日志路径后缀)。判定 ∈ PASS/FAIL/未验。"""
     名 = str(项["argv"][0])
@@ -282,7 +313,15 @@ def _跑(项: dict, 全新根: pathlib.Path) -> tuple[str, str, float, str]:
         with so.open("wb") as fo, se.open("wb") as fe:
             p = subprocess.Popen([str(_exe(名)), *argv[1:]], stdout=fo, stderr=fe,
                                  stdin=subprocess.DEVNULL, cwd=str(包根), env=环,
-                                 creationflags=0x00000008 | 0x00000200)
+                                 # ★ 0x8 = DETACHED_PROCESS ⇒ 子进程**没有控制台**；
+                                 #   而子进程内部（21 处 subprocess 调用，全部默认 flags）再起
+                                 #   孙进程时，Windows 会给孙进程**新建一个可见控制台** ⇒
+                                 #   每跑一条用例弹一个空黑窗（里面没内容是因为输出已重定向到
+                                 #   .out/.err）。47 条底线 ⇒ 几十次弹窗。
+                                 #   改成 CREATE_NO_WINDOW(0x8000000)：子进程有一个**隐藏**控制台，
+                                 #   孙进程**继承**它而不再新建 ⇒ 整条链一个窗口都不弹，
+                                 #   21 处调用点一行都不用改。Ctrl+C 免疫由 0x200 保留。
+                                 creationflags=0x08000000 | 0x00000200)
             rc = p.wait(timeout=float(项["max_s"]))
         超 = False
     except subprocess.TimeoutExpired:
@@ -306,7 +345,7 @@ def _跑(项: dict, 全新根: pathlib.Path) -> tuple[str, str, float, str]:
         _尾 = [l.strip() for l in 出.splitlines() if l.strip()]
         _尾 = [l for l in _尾 if not l.startswith("  ")] or _尾
         _证 = (" ｜ " + " ⏎ ".join(_尾[-3:]))[:420] if _尾 else ""
-        return "FAIL", f"退出码 {rc}（期望 {'0' if 项['expect'] == 'zero' else '非 0'}）{_证}", dt, 标
+        return "FAIL", f"退出码 {_退出码(rc)}（期望 {'0' if 项['expect'] == 'zero' else '非 0'}）{_证}", dt, 标
     缺 = [m for m in 项.get("must", []) if m not in 出]
     if 缺:
         return "FAIL", f"退出码对，但关键读数缺失：{缺}", dt, 标

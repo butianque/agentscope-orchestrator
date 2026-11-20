@@ -166,6 +166,51 @@ def check_deps() -> None:
         "已装" if u.find_spec("agentscope") else "未装（仅当用 agentscope 后端时需要）")
 
 
+# ★ R589：工程仓的**可判**标志 = 有清单文件（不猜目录名、不看有没有 .git）
+_工程清单 = (
+    "pyproject.toml", "setup.py", "Cargo.toml", "package.json", "go.mod",
+    "pom.xml", "build.gradle", "build.gradle.kts", "CMakeLists.txt", "Makefile",
+    "setup.cfg", "meson.build",
+)
+
+
+def _是工程仓(根: "Path | None") -> bool:
+    """`根` 下有没有工程清单文件（含一层子目录）。"""
+    if 根 is None:
+        return False
+    try:
+        if not 根.is_dir():
+            return False
+    except OSError:
+        return False
+    for 名 in _工程清单:
+        try:
+            if (根 / 名).is_file():
+                return True
+        except OSError:
+            continue
+    try:
+        for 子 in 根.iterdir():
+            if not 子.is_dir() or 子.name in (".git", ".venv", "node_modules", "__pycache__"):
+                continue
+            for 名 in _工程清单:
+                try:
+                    if (子 / 名).is_file():
+                        return True
+                except OSError:
+                    continue
+    except OSError:
+        return False
+    # 有 profile 文件也算（用户显式声明过工程档案）
+    try:
+        for 名 in ("orchestrator.profile.yml", "orchestrator.profile.yaml"):
+            if (根 / 名).is_file():
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def check_profile() -> None:
     if importlib.util.find_spec("yaml") is None:
         _行("profile", None, "跳过（缺 yaml，先装依赖）")
@@ -178,7 +223,16 @@ def check_profile() -> None:
         rr = getattr(pf, "repo_root", "")
         _行("repo_root", bool(str(rr).strip()), f"{rr}")
         门 = list(getattr(pf, "gates", []) or [])
-        _行("gates", bool(门), f"{len(门)} 条" + ("" if 门 else " ⇒ 没判据门，跑起来不知道什么叫'成'"))
+        # ★ R589：gates 属于**工程仓**，不属于安装目录。
+        #   在安装目录里跑 doctor 时 `gates 0 条` 是一条**永远修不掉**的假红
+        #   （安装目录按设计就不该有 gates）⇒ 先判 `repo_root` 是不是工程仓，
+        #   不是就判「不适用」并说清该去哪儿跑。清单文件是**可判**的，不猜目录名。
+        if not _是工程仓(Path(str(rr)) if str(rr).strip() else None):
+            _行("gates", None,
+                f"{len(门)} 条 ⇒ **不适用**：`repo_root` 不是工程仓（像安装目录/空目录）。"
+                f"gates 属于被编排的工程 ⇒ 到目标仓里跑 `orch-doctor` 才会判它")
+        else:
+            _行("gates", bool(门), f"{len(门)} 条" + ("" if 门 else " ⇒ 没判据门，跑起来不知道什么叫'成'"))
         允许 = list(getattr(pf, "gate_cmd_whitelist", []) or [])
         _行("whitelist", None, f"{允许 or '（未声明 ⇒ 门命令不受限，建议声明）'}")
     except Exception as e:                       # noqa: BLE001

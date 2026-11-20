@@ -42,19 +42,27 @@ sys.path.insert(0, str(包根 / "src"))
 )
 
 
-def _全仓lean名(根: pathlib.Path) -> dict[str, list[str]]:
-    """basename(小写) → 全仓相对路径们。只用于**存在性**判断（不剪枝，只排 .git）。"""
-    表: dict[str, list[str]] = {}
-    for dp, dn, fn in __import__("os").walk(根):
-        dn[:] = [d for d in dn if d != ".git"]
+# ★ R588：剪枝**只许剪 `.git`**。实测剪 `target` 会丢 2 个真名字
+#   （`target/_tmp/ax_ko.lean`、`形式化验证/formal_proof/target/_tmp/probe_139_mine.lean`）
+#   ⇒ 「全仓有该名」变假 ⇒ 悬空项错判成「★真缺」⇒ **假红**（口径 311：假红比漏报更坏）。
+#   提速靠下面两条**语义等价**的改动，不靠剪枝。
+_无lean目录 = {".git"}
+
+
+def _全仓lean名(根: pathlib.Path) -> set[str]:
+    """全仓所有 `.lean` 的 **basename（小写）集合**。只用于**存在性**判断。
+
+    ★ R587：以前返回 `dict[basename, list[相对路径]]`，但调用方只用
+      `in` / `set(...)` —— 那个路径列表**一次都没被读过**，
+      而建它（14.5 万次 `relative_to` + `as_posix`）正是 145s 的大头。
+      现在只建 set，并改用字符串遍历（实测 2x）。
+    """
+    表: set[str] = set()
+    for dp, dn, fn in __import__("os").walk(str(根)):
+        dn[:] = [d for d in dn if d not in _无lean目录]
         for f in fn:
-            if f.lower().endswith(".lean"):
-                p = pathlib.Path(dp) / f
-                try:
-                    相对 = p.relative_to(根).as_posix()
-                except ValueError:
-                    continue
-                表.setdefault(f.lower(), []).append(相对)
+            if f[-5:].lower() == ".lean":
+                表.add(f.lower())
     return 表
 
 
@@ -79,14 +87,22 @@ def main() -> int:
     from agentscope_orchestrator import mem_live as _ml
     from agentscope_orchestrator import profile as _pf
 
+    import time as _t
+    _段: list[tuple[str, float]] = []
+    _t0 = _t.time()
+
     档 = _pf.get_profile()
     根 = pathlib.Path(getattr(档, "repo_root", None) or 包根).resolve()
+    _段.append(("profile", _t.time() - _t0)); _t0 = _t.time()
     _ml.确保载入()
     表 = _ml.现存()
+    _段.append(("mem_live", _t.time() - _t0)); _t0 = _t.time()
     lean名 = _全仓lean名(根)
+    _段.append(("全仓lean名", _t.time() - _t0)); _t0 = _t.time()
 
     果 = _ma.扫锚定(根, ["src"], ["形式化验证"], 跳过={".git", ".venv", "target", "node_modules"},
-                   样例=10 ** 6, 表=表, 全仓lean名=set(lean名))
+                   样例=10 ** 6, 表=表, 全仓lean名=lean名)
+    _段.append(("扫锚定", _t.time() - _t0)); _t0 = _t.time()
     悬 = 果.get("悬空锚定（点了一个不存在的.lean）", {}).get("样例") or []
     悬挂条数 = int(果.get("悬空锚定（点了一个不存在的.lean）", {}).get("条数") or 0)
 
@@ -123,6 +139,8 @@ def main() -> int:
 
     总数 = sum(len(v) for v in 归类.values())
     守恒 = (总数 == 悬挂条数)
+    print("耗时：" + " · ".join(f"{k} {v:.1f}s" for k, v in _段)
+          + f" · 全仓lean名 {len(lean名)} 个")
     print(f"悬空锚定={悬挂条数} · 归类总数={总数} · 守恒={'平' if 守恒 else '不平'}")
     for k, v in sorted(归类.items(), key=lambda kv: -len(kv[1])):
         print(f"   {len(v):3d}  {k}")
@@ -141,7 +159,7 @@ def main() -> int:
         名 = 写到.split("/")[-1]
         rs = str(e.get("rs") or "")
         # ① 文件存在（按相对路径或 basename 在全仓能定位）
-        存在 = (根 / 写到).is_file() or bool(lean名.get(名.lower()))
+        存在 = (根 / 写到).is_file() or (名.lower() in lean名)
         # ② 点名在活代码里（不在注释里）
         行们 = _行们(根 / rs, 名) if rs else []
         活 = any(not c for _, c in 行们)
