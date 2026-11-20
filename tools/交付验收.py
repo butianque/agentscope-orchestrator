@@ -275,7 +275,13 @@ def _跑(项: dict, 全新根: pathlib.Path) -> tuple[str, str, float, str]:
         return "FAIL", f"超过 {项['max_s']}s 未到终态（口径 390：慢的机制等于没有的机制）", dt, 标
     好 = (rc == 0) if 项["expect"] == "zero" else (rc != 0)
     if not 好:
-        return "FAIL", f"退出码 {rc}（期望 {'0' if 项['expect'] == 'zero' else '非 0'}）", dt, 标
+        # ★★★★★ R551：**FAIL 摘要必须自带证据。**
+        #   真事故：批量里 #42 报「退出码 1」，而它的 .err 被我同时跑的另一趟覆盖了
+        #   ⇒ 事后完全查不出原因，只能重跑。判据不能要求人**事后复现**才拿到证据。
+        _尾 = [l.strip() for l in 出.splitlines() if l.strip()]
+        _尾 = [l for l in _尾 if not l.startswith("  ")] or _尾
+        _证 = (" ｜ " + " ⏎ ".join(_尾[-3:]))[:420] if _尾 else ""
+        return "FAIL", f"退出码 {rc}（期望 {'0' if 项['expect'] == 'zero' else '非 0'}）{_证}", dt, 标
     缺 = [m for m in 项.get("must", []) if m not in 出]
     if 缺:
         return "FAIL", f"退出码对，但关键读数缺失：{缺}", dt, 标
@@ -426,6 +432,90 @@ def _写读数(结果: list, *, 完成: bool) -> None:
     ), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _进程在(pid: int) -> bool:
+    """这个 pid 现在还在不在。**探活不许靠外部程序。**
+
+    ★ R551b：原来用 `tasklist /FI "PID eq N" /NH` + `stdout.count(str(pid))`：
+      ① 外部程序 + 本地化输出（中文系统列名/分隔都不同）；
+      ② `count(pid)` 会被**内存列**里的数字撞上 ⇒ 判活不可靠；
+      ③ 更要命：撞不上时它**返回 False 而不是抛异常** ⇒ 那个
+         `except: _活 = True`（保守当活）**根本不生效** ⇒ 静默接管。
+      实测：我拿一把活 pid 的假锁去测，它没认出活锁、直接接管并把整趟
+      `--快` 验收跑起来了（10 分钟后我才发现）。
+      **判据的"安全兜底"挂在一条不会触发的分支上** —— 这是本项目的老病。
+    ⇒ 用 `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`：句柄非 0 ⇒ 在。
+      探不了（非 Windows / 调用失败）⇒ **保守当活**（拒跑）：
+      "误拒跑"的代价是等一会儿，"误接管"的代价是**读数不可信**。
+    """
+    if pid <= 0:
+        return False
+    try:
+        import ctypes
+        _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        k32 = ctypes.windll.kernel32                       # type: ignore[attr-defined]
+        h = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return False                                   # 打不开 = 不存在
+        try:
+            return True
+        finally:
+            k32.CloseHandle(h)
+    except Exception:                                      # noqa: BLE001
+        return True                                        # 探不了 ⇒ 保守当活
+
+
+def _拿锁() -> "object | None":
+    """同一包根**同时只许一趟**验收。拿不到 ⇒ 返回 None（调用方拒跑）。
+
+    ★★★★★ R551：为什么必须拒跑而不是"两趟并行"。
+      真事故（2026-11-20 13:33）：我一边等全量验收，一边手动跑 `--只 42` 复现；
+      两个进程同时写 `work/工具面契约.json` 与 `42.out`/`42.err`
+      ⇒ 其中一趟读到另一趟的中间态 ⇒ **假红**（42 报退出码 1，单独跑 5 次全绿）。
+      **假红比漏报更坏**（口径 311）：它教人忽略红灯。
+      ⇒ 工具必须让「并发跑」**做不到**，而不是靠人记得。
+    ★ 陈旧锁自动接管：写 pid + 启动时间；pid 已不在 ⇒ 视为上一趟崩了，接管。
+      否则一次崩溃就把验收永久锁死。
+    """
+    import json as _j
+    锁 = 日志根 / "_交付验收.lock"
+    try:
+        日志根.mkdir(parents=True, exist_ok=True)
+    except OSError as _e:
+        # ★ R551b：**不许静默放行**。建不出锁目录 = "我不知道有没有别人在跑"，
+        #   不是"没有别人在跑"。放行可以（可跑性优先），但必须说出来。
+        print(f"○ 锁目录建不出来（{_e}）⇒ 本趟**无法防止并发**，读数可能与另一趟互相覆盖")
+        return object()
+    if 锁.exists():
+        try:
+            旧 = _j.loads(锁.read_text(encoding="utf-8"))
+            _pid = int(旧.get("pid") or 0)
+        except Exception:                  # noqa: BLE001 坏锁 ⇒ 当陈旧
+            _pid = 0
+        _活 = _进程在(_pid)
+        if _活:
+            print(f"✗ 另一趟验收正在跑（pid {_pid}，锁 {锁}）")
+            print("  ⇒ **拒绝并发跑**：两趟会互相覆盖 work/*.json 与 .out/.err，")
+            print("     跑出来的读数不可信 —— 假红比漏报更坏（口径 311）。")
+            print("     等它结束；若确认它已死，删掉那把锁再跑。")
+            return None
+        print(f"○ 接管陈旧锁（pid {_pid} 已不在）")
+    try:
+        锁.write_text(_j.dumps({"pid": os.getpid(),
+                              "起": time.strftime("%Y-%m-%d %H:%M:%S")},
+                             ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+    return 锁
+
+
+def _放锁(锁) -> None:
+    try:
+        if 锁 is not None and hasattr(锁, "unlink"):
+            锁.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def main() -> int:
     快 = "--快" in sys.argv
     # ★ `--只 11,38,45`：只跑指定用例。本轮三条红要逐条复验，
@@ -442,7 +532,16 @@ def main() -> int:
     if _污:
         print(_污)
     print()
+    _锁 = _拿锁()
+    if _锁 is None:
+        return 2
+    try:
+        return _跑全套(快, _只)
+    finally:
+        _放锁(_锁)
 
+def _跑全套(快: bool, _只: list[str]) -> int:
+    """原来的 main 主体（拆出来是为了让锁能 finally 释放）。"""
     # ── 表与章程一致性（防止"章程写一套、脚本跑另一套"）
     章 = 章程.read_text(encoding="utf-8", errors="replace") if 章程.is_file() else ""
     缺id = [x["id"] for x in 底线表 if x["id"].rstrip("abcd") not in 章]

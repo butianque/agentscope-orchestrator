@@ -87,14 +87,31 @@ def main() -> int:
     else:
         条数 = int(验.get("条数") or 0)
         过 = int(验.get("PASS") or 0)
+        # ★ R550e：原始三数（自洽校验用）。
         败 = int(验.get("FAIL") or 0)
         未 = int(验.get("未验") or 0)
-        if 败:
-            坏.append(f"全量判据有 {败} 条 FAIL")
-        if 未:
-            未验.append(f"全量判据有 {未} 条未验")
+        # ★ R550：元判据（51/52/53）不许自己判自己 —— 见 `仓内生产力.py` 同处注释。
+        #   它们量的是**度量 apparatus**，不是产品行为；互相计入判定会「一趟红 ⇒ 永远红」。
+        _元判据550 = {"51", "52", "53"}
+        _明细550 = list(验.get("明细") or [])
+        _非元550 = [x for x in _明细550 if str(x.get("id")) not in _元判据550]
+        _仪器红550 = [x for x in _明细550 if str(x.get("id")) in _元判据550
+                      and str(x.get("态")) != "PASS"]
+        # ★ R550d：`条数` 是规模量，不许被过滤改写；判定用独立的 判过/判败/判未。
+        if _非元550:
+            判过 = sum(1 for x in _非元550 if str(x.get("态")) == "PASS")
+            判败 = sum(1 for x in _非元550 if str(x.get("态")) == "FAIL")
+            判未 = sum(1 for x in _非元550 if str(x.get("态")) == "未验")
+        else:
+            判过, 判败, 判未 = 过, 败, 未
+        if 判败:
+            坏.append(f"全量判据有 {判败} 条 FAIL")
+        if 判未:
+            未验.append(f"全量判据有 {判未} 条未验")
         if 过 + 败 + 未 != 条数:
             坏.append(f"读数自相矛盾：{过}+{败}+{未} != {条数}")
+        if len(验.get("明细") or []) > 条数:
+            坏.append(f"明细 {len(验.get('明细') or [])} 条 > 条数 {条数}")
 
     # ② 门区分力
     抓 = 注 = 具 = 0
@@ -184,7 +201,12 @@ def main() -> int:
     输出.parent.mkdir(parents=True, exist_ok=True)
     输出.write_text("\n".join(行) + "\n", encoding="utf-8")
 
-    print(f"   ① 全量判据 = {条数} 条 · PASS {过} · FAIL {败} · 未验 {未}")
+    print(f"   ① 全量判据 = {条数} 条（其中非元判据 {len(_非元550) or 条数} 条）"
+          f" · PASS {判过} · FAIL {判败} · 未验 {判未}")
+    if _仪器红550:
+        print("   ①b **仪器红（元判据 51/52/53）** = "
+              + " · ".join(f"{x.get('id')} {x.get('态')}" for x in _仪器红550)
+              + "（照实列出；**不计入**判定 —— 仪器不许自己判自己）")
     print(f"   ② 门区分力 = 抓住 {抓}/{注} · 门具 {具} 个")
     print(f"   ③ 人工交互点 = {交互 if 交互 is not None else '未验'}")
     print(f"   ④ 工具面契约 = {工具数} 个工具")
