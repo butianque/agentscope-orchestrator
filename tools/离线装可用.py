@@ -147,6 +147,58 @@ def main() -> int:
         return 1
     print(f"   ④ MCP 协议真握手 {len(工具们)} 个工具")
 
+    # ★ R593：装成包之后，**"东西该放哪"不许算到代码目录**。
+    #   这一族错已经犯过两次（R578 配置 / R593 临时落点），两次都是
+    #   「源码树里对、装完错」，两次都只在真装一遍时暴露 ⇒ 必须机器判。
+    形态 = subprocess.run(
+        [str(vpy), "-c",
+         "import json, sys\n"
+         "from agentscope_orchestrator import temp_guard as tg\n"
+         "print('LANDING=' + json.dumps({\n"
+         "  '包根': str(tg.包根),\n"
+         "  '落点根': str(tg._落点根()),\n"
+         "  '自有目录': str(tg.自有目录()),\n"
+         "}, ensure_ascii=False))"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", env=环, timeout=300)
+    形 = {}
+    for ln in (形态.stdout or "").split("\n"):
+        if ln.startswith("LANDING="):
+            try:
+                形 = json.loads(ln[len("LANDING="):])
+            except Exception:                                    # noqa: BLE001
+                形 = {}
+    if not 形:
+        print(f"   ✗ 装成包后取不到落点（{((形态.stderr or 形态.stdout) or '')[-400:]}）")
+        return 1
+
+    落点 = 形["落点根"].replace("\\", "/").lower()
+    自有 = 形["自有目录"].replace("\\", "/").lower()
+    坏 = []
+    if "site-packages" in 落点:
+        坏.append(f"落点根在 site-packages 里：{形['落点根']}")
+    if "/.venv/lib" in 落点 or "/.venv/lib/" in 落点 + "/":
+        坏.append(f"落点根在 .venv/Lib 里：{形['落点根']}")
+    if "site-packages" in 自有:
+        坏.append(f"自有目录在 site-packages 里：{形['自有目录']}")
+    # ③ 自有目录必须真的在部署根下（部署根 = 含 .venv 的那个目录）
+    if not 自有.startswith(落点.rstrip("/") + "/"):
+        坏.append(f"自有目录不在落点根下：{形['自有目录']}")
+    # ② 装完之后 site-packages / .venv/Lib 下不许冒出运行期目录
+    for 代码目录 in (vdir / "Lib" / "site-packages", vdir / "Lib"):
+        if not 代码目录.is_dir():
+            continue
+        for 名 in ("work", "config", "临时", "orch-tmp"):
+            if (代码目录 / 名).exists():
+                坏.append(f"装完在代码目录里冒出了 {代码目录.name}/{名}")
+
+    if 坏:
+        print("   ✗ ⑤ 装成包后「东西该放哪」算错了（R578/R593 同族）：")
+        for x in 坏:
+            print(f"       · {x}")
+        print(f"       落点根={形['落点根']}  包根={形['包根']}")
+        return 1
+    print(f"   ⑤ 装成包后落点正确：落点根=部署根（不在 site-packages）· 自有目录={形['自有目录']}")
+
     判定 = "OK" if len(命令) >= 11 and len(工具们) >= 40 else "不达标"
     print(f"   判定={判定}")
     (包根 / "work" / "离线装.json").write_text(json.dumps(

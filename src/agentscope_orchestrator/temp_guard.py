@@ -143,6 +143,37 @@ def 诊断(*, 探候选: bool = True) -> dict:
     }
 
 
+def _落点根() -> Path:
+    """临时落点该建在**哪个根**下面 —— 装成包时必须离开 site-packages。
+
+    ★ R593（真读数，2026-11-21 03:05，从组织仓干净克隆离线装完第一次运行）：
+      ```
+      [orchestrator] 临时目录降级 -> .../.venv/Lib/work/临时/orch-tmp
+      .venv/Lib/work 存在 = True
+      ```
+      原因：`包根 = parents[2]`，源码树里正好是包目录，**装进 site-packages 后
+      变成 `.venv/Lib`** ⇒ 编排器往 venv 里拉了一个 `work/`。
+
+      ★ 这和 `gateway.py` **R578 是同一个错**（配置按 parents[2] 找 ⇒ 装完找不到）。
+        我在 R590 修临时落点时用的是同一个 `包根`，于是把同一个错又犯了一遍。
+      ⇒ 口径：**`包根` 只能用来算"源码树里的东西在哪"**；
+        凡是要算"东西该放哪"（配置、状态、临时），一律走部署根。
+
+    复用 `gateway._部署根()`（R578 已踩过两种布局），不重写：
+      · `.venv/Lib/site-packages/<包>` ⇒ 往上遇 `pyvenv.cfg`，其父目录是部署根；
+      · `<部署根>/.venv/...` ⇒ 往上遇含 `.venv` 子目录的目录，它就是部署根；
+      · 源码树（无 venv）⇒ 退回 `包根`（这时包根就是对的）。
+    """
+    try:
+        from .gateway import _部署根
+        根 = _部署根()
+        if 根 is not None:
+            return Path(根)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return 包根
+
+
 def 自有目录() -> Path:
     """编排器自己拥有、且**分区扫描本来就剪掉**的临时目录。
 
@@ -152,7 +183,7 @@ def 自有目录() -> Path:
       临时落点与真实文件混住，任何「清临时目录」的动作都会伤到真实文件。
       下沉之后：「清空临时目录」= 删 `orch-tmp` 整个子目录，**不可能**碰到 `work/临时/*.py`。
     """
-    return 包根 / "work" / "临时" / "orch-tmp"
+    return _落点根() / "work" / "临时" / "orch-tmp"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -306,7 +337,8 @@ def 钉住(*, 强制: bool = False, 仓外优先: bool = True,
 
     顺序（每一步都**先探可写**，探不过就换下一个）：
       ① 现有的 `TMPDIR`/`TEMP`/`TMP` 里第一个真可写的 —— 最不打搅机器原有安排；
-      ② `<包根>/work/临时` —— 编排器自己拥有，且 `work` 在剪枝表里。
+      ② `<落点根>/work/临时/orch-tmp` —— 编排器自己拥有，且 `work` 在剪枝表里。
+         ★ R593：`落点根` 源码树=包根，**装成包=部署根**（见 `_落点根()`）。
 
     `仓外优先=False` ⇒ 跳过 ①，直接用 ②。
     `只试` / `允许降级` 是给**自检**用的注入口：把候选换成一组必然不可写的路径、
@@ -357,12 +389,12 @@ def 钉住(*, 强制: bool = False, 仓外优先: bool = True,
         try:
             候选.mkdir(parents=True, exist_ok=True)
             理由 = _可写(候选)
-            试过.append({"来源": "包根/work/临时/orch-tmp", "路径": str(候选),
+            试过.append({"来源": "落点根/work/临时/orch-tmp", "路径": str(候选),
                          "结论": "可写" if not 理由 else 理由})
             if not 理由:
                 选定, 为何 = 候选, "系统临时目录全不可写 ⇒ 降级到编排器自己的目录"
         except OSError as e:
-            试过.append({"来源": "包根/work/临时/orch-tmp", "路径": str(候选),
+            试过.append({"来源": "落点根/work/临时/orch-tmp", "路径": str(候选),
                          "结论": f"建不出来：{type(e).__name__}: {e}"})
 
     if 选定 is None:
