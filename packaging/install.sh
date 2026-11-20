@@ -42,8 +42,8 @@ echo "· 安装 $(basename "$WHL")（wheels/ 共 $(ls -1 wheels/*.whl 2>/dev/nul
 #   （install.sh 原本没写 --no-deps，是靠联网补依赖；离线机器上就装坏了）。
 "$VPY" -m pip install --no-cache-dir --disable-pip-version-check --no-index --find-links wheels --force-reinstall "$WHL"
 
-# ★ R553b：通道配置必须放到**部署根**（与 install.ps1 同源同修）。
-#   R553 之前它在「包内 config/」⇒ 任何 force-reinstall 都会把它删掉
+# ★ R578b：通道配置必须放到**部署根**（与 install.ps1 同源同修）。
+#   R578 之前它在「包内 config/」⇒ 任何 force-reinstall 都会把它删掉
 #   ⇒ 真读数：重装后「没有真实可用的模型通道（已探测 0 个）」。
 echo
 echo "· 通道配置"

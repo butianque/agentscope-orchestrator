@@ -62,7 +62,7 @@ _DSH_CREDENTIALS = Path.home() / ".dsh" / ".credentials.yaml"
 def _部署根() -> Path | None:
     """这个包装在哪个**部署目录**里（配置该住的地方，不是 site-packages）。
 
-    ★ R553：配置放 site-packages 里 ⇒ 每次 `pip install --force-reinstall`
+    ★ R578：配置放 site-packages 里 ⇒ 每次 `pip install --force-reinstall`
       （或任何"删包目录再解包"的升级）都会把它删掉。
       真事故：重装后通道全消失，报「没有真实可用的模型通道（已探测 0 个）」。
     两种布局都认：
@@ -96,11 +96,11 @@ def _找配置目录() -> Path | None:
     查找顺序（先到先得，全不存在 ⇒ None）：
       ① `ORCH_CONFIG_DIR` —— 用户显式指定；
       ② 源码树布局 `<包>/../../config`（开发态）；
-      ③ **部署根** `config/` —— ★ R553：配置**不许**住在 site-packages 里；
+      ③ **部署根** `config/` —— ★ R578：配置**不许**住在 site-packages 里；
       ④ 包内 `config/`（出厂样例，会被重装覆盖）；
       ⑤ 当前目录 `config/`（用户自己的工作目录）。
 
-    ★★★★★ R553（真事故 2026-11-20 15:20）：
+    ★★★★★ R578（真事故 2026-11-20 15:20）：
       部署流程是「删包目录 + 解包 wheel」，而 wheel 里**不含** `config/`
       （配置里有内网地址，不该打进发布包）⇒ **每次重装都把 channels.yml 一起删掉**
       ⇒ `RuntimeError: 没有真实可用的模型通道（已探测 0 个）`。

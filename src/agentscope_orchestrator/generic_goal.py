@@ -96,7 +96,7 @@ def _尽力建目录(路径, 名: str) -> None:
 
     ★ R543 / R543b / R544：本函数只是 `profile.尽力建目录` 的**薄壳**。
       口径：任何要落盘的地方**只调一个函数**（同一件事留两份实现，迟早会分叉 ——
-      `project_kb.库根()` 自己拼路径导致「写不了的根被显示成空的」就是这么来的，R549）。
+      `project_kb.库根()` 自己拼路径导致「写不了的根被显示成空的」就是这么来的，R574）。
     """
     prof_mod.尽力建目录(路径, 名)
 
@@ -925,7 +925,7 @@ def _增量应用(adopted: dict, 基线: frozenset, round_root: Path,
     # ★ R177：`回退详情` 是**出参**（追加），不改返回值 ⇒ 老调用点/老齿零影响。
     #   每一笔 = {文件, 因由, 新增违规点, 原有违规点}。
     #
-    # ★★★★★ R549：`主树` = 本函数**备份/落盘/判门**用的根。
+    # ★★★★★ R574：`主树` = 本函数**备份/落盘/判门**用的根。
     #   真事故（2026-11-20 12:28 生产冒烟，部署 venv）：主树工程的调用点传的是
     #   `self.round_root` ⇒ 备份副本、改副本、判副本 ⇒ **主树一个字节没改**，
     #   而门 `cwd: "{repo}"` 被展开成轮次目录 ⇒ `can't open file ...r1\gate.py`
@@ -3905,7 +3905,7 @@ def _score_gates(workdir: Path, file: Path, gates,
         if cwd is None or str(cwd) in ("", "."):
             g["cwd"] = str(repo_root if repo_root is not None else workdir)
         else:
-            # ★★★★★ R548：`{repo}` 是**语义占位符**（= 主树根），**永不**展开成副本。
+            # ★★★★★ R573：`{repo}` 是**语义占位符**（= 主树根），**永不**展开成副本。
             #
             #   真事故（2026-11-20 12:04，生产冒烟，部署 venv）：
             #     门 `cwd: "{repo}", cmd: ["python","gate.py"]`，
@@ -3922,7 +3922,7 @@ def _score_gates(workdir: Path, file: Path, gates,
             #     （R251b），它**只对不含 `{repo}` 的 cwd 生效**。
             _原串 = str(cwd)
             if "{repo}" in _原串:
-                # ★★★★★ R548b：**`{repo}` 只有一个定义：主树根。**
+                # ★★★★★ R573b：**`{repo}` 只有一个定义：主树根。**
                 #   `repo_root` 没传就回落模块级 `REPO_ROOT`（它本来就是主树根），
                 #   **绝不**回落到 `cwd_根` / workdir / 轮次目录。
                 #   真事故（12:13 生产冒烟）：门 `gate_exit_zero` 的 cwd 被展开成
@@ -3938,9 +3938,9 @@ def _score_gates(workdir: Path, file: Path, gates,
                             for _f in _tb548.extract_stack()[-5:-1])
                     except Exception:                    # noqa: BLE001
                         _栈548 = "（栈取不到）"
-                    # ★ R548c：本模块**没有** `logger`（它用 `_log = print`）——
+                    # ★ R573c：本模块**没有** `logger`（它用 `_log = print`）——
                     #   我凭印象写了别的模块的写法 ⇒ 齿当场报 NameError。
-                    _log(f"[generic] 【R548b】门的 cwd 引用了 {{repo}} 但没传 "
+                    _log(f"[generic] 【R573b】门的 cwd 引用了 {{repo}} 但没传 "
                          f"repo_root ⇒ 回落到主树根 {_根548}（**不是**轮次目录）。"
                          f"调用栈：{_栈548}")
                 g["cwd"] = _原串.replace("{repo}", _根548)
@@ -4462,7 +4462,7 @@ def _档案声明了主树门(档案门) -> bool:
 def _交付物落在主树(交付物) -> bool:
     """至少一个交付物**真的在主树里存在**（相对 REPO_ROOT，或本身就是绝对路径）。
 
-    ★ R547：这是「要不要改主树」的**可观测判据**。为什么不看「档案有没有门」——
+    ★ R572：这是「要不要改主树」的**可观测判据**。为什么不看「档案有没有门」——
       那只是**间接指标**：本包自己的档案就声明了 3 条门 ⇒ 若按它判，
       **自检环境里每个目标**都成了主树任务（真读数：`--selftest` 从全绿变失败 2）。
     """
@@ -4481,7 +4481,7 @@ def _交付物落在主树(交付物) -> bool:
 
 
 def _齿_R548(fails: list) -> None:
-    """`{repo}` 占位符只许展开成**主树根**（R548）。
+    """`{repo}` 占位符只许展开成**主树根**（R573）。
 
     ★ 真事故（2026-11-20 12:04，生产冒烟，部署 venv）：门 `cwd: "{repo}"` 被展开成
       **轮次副本** `...\\work\\calc_py_mul\\r2`，那里只有交付物、没有 `gate.py`
@@ -4514,7 +4514,7 @@ def _齿_R548(fails: list) -> None:
         _res548, _red548 = _score_gates(_副本548, _副本548 / "src" / "calc.py",
                                         _门548, repo_root=_根548, cwd_根=_副本548)
         if not _res548.get("gate_ok"):
-            fails.append("【R548】★ `{repo}` 被展开成**轮次副本** ⇒ 门在副本上跑、"
+            fails.append("【R573】★ `{repo}` 被展开成**轮次副本** ⇒ 门在副本上跑、"
                          "找不到主树里的文件 ⇒ 正确的修复被判「没进展」而回退"
                          f"（真报错：{str((_red548 or [{}])[0].get('err') or '')[:90]}）")
         # ② 反向：非主树任务（repo_root=None）时仍要能兜底，不许崩
@@ -4523,16 +4523,16 @@ def _齿_R548(fails: list) -> None:
                                       [dict(_门548[0])], repo_root=None,
                                       cwd_根=_副本548)
             if "gate_ok" not in _r2_548:
-                fails.append("【R548】★ 非主树任务（repo_root=None）下门没被求值 ⇒ 兜底坏了")
+                fails.append("【R573】★ 非主树任务（repo_root=None）下门没被求值 ⇒ 兜底坏了")
         except Exception as _e2_548:                     # noqa: BLE001
-            fails.append("【R548】★ 非主树任务（repo_root=None）下门求值抛异常："
+            fails.append("【R573】★ 非主树任务（repo_root=None）下门求值抛异常："
                          f"{type(_e2_548).__name__}: {_e2_548}")
     except Exception as _e548:                           # noqa: BLE001
-        fails.append("【R548】齿自身异常：%s: %s" % (type(_e548).__name__, _e548))
+        fails.append("【R573】齿自身异常：%s: %s" % (type(_e548).__name__, _e548))
 
 
 def _齿_R549(fails: list) -> None:
-    """主树工程的增量裁决必须跑在**主树**上（R549）。
+    """主树工程的增量裁决必须跑在**主树**上（R574）。
 
     ★ 真事故（2026-11-20 12:28 生产冒烟，部署 venv）：`_round` 里注释写着
       「备份 → **应用主树** → 判门」，实际调 `_增量应用(..., self.round_root, ...)`
@@ -4568,16 +4568,16 @@ def _齿_R549(fails: list) -> None:
             _增量应用({"src/calc.py": _新549}, frozenset({"占位违规点"}),
                       _副549, _交549, 主树=_主549)
         except Exception as _e549:                    # noqa: BLE001
-            fails.append(f"【R549】★ 带 `主树=` 调用 `_增量应用` 抛异常："
+            fails.append(f"【R574】★ 带 `主树=` 调用 `_增量应用` 抛异常："
                          f"{type(_e549).__name__}: {_e549}")
         else:
             _主文549 = (_主549 / "src" / "calc.py").read_text(encoding="utf-8")
             _副文549 = (_副549 / "src" / "calc.py").read_text(encoding="utf-8")
             if "a * b" not in _主文549:
-                fails.append("【R549】★ 传了 `主树=` 却**没改主树**（改动落在副本上）"
+                fails.append("【R574】★ 传了 `主树=` 却**没改主树**（改动落在副本上）"
                              " ⇒ 增量裁决仍在判沙箱、主树一个字节没改（假进展）")
             if "a * b" in _副文549:
-                fails.append("【R549】★ 传了 `主树=` 却**同时改了副本** ⇒ 两棵树都动，"
+                fails.append("【R574】★ 传了 `主树=` 却**同时改了副本** ⇒ 两棵树都动，"
                              "回滚会还原错的那棵")
         # ── 结构（AST）：生产调用点必须把 `主树=` 传进去 ────────────────
         _树549 = _ast549.parse(_P549(__file__).read_text(encoding="utf-8", errors="replace"))
@@ -4585,17 +4585,17 @@ def _齿_R549(fails: list) -> None:
                   if isinstance(n, _ast549.Call)
                   and getattr(n.func, "id", "") == "_增量应用"]
         if not _调549:
-            fails.append("【R549】★ 全仓**没有调用** `_增量应用` ⇒ 增量裁决失效")
+            fails.append("【R574】★ 全仓**没有调用** `_增量应用` ⇒ 增量裁决失效")
         else:
             _文549 = [_ast549.unparse(n) for n in _调549]
             if not any("主树=" in _w for _w in _文549):
-                fails.append("【R549】★ `_增量应用` 的调用**没传 `主树=`** ⇒ "
+                fails.append("【R574】★ `_增量应用` 的调用**没传 `主树=`** ⇒ "
                              f"主树工程仍会判副本（实参文本 {_文549[:1]}）")
             elif not any("repo_scope" in _w for _w in _文549):
-                fails.append("【R549】★ `主树=` 传了但**没跟 `repo_scope` 绑定** ⇒ "
+                fails.append("【R574】★ `主树=` 传了但**没跟 `repo_scope` 绑定** ⇒ "
                              "纯产物型任务也会去改主树")
     except Exception as _e549b:                           # noqa: BLE001
-        fails.append("【R549】齿自身异常：%s: %s"
+        fails.append("【R574】齿自身异常：%s: %s"
                      % (type(_e549b).__name__, _e549b))
 
 
@@ -4605,7 +4605,7 @@ def _detect_repo_scope(spec: dict, all_gates: list, 档案门=None, 交付物=No
     三路**任一成立**即主树工程：
       ① 规约顶层 `repo: true`；
       ② 任一（模型自撰的）判据门引用 `{repo}` 占位符；
-      ③ ★ R540/R547：**档案声明了项目验收门** 且 **至少一个交付物在主树里存在**。
+      ③ ★ R540/R572：**档案声明了项目验收门** 且 **至少一个交付物在主树里存在**。
 
     ★ 为什么需要 ③（真读数，2026-11-20 06:04 部署 venv，同一句命令跑两趟）：
       档案声明了 `gates: [gate_ok … cwd: "{repo}"]`，而第 1 趟模型自己派生的门
@@ -4614,7 +4614,7 @@ def _detect_repo_scope(spec: dict, all_gates: list, 档案门=None, 交付物=No
       第 2 趟模型换了一套门（含 `{repo}`）⇒ 进了主树路径 ⇒ rc=1。
       **同一句命令两趟两种行为，两趟都 rc=0/1 报得像回事** —— 这是「假成功」。
 
-    ★ 为什么 ③ 还要加「交付物在主树里存在」（R547，`--selftest` 抓出来的）：
+    ★ 为什么 ③ 还要加「交付物在主树里存在」（R572，`--selftest` 抓出来的）：
       只写「档案有门」太宽 —— 本包档案就声明了 3 条门 ⇒ **自检里每个目标**都被判成
       主树任务，而大量齿验的是**非主树路径**行为 ⇒ 自检从「全绿 · 失败 0」变成「失败 2」。
       判据要落在**可观测的东西**上（文件存不存在），不是落在**间接指标**上（档案有没有门）。
@@ -4658,12 +4658,12 @@ def _齿_R540(fails: list) -> None:
             fails.append("【R540】★ 档案声明了项目验收门、交付物也在主树里，"
                          "却仍判成**非主树任务** ⇒ 产物只落 products/、判副本 ⇒ "
                          "rc=0 而主树没改（假成功）")
-        # ── 【R547】② 反向：档案有门但**交付物不在主树** ⇒ 必须 False ─────
+        # ── 【R572】② 反向：档案有门但**交付物不在主树** ⇒ 必须 False ─────
         #   ★ 只写「档案有门 ⇒ 主树」太宽：本包档案就声明了 3 条门 ⇒ 自检里
         #     **每个目标**都成主树任务 ⇒ 大量验「非主树路径」的齿被拖红（失败 2）。
         if _detect_repo_scope({"gates": [{"cwd": "."}]}, [{"cwd": "."}],
                               _档门540, [{"path": "不存在的产物/报告.md"}]):
-            fails.append("【R547】★ 反向过头：档案有门、但交付物**不在主树**，"
+            fails.append("【R572】★ 反向过头：档案有门、但交付物**不在主树**，"
                          "却被判成主树任务（纯产物型目标会被拖去改仓）")
         # ── 【R540】② 反向：档案没门 + 门不含 {repo} ⇒ 仍必须 False ─────
         if _detect_repo_scope({"gates": [{"cwd": "."}]}, [{"cwd": "."}], []):
@@ -4734,9 +4734,9 @@ def _齿_R540(fails: list) -> None:
                              f"（实参个数 {[len(n.args) for n in _调用540]}，应有一个 ≥3）"
                              " ⇒ 函数改对了但没生效")
             if not any("deliverables" in _w for _w in _文们540):
-                fails.append("【R547】★ `_detect_repo_scope` 的调用**没把交付物传进去**"
+                fails.append("【R572】★ `_detect_repo_scope` 的调用**没把交付物传进去**"
                              f"（实参文本 {_文们540[:2]}）"
-                             " ⇒ R547 的收窄没生效（会退回「档案有门就一律主树」）")
+                             " ⇒ R572 的收窄没生效（会退回「档案有门就一律主树」）")
     except Exception as _e540:                       # noqa: BLE001
         fails.append("【R540】主树判定/假成功 门自身异常：%s: %s"
                      % (type(_e540).__name__, _e540))
@@ -8042,7 +8042,7 @@ class GoalRunner:
                     self._emit({"kind": "shrunken_candidate_rejected",
                                 "work": int(getattr(self, "_当前轮242", 0) or 0),
                                 "detail": _缩220[:6]})
-                # ★ R549：主树工程必须**在主树上**备份/应用/判门 —— 见 `_增量应用` 的 `主树` 注释。
+                # ★ R574：主树工程必须**在主树上**备份/应用/判门 —— 见 `_增量应用` 的 `主树` 注释。
                 results, round_red, _留43, _退43 = _增量应用(
                     adopted, 基线, self.round_root, self.deliverables, 回退详情=_台177,
                     主树=(REPO_ROOT if self.repo_scope else None))

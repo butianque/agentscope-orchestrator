@@ -156,7 +156,7 @@ def _锚(根: Path, 语言名: str | None) -> str | None:
 def _候选门(根: Path, 测: dict) -> list[tuple[str, list[str], str]]:
     """列出这个工程**可能的**判据门：(名, 命令, 为什么)。
 
-    ★ R552b：`orch-init` 原来把 `gates:` **整段注释掉** ⇒ 新用户拿到的档案 0 条门
+    ★ R577b：`orch-init` 原来把 `gates:` **整段注释掉** ⇒ 新用户拿到的档案 0 条门
       ⇒ `orch-doctor` 报「没判据门」、`orch-goal` 回执报「无从独立验收」。
     ★ 顺序 = **独立性强弱**：工程自己声明的 > 工程自己写的验收脚本 > 语言级兜底。
     """
@@ -250,7 +250,7 @@ def _写档案(根: Path, 测: dict, 出: Path, 名: str) -> str:
         L.append("# anchors.main：★ 没写 —— 没找到确定的入口单元。")
         L.append("#   空着**不会**让门锚到假单元；需要时手填（rust: src.lib / python: src.包名）。")
     L.append("")
-    # ★★★★★ R552b：**真写** gates，且每条**当场探跑**。
+    # ★★★★★ R577b：**真写** gates，且每条**当场探跑**。
     #   原来这里整段是注释（`# gates:`）⇒ 新用户拿到的档案 0 条门 ⇒
     #   `orch-doctor` 报「没判据门」、`orch-goal` 回执报「无从独立验收」。
     #   口径与 `bootstrap.生成档案` 一致：**只写探跑确认能跑的门**。

@@ -87,7 +87,7 @@ if ($LASTEXITCODE -ne 0) {
 #   ⇒ 装的最后一步把字节码先编出来，用户第一次敲就是热的。
 Write-Host "· 预编译字节码（省掉首次 import 的十几秒）"
 $purelib = & $vpy -c "import sysconfig;print(sysconfig.get_paths()['purelib'])"
-# ★★★★★ R554：这一步**不许 abort**，而旧写法一定会 abort。
+# ★★★★★ R579：这一步**不许 abort**，而旧写法一定会 abort。
 #   真读数（2026-11-20 15:20，把 dist 复制到全新目录真跑本脚本）：
 #     第 90 行 `& $vpy -m compileall ... 2>&1 | Out-Null`
 #     ⇒ python 把一条 `SyntaxWarning: invalid escape sequence` 写到 stderr
@@ -132,10 +132,10 @@ if (Test-Path $cfg) {
     Write-Host '  {"bin":"<semsearch.exe>","project_root":"<知识库所在项目根>"}'
 }
 
-# ④.5 通道配置（★ R553b）
+# ④.5 通道配置（★ R578b）
 #
 # ★ 为什么必须在**部署根**、且必须由安装脚本建：
-#   R553 之前配置候选里有「包内 config/」⇒ 每次 `pip install --force-reinstall`
+#   R578 之前配置候选里有「包内 config/」⇒ 每次 `pip install --force-reinstall`
 #   （或任何"删包目录再解包"的升级）都会把 channels.yml 一起删掉
 #   ⇒ 真读数：重装后 `RuntimeError: 没有真实可用的模型通道（已探测 0 个）`。
 #   ⇒ 现在查找顺序是「ORCH_CONFIG_DIR > 源码树 > **部署根 config/** > 包内 > cwd」，
