@@ -63,6 +63,41 @@ def _HEAD字节(相对: str) -> bytes | None:
     return r.stdout if r.returncode == 0 and r.stdout else None
 
 
+def _期望形态(相对: str, 原: bytes) -> tuple[str, str]:
+    """★ R585：**git 期望的检出形态**，不是 HEAD blob 的原始字节。
+
+    公仓 `.gitattributes` 写着 `*.ps1 text eol=crlf` ⇒ 工作区就该是 CRLF，
+    而 blob 是 LF。拿 blob 当基线会把**正确的检出转换**判成事故
+    （2026-11-20 干净克隆里真撞上：`install.ps1` 假红）。
+    """
+    try:
+        r = subprocess.run(["git", "check-attr", "eol", "--", 相对], cwd=str(包根),
+                           capture_output=True, timeout=30)
+        出 = r.stdout.decode("utf-8", "replace").strip()
+        # 形如 `path: eol: crlf` / `path: eol: unspecified`
+        if r.returncode == 0 and ":" in 出:
+            值 = 出.rsplit(":", 1)[1].strip()
+            if 值 == "crlf":
+                return "CRLF", "`.gitattributes` 声明 eol=crlf"
+            if 值 == "lf":
+                return "LF", "`.gitattributes` 声明 eol=lf"
+    except Exception:                                           # noqa: BLE001
+        pass
+    try:
+        r = subprocess.run(["git", "config", "--get", "core.autocrlf"], cwd=str(包根),
+                           capture_output=True, timeout=30)
+        值 = r.stdout.decode("utf-8", "replace").strip().lower()
+        if 值 in ("true", "always"):
+            return "CRLF", "`core.autocrlf=true`"
+        if 值 in ("input",):
+            return "LF", "`core.autocrlf=input`"
+    except Exception:                                           # noqa: BLE001
+        pass
+    o_crlf, o_lf, _ = _行尾种类(原)
+    原态 = "CRLF" if o_crlf and not o_lf else ("LF" if o_lf and not o_crlf else "混合")
+    return 原态, "无行尾声明 ⇒ 沿用 HEAD 自身形态"
+
+
 def main() -> int:
     try:
         if callable(getattr(sys.stdout, "reconfigure", None)):
@@ -114,11 +149,10 @@ def main() -> int:
         原 = _HEAD字节(相对)
         if 原 is None:
             continue                                            # 新文件，无基线
-        o_crlf, o_lf, _ = _行尾种类(原)
-        原态 = "CRLF" if o_crlf and not o_lf else ("LF" if o_lf and not o_crlf else "混合")
+        期望, 依据 = _期望形态(相对, 原)
         今态 = "CRLF" if crlf and not lf else ("LF" if lf and not crlf else "混合")
-        if 原态 != 今态:
-            变了.append(f"{相对}：HEAD 是 {原态}，工作区成了 {今态}")
+        if 期望 != 今态:
+            变了.append(f"{相对}：期望 {期望}（{依据}），工作区是 {今态}")
 
     print(f"\n① 纯度：扫 {len(文件)} 个文件（CRLF {crlf文件} · LF {lf文件}）")
     if 混合:
@@ -128,15 +162,15 @@ def main() -> int:
     else:
         print("   ✓ 没有混合行尾")
 
-    print("\n② 与 HEAD 一致" + ("（未验：无 git）" if 只判纯度 else ""))
+    print("\n② 工作区 == git 期望的检出形态" + ("（未验：无 git）" if 只判纯度 else ""))
     if 只判纯度:
         print("   ○ 未验（不是通过）")
     elif 变了:
-        print(f"   ✗ {len(变了)} 个文件的行尾被改了：")
+        print(f"   ✗ {len(变了)} 个文件的行尾与 git 期望不符：")
         for x in 变了[:10]:
             print(f"      {x}")
     else:
-        print("   ✓ 没有文件的行尾被改动")
+        print("   ✓ 全部与 git 期望形态一致（含 `.gitattributes` 的 eol 声明）")
 
     print("\n③ 双重翻译指纹 `\\r\\r\\n`")
     if 双CR:
@@ -154,7 +188,7 @@ def main() -> int:
         print("        并**还原成原行尾**；仓里已有现成工具 `work/R536/安全改写.py`（`替换()`）。")
         return 1
     态 = "判定=OK" if not 只判纯度 else "判定=OK（② 未验）"
-    print(f"{态}；{len(文件)} 个文件行尾纯净 · 与 HEAD 一致 · 无双重翻译")
+    print(f"{态}；{len(文件)} 个文件行尾纯净 · 与 git 期望形态一致 · 无双重翻译")
     return 0
 
 
