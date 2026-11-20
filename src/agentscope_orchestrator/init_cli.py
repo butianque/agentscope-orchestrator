@@ -153,6 +153,40 @@ def _锚(根: Path, 语言名: str | None) -> str | None:
     return None
 
 
+def _候选门(根: Path, 测: dict) -> list[tuple[str, list[str], str]]:
+    """列出这个工程**可能的**判据门：(名, 命令, 为什么)。
+
+    ★ R552b：`orch-init` 原来把 `gates:` **整段注释掉** ⇒ 新用户拿到的档案 0 条门
+      ⇒ `orch-doctor` 报「没判据门」、`orch-goal` 回执报「无从独立验收」。
+    ★ 顺序 = **独立性强弱**：工程自己声明的 > 工程自己写的验收脚本 > 语言级兜底。
+    """
+    候: list[tuple[str, list[str], str]] = []
+    if 测.get("构建"):
+        _名, _工具, _cmd = 测["构建"]
+        候.append((f"{_工具}_build_ok", [str(x) for x in _cmd],
+                   f"根目录有 {_名} ⇒ 这是这个工程**自己声明**的构建方式"))
+    # ② 工程自己写的验收脚本 —— 最强独立来源（人写的，不是模型给的）
+    for _n in ("gate.py", "check.py", "verify.py"):
+        if (根 / _n).is_file():
+            候.append((f"{_n[:-3]}_exit0", ["python", _n],
+                       f"根目录有 `{_n}` ⇒ **工程自己写的**验收脚本（独立来源）"))
+            break
+    # ③④ python 语言级兜底（只在 python 项目上做）
+    _语 = (测.get("语言") or ("",))[0]
+    if _语 == "python":
+        _有测 = ((根 / "tests").is_dir()
+                 or any(根.glob("test_*.py")) or any(根.glob("*_test.py")))
+        if _有测:
+            候.append(("pytest_ok", ["python", "-m", "pytest", "-q"],
+                       "有测试文件 ⇒ pytest 真执行断言"))
+        if not any(c[0].endswith("_build_ok") for c in 候):
+            候.append(("syntax_ok", ["python", "-m", "compileall", "-q",
+                                   "-x", r"(^|[\\/])(\.venv|venv|node_modules|__pycache__|\.git)([\\/]|$)", "."],
+                       "python 项目**没有构建清单** ⇒ 兜底用 compileall 做语法编译"
+                       "（有语法错就非 0，不是恒真占位门）"))
+    return 候
+
+
 def _写档案(根: Path, 测: dict, 出: Path, 名: str) -> str:
     """手写 YAML（不用 yaml.dump：注释会被吃掉，而这份档案是**给人读的**）。"""
     语 = 测["语言"]
@@ -216,16 +250,45 @@ def _写档案(根: Path, 测: dict, 出: Path, 名: str) -> str:
         L.append("# anchors.main：★ 没写 —— 没找到确定的入口单元。")
         L.append("#   空着**不会**让门锚到假单元；需要时手填（rust: src.lib / python: src.包名）。")
     L.append("")
-    if 测["构建"]:
-        L.append("# 项目固定门（可选）。不填 ⇒ 编排器按目标**现场规划**判据门。")
-        L.append("# 自动认出的构建命令已写在下面，确认无误可以启用：")
-        L.append("# gates:")
-        L.append("#   - name: build_ok")
-        L.append("#     type: compile")
-        L.append("#     cmd: " + json.dumps(测["构建"][2], ensure_ascii=False))
-        L.append('#     cwd: "{repo}"')
-        L.append("#     expect_exit: 0")
-        L.append("")
+    # ★★★★★ R552b：**真写** gates，且每条**当场探跑**。
+    #   原来这里整段是注释（`# gates:`）⇒ 新用户拿到的档案 0 条门 ⇒
+    #   `orch-doctor` 报「没判据门」、`orch-goal` 回执报「无从独立验收」。
+    #   口径与 `bootstrap.生成档案` 一致：**只写探跑确认能跑的门**。
+    L.append("# ── 判据门：项目**自己的**验收标准（独立来源 · 非模型给）────────────")
+    L.append("# ★ 下面每条都**当场真跑过**（探跑）。起不来的门不写 —— 那会每次必红，")
+    L.append("#   是项目级假红，比没有门更坏（把真问题淹掉）。")
+    L.append("# ★ `可跑·红` 会照写：它不是错误，它正是**当前缺口**（改之前本来就不过）。")
+    候 = _候选门(根, 测)
+    已写 = 0
+    if 候:
+        _行: list[str] = []
+        for _门名, _cmd, _因 in 候:
+            try:
+                from agentscope_orchestrator import bootstrap as _bs
+                _r = _bs.探命令(_cmd, 根, 120)
+            except Exception as _e:                    # noqa: BLE001
+                _r = {"状态": "不可用", "因由": f"{type(_e).__name__}: {_e}"}
+            _态 = _r.get("状态")
+            if _态 not in ("可跑·绿", "可跑·红"):
+                L.append(f"# ★ 门 `{_门名}` **未入档**：探跑不可用（{_r.get('因由') or _态}）")
+                continue
+            L.append(f"# 探跑：{_态}（退出码 {_r.get('退出码')}，{_r.get('秒')}s）—— {_因}")
+            _行.append(f"  - name: {_门名}")
+            _行.append("    type: compile")
+            _行.append("    cmd: " + json.dumps(_cmd, ensure_ascii=False))
+            _行.append('    cwd: "{repo}"')
+            _行.append("    expect_exit: 0")
+            已写 += 1
+        if 已写:
+            L.append("gates:")
+            L.extend(_行)
+        else:
+            L.append("# ★★ 候选门**全部探跑不可用** ⇒ 本档案无判据门。")
+            L.append("#    工具仍可启动，但**不会跑任何项目级判据**（不用恒真门冒充）。")
+    else:
+        L.append("# ★★ 没找到任何可探跑的候选门 ⇒ 本档案无判据门。")
+        L.append("#    请人工补一条真能跑的验收命令（否则交付时只能信模型自己写的门）。")
+    L.append("")
     出.parent.mkdir(parents=True, exist_ok=True)
     出.write_text("\n".join(L) + "\n", encoding="utf-8")
     return str(出)

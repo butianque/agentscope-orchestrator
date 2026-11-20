@@ -59,6 +59,29 @@ def 凭据候选() -> list[Path]:
 _DSH_CREDENTIALS = Path.home() / ".dsh" / ".credentials.yaml"
 
 
+def _部署根() -> Path | None:
+    """这个包装在哪个**部署目录**里（配置该住的地方，不是 site-packages）。
+
+    ★ R553：配置放 site-packages 里 ⇒ 每次 `pip install --force-reinstall`
+      （或任何"删包目录再解包"的升级）都会把它删掉。
+      真事故：重装后通道全消失，报「没有真实可用的模型通道（已探测 0 个）」。
+    两种布局都认：
+      · `.venv/Lib/site-packages/<包>` —— 往上遇到含 `pyvenv.cfg` 的目录，
+        它的**父目录**是部署根；
+      · `<部署根>/.venv/...` —— 往上遇到**含 `.venv` 子目录**的目录，它自己就是部署根。
+    找不到 ⇒ None（不猜，交给后面的候选）。
+    """
+    try:
+        for p in Path(__file__).resolve().parents:
+            if (p / "pyvenv.cfg").is_file():
+                return p.parent
+            if (p / ".venv").is_dir():
+                return p
+    except OSError:
+        return None
+    return None
+
+
 def _找配置目录() -> Path | None:
     """配置目录按**实际安装位置**找，不按源码树位置找。
 
@@ -73,15 +96,27 @@ def _找配置目录() -> Path | None:
     查找顺序（先到先得，全不存在 ⇒ None）：
       ① `ORCH_CONFIG_DIR` —— 用户显式指定；
       ② 源码树布局 `<包>/../../config`（开发态）；
-      ③ 包内 `config/`（wheel 里随包分发，装完也在）；
-      ④ 当前目录 `config/`（用户自己的工作目录）。
+      ③ **部署根** `config/` —— ★ R553：配置**不许**住在 site-packages 里；
+      ④ 包内 `config/`（出厂样例，会被重装覆盖）；
+      ⑤ 当前目录 `config/`（用户自己的工作目录）。
+
+    ★★★★★ R553（真事故 2026-11-20 15:20）：
+      部署流程是「删包目录 + 解包 wheel」，而 wheel 里**不含** `config/`
+      （配置里有内网地址，不该打进发布包）⇒ **每次重装都把 channels.yml 一起删掉**
+      ⇒ `RuntimeError: 没有真实可用的模型通道（已探测 0 个）`。
+      ★ 这不是操作不细，是**结构错**：候选里有 `此处 / "config"`（包内），
+        也就是把配置放进了**代码目录**。site-packages 会被任何升级覆盖，
+        **配置在里面就一定会丢** —— 只是什么时候丢而已。
+      ⇒ 加「部署根 `config/`」，排在包内之前：用户放那里的配置**压过**包里那份。
     """
     候选 = []
     显式 = os.environ.get("ORCH_CONFIG_DIR")
     if 显式:
         候选.append(Path(显式))
     此处 = Path(__file__).resolve().parent
+    _根553 = _部署根()
     候选 += [此处.parents[1] / "config" if len(此处.parents) > 1 else None,
+             (_根553 / "config") if _根553 else None,
              此处 / "config",
              Path.cwd() / "config"]
     for c in 候选:

@@ -399,6 +399,41 @@ def _扫冻结(root: Path, 谱: 工程谱, 排除: frozenset[str],
     return out, 跳过
 
 
+# ═══════════════════════════════════════════════════════════════════
+# 语言兜底：**没有清单文件**的工程也该有一条真门（R552）
+# ═══════════════════════════════════════════════════════════════════
+def _python兜底(root: Path) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+    """没有清单的 python 目录 ⇒ (构建命令, 验收命令, 说明)。**只推真能判的。**
+
+    ★ 真场景（2026-11-20 14:56 新用户实机）：一个目录只有 `calc.py` + `gate.py`，
+      `orch-init` 生成档案但 0 条门 ⇒ `orch-doctor` 报「没判据门」
+      ⇒ 回执报「档案未声明项目验收门 ⇒ 无从独立验收」。
+    ★ 三条候选按**独立性强弱**排：
+      ① 根目录有 `gate.py` / `check.py` / `verify.py` —— 那是**工程自己写的验收脚本**，
+         最强的独立来源（人写的，不是模型给的）；
+      ② 有 `test_*.py` / `tests/` —— pytest 真跑断言；
+      ③ 兜底：`compileall` —— 只做语法编译，**有语法错就非 0**，真能红。
+         它不是"验收"，但它是**真的**（不是恒真占位门）。
+    ★ 每条都会被 `探命令` 当场真跑：跑不起来 ⇒ 不入档（不写"起不来的门"）。
+    """
+    验收: tuple[str, ...] = ()
+    for _n in ("gate.py", "check.py", "verify.py"):
+        if (root / _n).is_file():
+            验收 = ("python", _n)
+            break
+    if not 验收:
+        _有测 = ((root / "tests").is_dir()
+                 or any(root.glob("test_*.py")) or any(root.glob("*_test.py")))
+        if _有测:
+            验收 = ("python", "-m", "pytest", "-q")
+    # `-x` 排除：真跑过 `compileall -q .` 会把 `.venv` 里几万个包也编译（几分钟）
+    构建 = ("python", "-m", "compileall", "-q",
+            "-x", r"(^|[\\/])(\.venv|venv|node_modules|__pycache__|\.git)([\\/]|$)", ".")
+    return 构建, 验收, ("无清单文件 ⇒ **语言兜底**：compileall 语法编译"
+                       + ("；验收用工程自己的 `" + 验收[1] + "`" if 验收 and 验收[1].endswith(".py")
+                          else ("；验收用 pytest" if 验收 else "；**没有验收脚本**")))
+
+
 def 识别(root: Path) -> 识别结果:
     """扫仓库根：命中哪个谱系、它自己声明了什么命令、判据区域在哪。"""
     root = Path(root).resolve()
@@ -410,9 +445,40 @@ def 识别(root: Path) -> 识别结果:
     命中 = [s for s in _工程谱 if (root / s.清单).is_file()]
     r.命中清单 = [s.清单 for s in 命中]
     if not 命中:
+        # ★★★★★ R552：**没有清单 ≠ 没有门**。
+        #   旧行为直接 return（0 条门）⇒ 新用户第一步 `orch-doctor` 就报
+        #   「0 条 ⇒ 没判据门」、回执报「无从独立验收」。
+        #   真读数（2026-11-20 14:56）：只有 calc.py + gate.py 的目录就是这样。
+        #   ⇒ 按**语言后缀**兜底，只推**真能判**的命令，且照旧探跑。
+        _后缀们 = {p.suffix.lower() for p in root.glob("*") if p.is_file()}
+        _py = (root / "gate.py").is_file() or bool(list(root.glob("*.py")))
+        if _py:
+            _构, _验, _说明 = _python兜底(root)
+            r.谱 = 工程谱(清单="（无·语言兜底）", 语言="python",
+                         构建=_构, 验收=_验, 源码根=(".",), 后缀=("**/*.py",),
+                         冻结文件=("tests/**/test_*.py", "**/test_*.py", "**/*_test.py"),
+                         说明=_说明)
+            r.源码根, r.后缀 = (".",), ("**/*.py",)
+            r.排除 = _排除集(root)
+            r.构建, r.验收 = _构, _验
+            r.命令来源["构建"] = "**语言兜底**（无清单文件）"
+            r.命令来源["验收"] = ("**语言兜底**（工程自己的验收脚本）" if _验 and
+                                 _验[1].endswith(".py") else
+                                 ("**语言兜底**（pytest）" if _验 else "**语言兜底**：无验收脚本"))
+            r.备注.append("仓库根没有认识的清单文件 ⇒ 走**语言兜底**（python）："
+                          + _说明
+                          + "。★ 这是兜底，不是这个工程自己声明的 —— "
+                            "要更强的判据请补 `pyproject.toml` / `requirements.txt`。")
+            r.冻结候选, r.跳过冻结 = _扫冻结(root, r.谱, r.排除)
+            if not r.冻结候选:
+                r.备注.append("**未找到任何验收判据区域** ⇒ 档案不写 `frozen`"
+                              "（R23 的洞仍然敞着）。")
+            r.记忆候选 = _扫记忆候选(r)
+            return r
         r.备注.append("仓库根没有任何**认识的**清单文件（Cargo.toml / package.json / "
-                      "pyproject.toml / go.mod / Makefile …）⇒ 无法确定这个工程怎么构建、"
-                      "怎么验收。**不生成门**（绝不用恒真占位门冒充判据）。")
+                      "pyproject.toml / go.mod / Makefile …），也**没有** .py 文件可兜底"
+                      "⇒ 无法确定这个工程怎么构建、怎么验收。"
+                      "**不生成门**（绝不用恒真占位门冒充判据）。")
         return r
 
     # 表序即优先级；但**声明了命令的清单优先于只被识别的清单**：

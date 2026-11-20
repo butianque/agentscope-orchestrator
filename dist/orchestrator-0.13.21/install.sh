@@ -42,6 +42,27 @@ echo "· 安装 $(basename "$WHL")（wheels/ 共 $(ls -1 wheels/*.whl 2>/dev/nul
 #   （install.sh 原本没写 --no-deps，是靠联网补依赖；离线机器上就装坏了）。
 "$VPY" -m pip install --no-cache-dir --disable-pip-version-check --no-index --find-links wheels --force-reinstall "$WHL"
 
+# ★ R553b：通道配置必须放到**部署根**（与 install.ps1 同源同修）。
+#   R553 之前它在「包内 config/」⇒ 任何 force-reinstall 都会把它删掉
+#   ⇒ 真读数：重装后「没有真实可用的模型通道（已探测 0 个）」。
+echo
+echo "· 通道配置"
+mkdir -p config
+if [ -f config/channels.yml ]; then
+  echo "  · 已有 config/channels.yml（**不动它**）"
+elif [ -f channels.example.yml ]; then
+  cp channels.example.yml config/channels.yml
+  echo "  ✓ 已从 channels.example.yml 复制出 config/channels.yml"
+  echo "    ⇒ 现在去把里面的 key_env 填成**你自己**的环境变量名"
+else
+  echo "  · 包里没有 channels.example.yml ⇒ 跳过（要跑任务请手建 config/channels.yml）"
+fi
+# 问包：它**实际**会读哪个文件（不在这里再算一遍路径 —— R548 的教训）
+RESOLVED="$("$VPY" -c "import sys; sys.path.insert(0, '.'); from agentscope_orchestrator.gateway import _CHANNELS_FILE as f; print(f)" 2>/dev/null || true)"
+if [ -n "$RESOLVED" ]; then
+  if [ -f "$RESOLVED" ]; then echo "  ✓ 编排器实际读：$RESOLVED"; else echo "  ✗ 编排器实际读：$RESOLVED（不存在 ⇒ 会报「没有真实可用的模型通道」）"; fi
+fi
+
 echo
 set +e
 "$VPY" -m agentscope_orchestrator.doctor
@@ -54,6 +75,7 @@ echo "  激活：      source .venv/bin/activate"
 echo "  自检：      .venv/bin/orch-doctor"
 echo "  跑目标：    .venv/bin/orch-goal --goal \"<你的目标>\" --max-work 4"
 echo "  当插件用：  .venv/bin/orch-mcp"
+echo "  改通道：    config/channels.yml（★ 住在部署根，**重装不会删**）"
 echo "  上手文档：  QUICKSTART.md"
 [ "$DOC" -eq 0 ] || echo "注意：doctor 报了硬阻塞（见上），先解决再跑任务。"
 exit "$DOC"

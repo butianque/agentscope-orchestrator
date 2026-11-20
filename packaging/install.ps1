@@ -87,8 +87,21 @@ if ($LASTEXITCODE -ne 0) {
 #   ⇒ 装的最后一步把字节码先编出来，用户第一次敲就是热的。
 Write-Host "· 预编译字节码（省掉首次 import 的十几秒）"
 $purelib = & $vpy -c "import sysconfig;print(sysconfig.get_paths()['purelib'])"
-& $vpy -m compileall -q "$purelib\agentscope_orchestrator" 2>&1 | Out-Null
-if ($LASTEXITCODE -eq 0) { Write-Host "  ✓ 字节码已预编译" } else { Write-Host "  · 预编译没成功（不影响可用，只是首次慢）" -ForegroundColor Yellow }
+# ★★★★★ R554：这一步**不许 abort**，而旧写法一定会 abort。
+#   真读数（2026-11-20 15:20，把 dist 复制到全新目录真跑本脚本）：
+#     第 90 行 `& $vpy -m compileall ... 2>&1 | Out-Null`
+#     ⇒ python 把一条 `SyntaxWarning: invalid escape sequence` 写到 stderr
+#     ⇒ 因为 `$ErrorActionPreference = "Stop"`，**原生程序的任何 stderr 输出**
+#       都被 PowerShell 变成 terminating error ⇒ 安装中止，⑤ doctor 根本没跑，rc=1。
+#   而下一行的注释自己写着「预编译没成功（不影响可用，只是首次慢）」——
+#   **写着的降级必须真的降级**，否则那注释就是骗人的。
+#   ⇒ 本段临时 `Continue`，成败只认 `$LASTEXITCODE`（那才是"编译成没成"的真判据）。
+$旧EAP = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$null = & $vpy -m compileall -q "$purelib\agentscope_orchestrator" 2>&1
+$编译rc = $LASTEXITCODE
+$ErrorActionPreference = $旧EAP
+if ($编译rc -eq 0) { Write-Host "  ✓ 字节码已预编译" } else { Write-Host "  · 预编译没成功（不影响可用，只是首次慢）" -ForegroundColor Yellow }
 
 
 # ④ 检索桥配置（B 方案）
@@ -119,6 +132,42 @@ if (Test-Path $cfg) {
     Write-Host '  {"bin":"<semsearch.exe>","project_root":"<知识库所在项目根>"}'
 }
 
+# ④.5 通道配置（★ R553b）
+#
+# ★ 为什么必须在**部署根**、且必须由安装脚本建：
+#   R553 之前配置候选里有「包内 config/」⇒ 每次 `pip install --force-reinstall`
+#   （或任何"删包目录再解包"的升级）都会把 channels.yml 一起删掉
+#   ⇒ 真读数：重装后 `RuntimeError: 没有真实可用的模型通道（已探测 0 个）`。
+#   ⇒ 现在查找顺序是「ORCH_CONFIG_DIR > 源码树 > **部署根 config/** > 包内 > cwd」，
+#     所以装的时候就要把它放到部署根。
+#
+# ★ 路径**不在这里再算一遍**：问包自己的 `gateway.渠道文件()`。
+#   本项目栽过「同一语义有多个展开点 ⇒ 修一处等于没修」（R548）⇒ 脚本只问、不自己算。
+Write-Host ""
+Write-Host "· 通道配置"
+$cfgDir = Join-Path $here "config"
+$cfgFile = Join-Path $cfgDir "channels.yml"
+$示例 = Join-Path $here "channels.example.yml"
+if (-not (Test-Path $cfgDir)) { New-Item -ItemType Directory -Path $cfgDir -Force | Out-Null }
+if (Test-Path $cfgFile) {
+    Write-Host "  · 已有 config/channels.yml（**不动它**）"
+} elseif (Test-Path $示例) {
+    Copy-Item $示例 $cfgFile
+    Write-Host "  ✓ 已从 channels.example.yml 复制出 config/channels.yml" -ForegroundColor Green
+    Write-Host "    ⇒ 现在去把里面的 key_env 填成**你自己**的环境变量名（或直接改 base_url/models）"
+} else {
+    Write-Host "  · 包里没有 channels.example.yml ⇒ 跳过（要跑任务请手建 config/channels.yml）" -ForegroundColor Yellow
+}
+# 问包：它**实际**会读哪个文件（避免"我放的地方"和"它读的地方"不是一处）
+$resolved = & $vpy -c "import sys; sys.path.insert(0, r'$here'); from agentscope_orchestrator.gateway import _CHANNELS_FILE as f; print(f)" 2>$null
+if ($resolved) {
+    $ok = Test-Path $resolved
+    $mark = if ($ok) { "✓" } else { "✗" }
+    $color = if ($ok) { "Gray" } else { "Yellow" }
+    Write-Host "  $mark 编排器实际读：$resolved" -ForegroundColor $color
+    if (-not $ok) { Write-Host "    ⇒ 这个文件不存在 ⇒ 跑任务时会报「没有真实可用的模型通道」" -ForegroundColor Yellow }
+}
+
 # ⑤ doctor
 Write-Host ""
 & $vpy -m agentscope_orchestrator.doctor
@@ -132,6 +181,7 @@ Write-Host "  自检：      .\\.venv\\Scripts\\orch-doctor.exe"
 Write-Host "  跑目标：    .\\.venv\\Scripts\\orch-goal.exe --goal `"<你的目标>`" --max-work 4"
 Write-Host "  当插件用：  .\\.venv\\Scripts\\orch-mcp.exe"
 Write-Host "  查检索桥：  .\\.venv\\Scripts\\python.exe -c `"import sys;sys.path.insert(0,'.');from agentscope_orchestrator import semsearch_link as S;print(S.可用())`""
+Write-Host "  改通道：    config\channels.yml（★ 住在部署根，**重装不会删**）"
 Write-Host "  上手文档：  QUICKSTART.md"
 if ($doc -ne 0) {
     Write-Host ""
