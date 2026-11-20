@@ -173,6 +173,38 @@ def state_dir() -> Path:
     return Path(_v) if _v else Path(STATE_ROOT)
 
 
+def 尽力建目录(路径, 名: str = "") -> bool:
+    """**导入期**尽量把目录准备好；建不出来只 warning，**不许让导入失败**。返回是否成功。
+
+    ★★★★★ R543 / R543b（2026-11-20 部署 venv 真跑）：`orch-check ③` 崩在
+      `PermissionError: [WinError 5] … <部署目录>/.orchestrator`，完整栈指向
+      `generic_goal.py` 的**模块级** `AUDIT.mkdir(...)`：
+      只要有一处不可写（本机：部署目录对 python 子进程不可写，而档案没找到时
+      `audit_dir` 落到 `<cwd>/.orchestrator`）⇒ **`import agentscope_orchestrator`
+      直接抛 PermissionError** ⇒ `taixu_mcp` 导入失败 ⇒ **MCP 服务器起不来、自检崩**。
+
+    ★ 口径：**导入期只做「尽量准备」，不做「必须成功」**。
+      目录建不出来时，应该在该落盘的那一刻响亮地失败并说清修法；
+      而不是让导入本身抛错 —— 那样连"报错说清原因"的机会都没有，
+      用户只看到「自检本身跑不起来」，无法据此判断产品好坏（崩溃 ≠ 产品判定）。
+
+    ★ **不吞掉**：warning 里明写哪个目录、为什么、怎么改。
+    ★ 为什么不只在 `generic_goal` 里修：这条线是**普适**的 —— 机判扫描
+      （`tools/导入期写盘扫描.py`）在 `doc_store` / `gate_memory` / `taixu_mcp`
+      里各查出 1 处同族病。**按类别扫干净，不是按报错修一处。**
+    """
+    try:
+        Path(路径).mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception as _e:                  # noqa: BLE001 - 见上面口径
+        logger.warning(
+            "[profile] %s 目录建不出来（%s: %s）：%s ⇒ 真正落盘时会失败；"
+            "修法：把 ORCH_STATE_DIR 指到可写目录，或在档案里显式声明它。"
+            "导入**继续**（导入期不承担可写性）。",
+            名 or "状态", type(_e).__name__, _e, 路径)
+        return False
+
+
 TOOL_ROOT = _detect_tool_root()
 STATE_ROOT = _detect_state_root()
 
@@ -435,12 +467,41 @@ def _load_yaml(path: Path) -> dict:
 # ═══════════════════════════════════════════════════════════════════
 # 通用空档案（兜底）：无项目知识，工具仍可用
 # ═══════════════════════════════════════════════════════════════════
+def _通用档案的审计目录(root: Path) -> Path:
+    """通用空档案的审计目录：**cwd 可写就跟项目走，不可写就回落到状态根**。
+
+    ★★★★★ R544（2026-11-20 部署 venv 真跑）：`work_dir`/`products_dir` 都挂在
+      `STATE_ROOT` 下，**唯独 `audit_dir` 挂在 cwd 下** ⇒ cwd 恰好是安装/部署目录
+      （只读）时，回执与备份没地方落 —— 而「cwd 可写」不是产品前提
+      （MCP 的 cwd 由宿主决定，本项目部署档案里就是 `E:/基础设施/orch-deploy`）。
+      真读数：`orch-check` 全绿但 stderr 上 3 条 WARNING，都是这个目录建不出来。
+
+    ★ 这是**条件回落**，不改语义：cwd 可写时行为与原来一模一样（收据跟着项目走）；
+      只有真写不了才落到 `STATE_ROOT/audit`（与 work/products 同一处）。
+    """
+    跟项目 = root / ".orchestrator" / "audit"
+    try:
+        跟项目.mkdir(parents=True, exist_ok=True)
+        探 = 跟项目 / f".probe.{__import__('os').getpid()}"
+        探.write_text("ok", encoding="utf-8")
+        探.unlink()
+        return 跟项目
+    except Exception as _e:                  # noqa: BLE001 - 见上面口径
+        logger.warning(
+            "[profile] 通用空档案：审计目录跟项目走不通（%s: %s）：%s ⇒ "
+            "回落到状态根 %s/audit（与 work/products 同一处）。"
+            "若要让收据跟着项目走，请把 ORCH_STATE_DIR 指到可写目录，"
+            "或在项目里 `orch-init` 建档案。",
+            type(_e).__name__, _e, 跟项目, STATE_ROOT)
+        return STATE_ROOT / "audit"
+
+
 def _generic_profile(repo_root: Path | None = None) -> Profile:
     root = (repo_root or Path.cwd()).resolve()
     return Profile(
         name="generic",
         repo_root=root,
-        audit_dir=root / ".orchestrator" / "audit",
+        audit_dir=_通用档案的审计目录(root),
         work_dir=STATE_ROOT / "work",
         products_dir=STATE_ROOT / "products",
         receipt_prefix="ORCH",

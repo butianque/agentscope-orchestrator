@@ -55,7 +55,7 @@ from agentscope_orchestrator import profile as prof_mod
 # ── 账本位置（随档案走，换工程不串味）────────────────────────────
 _prof = prof_mod.get_profile()
 AUDIT = _prof.audit_dir
-AUDIT.mkdir(parents=True, exist_ok=True)
+prof_mod.尽力建目录(AUDIT, "audit_dir")
 GATE_MEMORY = AUDIT / "gate_memory.jsonl"
 
 # 复用门槛：同一结构对象被**独立确证**至少这么多次才允许复用。

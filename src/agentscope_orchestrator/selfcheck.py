@@ -49,6 +49,20 @@ def _临时目录(前缀: str) -> Path:
     基们: list[Path] = []
     if os.environ.get("ORCH_STATE_DIR"):
         基们.append(Path(os.environ["ORCH_STATE_DIR"]).parent)
+    # ★★★★★ R541（2026-11-20 部署 venv 真跑）：**必须试 TEMP/TMP/TMPDIR**。
+    #   真读数：在部署目录里跑 `orch-check` ⇒
+    #     `[FAIL] 自检自身：RuntimeError: 没有任何可写的临时目录
+    #      （最后一错：PermissionError: …\site-packages\agentscope_orchestrator\o…）`
+    #   而当时 `TEMP` **是可写的**（被指到工作区）—— 候选里根本没它。
+    #   ★ 原注释「TEMP 对子进程拒绝访问」是**这台机器上的一种**沙箱形态，被过度外推成
+    #     「TEMP 不该进候选」。候选应该**广**、每个只试 3 个名字（失败要快），
+    #     而不是**窄** —— 窄了就在别的沙箱里直接崩，且崩因与产品无关。
+    for _k in ("TEMP", "TMP", "TMPDIR"):
+        _v = os.environ.get(_k)
+        if _v:
+            _p = Path(_v)
+            if _p not in 基们:
+                基们.append(_p)
     基们.append(Path.cwd())
     基们.append(Path.home())
     基们.append(Path(__file__).resolve().parent)   # 包所在目录（装在哪就在哪，必然存在）
@@ -74,6 +88,24 @@ def _记(结果: list, 名: str, 绿: bool, 证据: str = "", 修法: dict | Non
 def run() -> dict:
     t0 = time.time()
     结果: list[dict] = []
+
+    # ★★★★★ R542（2026-11-20 部署 venv 真跑）：**状态根必须在任何包导入之前设好**。
+    #   真读数（部署目录里跑 `orch-check`）：
+    #     ① 版本 PASS · ② 依赖 PASS · ③ 工具面 **FAIL PermissionError: …\.orchestrator**
+    #   而 `ORCH_STATE_DIR` 当时**已经**指向可写临时目录 —— 只是设得太晚：
+    #   状态根是**模块导入期**算出来并缓存的，第 100 行 `import agentscope_orchestrator`
+    #   之后才设环境变量 ⇒ 第 143 行 `import taixu_mcp` 拿到的还是旧的不可写根。
+    #   ★ 而「部署目录可写」**本来就不是产品前提**（状态根可被 ORCH_STATE_DIR 指走）。
+    #   口径：**崩溃 ≠ 产品判定** —— 自检自己崩了，用户无法据此判断产品好坏。
+    #   失败也不许挡住后续检查：④ 会如实报红，那才是该看的那一行。
+    if not os.environ.get("ORCH_STATE_DIR"):
+        try:
+            临时 = _临时目录("orch-selfcheck-state-")
+            os.environ["ORCH_STATE_DIR"] = str(临时)
+        except Exception as _e:              # noqa: BLE001
+            # 拿不到可写临时目录 ⇒ 不改环境变量，让 ④ 如实报红（不是崩）。
+            print(f"   ⚠ 自检拿不到可写临时目录（{type(_e).__name__}: {_e}）"
+                  f"⇒ 沿用当前状态根，④ 会如实判定", file=sys.stderr)
 
     # ── ① 导入与版本 ──
     try:
@@ -117,11 +149,6 @@ def run() -> dict:
         _记(结果, "② 依赖 mcp<2.0.0", False, f"{type(e).__name__}: {e}",
             {"做": "pip install 'mcp<2.0.0'"})
         return _汇总(结果, t0, 版本)
-
-    # 自检不污染生产任务库；这个临时目录同样登记，结束时删掉
-    if not os.environ.get("ORCH_STATE_DIR"):
-        临时 = _临时目录("orch-selfcheck-state-")
-        os.environ["ORCH_STATE_DIR"] = str(临时)
 
     # ── ③ 工具面 ──
     try:

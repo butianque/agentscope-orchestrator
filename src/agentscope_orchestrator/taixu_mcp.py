@@ -252,7 +252,7 @@ def _submit_coro(coro) -> asyncio.Task:
 #     ⇒ 两边各自 `INSERT OR REPLACE` 互相覆盖 ⇒ 任务历史丢失、ID 计数退回。
 #     测试必须指向独立库，生产库只由唯一一个服务器进程写。
 _DB_FILE = Path(os.environ.get("TAIXU_DB") or (STATE / "jobs" / "jobs.db"))
-_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+prof_mod.尽力建目录(_DB_FILE.parent, "jobs_db_dir")
 
 
 def _db_可写断言() -> None:

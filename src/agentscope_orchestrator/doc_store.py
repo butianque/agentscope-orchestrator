@@ -32,7 +32,7 @@ INDEX = DOCS_DIR / "_index.jsonl"
 MAX_INLINE_BYTES = 1000                            # 超过即外置（聊天窗口只留记录）
 MAX_READ_CHARS = 4000                              # read_doc 单次拉取上限（防爆会话）
 
-DOCS_DIR.mkdir(parents=True, exist_ok=True)
+prof_mod.尽力建目录(DOCS_DIR, "docs_dir")
 
 
 def _now() -> float:

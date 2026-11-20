@@ -89,15 +89,30 @@ _prof = prof_mod.get_profile()
 WORKDIR = _prof.work_dir
 PRODUCTS = _prof.products_dir
 AUDIT = _prof.audit_dir
-WORKDIR.mkdir(parents=True, exist_ok=True)
-PRODUCTS.mkdir(parents=True, exist_ok=True)
-AUDIT.mkdir(parents=True, exist_ok=True)
+
+
+def _尽力建目录(路径, 名: str) -> None:
+    """导入期**尽量**把目录准备好；建不出来只 warning，**不许让导入失败**。
+
+    ★ R543 / R543b / R544：本函数只是 `profile.尽力建目录` 的**薄壳**。
+      口径：任何要落盘的地方**只调一个函数**（同一件事留两份实现，迟早会分叉 ——
+      `project_kb.库根()` 自己拼路径导致「写不了的根被显示成空的」就是这么来的，R549）。
+    """
+    prof_mod.尽力建目录(路径, 名)
+
+
+_尽力建目录(WORKDIR, "work_dir")
+_尽力建目录(PRODUCTS, "products_dir")
+_尽力建目录(AUDIT, "audit_dir")
 _RECEIPT = AUDIT / "generic_receipt.jsonl"
 
 # 主树仓库根 = 档案声明的 repo_root（{repo} 占位符、文件应用/备份/回滚都锚到这里）。
 REPO_ROOT = _prof.repo_root
 BACKUP_DIR = AUDIT / "generic_backup"     # 主树文件应用前备份（原子回滚闭环）
-BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+# ★ R543：同一条口径 —— 导入期只「尽量准备」。原来这里是第四处裸 mkdir，
+#   上一轮修了前三处却漏了它 ⇒ `orch-check ③` 仍报同一个 PermissionError
+#   （栈直接指到这一行）。**「修了三处」不等于「修完了」，要按类别扫干净。**
+_尽力建目录(BACKUP_DIR, "backup_dir")
 _REPO_CTX_CAP = 8000                      # 源码注入上限（字符，依赖参考文件）
 _REPO_TARGET_CAP = 60000                  # 目标文件源码注入上限（要改的文件需完整可见，防误删）
 
@@ -881,7 +896,8 @@ def _基线偏差(workdir: Path, deliverables: list, dev_pred: dict) -> list:
 
 
 def _增量应用(adopted: dict, 基线: frozenset, round_root: Path,
-               deliverables: list, 回退详情: list | None = None) -> tuple[dict, list, list, list]:
+               deliverables: list, 回退详情: list | None = None,
+               主树: "Path | None" = None) -> tuple[dict, list, list, list]:
     """**逐文件**应用 + 逐文件用判据度量裁决（保留/回退）。
 
     ★★★★★ R43（真跑抓出的缺口 · 2026-10-15 · Rust 工程 `example-project`）：
@@ -908,6 +924,18 @@ def _增量应用(adopted: dict, 基线: frozenset, round_root: Path,
     """
     # ★ R177：`回退详情` 是**出参**（追加），不改返回值 ⇒ 老调用点/老齿零影响。
     #   每一笔 = {文件, 因由, 新增违规点, 原有违规点}。
+    #
+    # ★★★★★ R549：`主树` = 本函数**备份/落盘/判门**用的根。
+    #   真事故（2026-11-20 12:28 生产冒烟，部署 venv）：主树工程的调用点传的是
+    #   `self.round_root` ⇒ 备份副本、改副本、判副本 ⇒ **主树一个字节没改**，
+    #   而门 `cwd: "{repo}"` 被展开成轮次目录 ⇒ `can't open file ...r1\gate.py`
+    #   ⇒ rc=2 ⇒ 门永远判红 ⇒ **模型四轮都写对了也被全数回退**，rc=1。
+    #   ★ 那段代码的注释自己写着「备份 → **应用主树** → 判门」——
+    #     **注释说的是主树，代码做的是副本**，而机器只信代码。
+    #   ★ 默认 None = 用 `round_root`（老行为）：自检里 13 处直接调本函数造临时仓，
+    #     那些用例的 round_root **就是**那个仓 ⇒ 改默认值会把它们全弄红。
+    #     **修一个生产缺陷，不许顺手改掉 13 条齿的前提。**
+    根 = Path(主树) if 主树 is not None else round_root
     if not 基线:
         return {}, [], [], []
     results: dict = {}
@@ -928,7 +956,7 @@ def _增量应用(adopted: dict, 基线: frozenset, round_root: Path,
     前red: list = []
     try:
         前res, 前red = _score_files(
-            round_root, deliverables, file_root=round_root, repo_root=round_root)
+            根, deliverables, file_root=根, repo_root=根)
     except Exception as _e76:             # noqa: BLE001
         _log(f"[generic] ★ R76 改前量取失败（退回只按违规点判）："
              f"{type(_e76).__name__}: {_e76}")
@@ -943,16 +971,16 @@ def _增量应用(adopted: dict, 基线: frozenset, round_root: Path,
             _log(f"[generic]   ↳ {rel}：机器拒收的产物 ⇒ **不写主树**"
                  f"（{_是拒收产物(text)}）")
             continue
-        bk = _backup_file(rel, round_root)
+        bk = _backup_file(rel, 根)
         try:
-            _apply_file(rel, text, round_root)
+            _apply_file(rel, text, 根)
         except Exception as e:            # noqa: BLE001 写不进 ⇒ 回退这一个，不炸整轮
             _log(f"[generic]   ↳ {rel}：写入失败（{type(e).__name__}）⇒ 回退该文件")
             _rollback_file(bk)
             退.append(rel)
             continue
         r_this, red_this = _score_files(
-            round_root, deliverables, file_root=round_root, repo_root=round_root)
+            根, deliverables, file_root=根, repo_root=根)
         点 = _红门违规点(red_this)
         # ★★★★★ R46（**我自己 R43 的洞** · 2026-10-15 自审抓出）：
         #   `_增量可判` 要求"违规点**非空**且真子集变小"。而**最后一个**文件
@@ -3876,13 +3904,55 @@ def _score_gates(workdir: Path, file: Path, gates,
         cwd = g.get("cwd")
         if cwd is None or str(cwd) in ("", "."):
             g["cwd"] = str(repo_root if repo_root is not None else workdir)
-        elif cwd_根 is not None:
-            _c = str(cwd).replace("{repo}", str(cwd_根))
-            # ★ 只重定位"看起来指向前一个仓"的绝对路径：取 `cwd_根` 之前的仓前缀不可知，
-            #   所以用**判据文件所在根**对齐：若 cwd 不以 cwd_根 开头，就用 cwd_根 本身。
-            g["cwd"] = _c if _c.startswith(str(cwd_根)) else str(cwd_根)
-        elif repo_str is not None:
-            g["cwd"] = str(cwd).replace("{repo}", repo_str)
+        else:
+            # ★★★★★ R548：`{repo}` 是**语义占位符**（= 主树根），**永不**展开成副本。
+            #
+            #   真事故（2026-11-20 12:04，生产冒烟，部署 venv）：
+            #     门 `cwd: "{repo}", cmd: ["python","gate.py"]`，
+            #     而这里原来先走 `cwd_根` 分支 ⇒ `{repo}` 被展开成
+            #     `...\work\calc_py_mul\r2`（轮次副本，只有交付物、没有 gate.py）
+            #     ⇒ `can't open file ...r2\gate.py`（rc=2）⇒ 门判红
+            #     ⇒ 模型**四轮都写对了** `return a * b`，**四轮全被回退**，
+            #       最终 rc=1，主树一个字节没改。
+            #   ★ 同一条门的两半指向两棵树：`cmd` 用 `repo_str`（主树）✔，
+            #     `cwd` 用 `cwd_根`（副本）✘ —— 这就是「不要猜数据的形状」的同类：
+            #     **占位符的语义只能有一个定义**。
+            #
+            #   ★ `cwd_根` 的本职是「把**创建时写死的旧仓绝对路径**重定位到当前根」
+            #     （R251b），它**只对不含 `{repo}` 的 cwd 生效**。
+            _原串 = str(cwd)
+            if "{repo}" in _原串:
+                # ★★★★★ R548b：**`{repo}` 只有一个定义：主树根。**
+                #   `repo_root` 没传就回落模块级 `REPO_ROOT`（它本来就是主树根），
+                #   **绝不**回落到 `cwd_根` / workdir / 轮次目录。
+                #   真事故（12:13 生产冒烟）：门 `gate_exit_zero` 的 cwd 被展开成
+                #   `...\work\calc_py\r1`（轮次目录，没有 gate.py）⇒ rc=2 ⇒ 判红
+                #   ⇒ 模型写对了也被回退。**同一语义有多个展开点 ⇒ 修一处等于没修。**
+                _根548 = repo_str if repo_str is not None else str(REPO_ROOT)
+                if repo_str is None:
+                    # 留证：把调用栈写进日志，下次不用猜是哪个调用点漏传 repo_root
+                    try:
+                        import traceback as _tb548
+                        _栈548 = " ← ".join(
+                            f"{_f.name}:{_f.lineno}"
+                            for _f in _tb548.extract_stack()[-5:-1])
+                    except Exception:                    # noqa: BLE001
+                        _栈548 = "（栈取不到）"
+                    # ★ R548c：本模块**没有** `logger`（它用 `_log = print`）——
+                    #   我凭印象写了别的模块的写法 ⇒ 齿当场报 NameError。
+                    _log(f"[generic] 【R548b】门的 cwd 引用了 {{repo}} 但没传 "
+                         f"repo_root ⇒ 回落到主树根 {_根548}（**不是**轮次目录）。"
+                         f"调用栈：{_栈548}")
+                g["cwd"] = _原串.replace("{repo}", _根548)
+            elif cwd_根 is not None:
+                _c = _原串
+                # ★ 只重定位"看起来指向前一个仓"的绝对路径：取 `cwd_根` 之前的仓前缀不可知，
+                #   所以用**判据文件所在根**对齐：若 cwd 不以 cwd_根 开头，就用 cwd_根 本身。
+                g["cwd"] = _c if _c.startswith(str(cwd_根)) else str(cwd_根)
+            elif repo_str is not None:
+                g["cwd"] = _原串.replace("{repo}", repo_str)
+            else:
+                g["cwd"] = _原串
         cmd = g.get("cmd")
         if repo_str is not None and isinstance(cmd, list):
             g["cmd"] = [str(c).replace("{repo}", repo_str) for c in cmd]
@@ -4379,11 +4449,297 @@ def _hist_note(obj: auto_objective.Objective,
 # ════════════════════════════════════════════════════════════════
 # 主树工程任务（repo_scope）机器算子：源码注入 / 缺口分类 / 原子备份·应用·回滚
 # ════════════════════════════════════════════════════════════════
-def _detect_repo_scope(spec: dict, all_gates: list) -> bool:
-    """主树工程任务判定：规约顶层 repo:true，或任一判据门引用 {repo} 占位符。"""
+def _档案声明了主树门(档案门) -> bool:
+    """档案（`orchestrator.profile.yml`）是否声明了**项目验收门**。
+
+    ★ R540（2026-11-20 生产阻断修复）：项目验收门跑在**主树**上
+      ⇒ 档案一旦声明它，这个目标就是主树工程任务。档案是**独立来源**
+      （人写的），比模型自撰的门可信 —— 判定不能只看后者。
+    """
+    return bool(list(档案门 or ()))
+
+
+def _交付物落在主树(交付物) -> bool:
+    """至少一个交付物**真的在主树里存在**（相对 REPO_ROOT，或本身就是绝对路径）。
+
+    ★ R547：这是「要不要改主树」的**可观测判据**。为什么不看「档案有没有门」——
+      那只是**间接指标**：本包自己的档案就声明了 3 条门 ⇒ 若按它判，
+      **自检环境里每个目标**都成了主树任务（真读数：`--selftest` 从全绿变失败 2）。
+    """
+    for d in (交付物 or ()):
+        rel = d.get("path") if isinstance(d, dict) else str(d)
+        if not rel:
+            continue
+        try:
+            if (REPO_ROOT / rel).is_file():
+                return True
+            if Path(rel).is_file():
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def _齿_R548(fails: list) -> None:
+    """`{repo}` 占位符只许展开成**主树根**（R548）。
+
+    ★ 真事故（2026-11-20 12:04，生产冒烟，部署 venv）：门 `cwd: "{repo}"` 被展开成
+      **轮次副本** `...\\work\\calc_py_mul\\r2`，那里只有交付物、没有 `gate.py`
+      ⇒ `can't open file ...r2\\gate.py`（rc=2）⇒ 门判红
+      ⇒ 模型**四轮都写对了** `return a * b`，**四轮全被回退**，最终 rc=1、主树没改。
+    ★ 为什么这条齿必须存在：这个缺陷**不报错、不崩**，只是让「正确的修复」被判成
+      「没进展」—— 从回执上看跟"模型不行"一模一样，不专门钉一条就会被误判成模型问题。
+    """
+    try:
+        import tempfile as _tf548
+        from pathlib import Path as _P548
+
+        _根548 = _P548(_tf548.mkdtemp(prefix="r548齿_"))
+        (_根548 / "src").mkdir(parents=True, exist_ok=True)
+        (_根548 / "src" / "calc.py").write_text(
+            "def mul(a, b):\n    return a * b\n", encoding="utf-8")
+        (_根548 / "gate.py").write_text(
+            "import pathlib, sys\n"
+            "sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / 'src'))\n"
+            "from calc import mul\n"
+            "sys.exit(0 if mul(3, 4) == 12 else 1)\n", encoding="utf-8")
+        # 轮次副本：**只有交付物**，没有 gate.py（这正是事故现场）
+        _副本548 = _根548 / ".orchestrator" / "work" / "r2"
+        (_副本548 / "src").mkdir(parents=True, exist_ok=True)
+        (_副本548 / "src" / "calc.py").write_text(
+            "def mul(a, b):\n    return a * b\n", encoding="utf-8")
+        _门548 = [{"name": "gate_ok", "type": "compile", "cwd": "{repo}",
+                   "cmd": ["python", "gate.py"], "expect_exit": 0}]
+        # ① 事故现场参数：workdir=副本、cwd_根=副本、repo_root=主树
+        _res548, _red548 = _score_gates(_副本548, _副本548 / "src" / "calc.py",
+                                        _门548, repo_root=_根548, cwd_根=_副本548)
+        if not _res548.get("gate_ok"):
+            fails.append("【R548】★ `{repo}` 被展开成**轮次副本** ⇒ 门在副本上跑、"
+                         "找不到主树里的文件 ⇒ 正确的修复被判「没进展」而回退"
+                         f"（真报错：{str((_red548 or [{}])[0].get('err') or '')[:90]}）")
+        # ② 反向：非主树任务（repo_root=None）时仍要能兜底，不许崩
+        try:
+            _r2_548, _ = _score_gates(_副本548, _副本548 / "src" / "calc.py",
+                                      [dict(_门548[0])], repo_root=None,
+                                      cwd_根=_副本548)
+            if "gate_ok" not in _r2_548:
+                fails.append("【R548】★ 非主树任务（repo_root=None）下门没被求值 ⇒ 兜底坏了")
+        except Exception as _e2_548:                     # noqa: BLE001
+            fails.append("【R548】★ 非主树任务（repo_root=None）下门求值抛异常："
+                         f"{type(_e2_548).__name__}: {_e2_548}")
+    except Exception as _e548:                           # noqa: BLE001
+        fails.append("【R548】齿自身异常：%s: %s" % (type(_e548).__name__, _e548))
+
+
+def _齿_R549(fails: list) -> None:
+    """主树工程的增量裁决必须跑在**主树**上（R549）。
+
+    ★ 真事故（2026-11-20 12:28 生产冒烟，部署 venv）：`_round` 里注释写着
+      「备份 → **应用主树** → 判门」，实际调 `_增量应用(..., self.round_root, ...)`
+      ⇒ 备份副本、改副本、判副本 ⇒ **主树一个字节没改**，而门 `cwd: "{repo}"`
+      被展开成轮次目录 ⇒ `can't open file ...r1\\gate.py`（rc=2）⇒ 门永远红
+      ⇒ **模型四轮都写对了也被全数回退**，最终 rc=1。
+    ★ 为什么必须有这条齿：这个缺陷**不报错、不崩**，只是让正确的改动全被回退，
+      从日志上看跟"模型不行"一模一样 —— 不专门钉一条就会被误判成模型问题。
+    """
+    try:
+        import ast as _ast549
+        import tempfile as _tf549
+        from pathlib import Path as _P549
+
+        _主549 = _P549(_tf549.mkdtemp(prefix="r549主_"))
+        (_主549 / "src").mkdir(parents=True, exist_ok=True)
+        (_主549 / "src" / "calc.py").write_text(
+            "def mul(a, b):\n    return a + b\n", encoding="utf-8")
+        (_主549 / "gate.py").write_text(
+            "import pathlib, sys\n"
+            "sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / 'src'))\n"
+            "from calc import mul\n"
+            "sys.exit(0 if mul(3, 4) == 12 else 1)\n", encoding="utf-8")
+        _副549 = _P549(_tf549.mkdtemp(prefix="r549副_"))
+        (_副549 / "src").mkdir(parents=True, exist_ok=True)
+        (_副549 / "src" / "calc.py").write_text(
+            "def mul(a, b):\n    return a + b\n", encoding="utf-8")
+        _门549 = {"name": "gate_ok", "type": "compile", "cwd": "{repo}",
+                  "cmd": ["python", "gate.py"], "expect_exit": 0}
+        _交549 = [{"path": "src/calc.py", "gates": [dict(_门549)]}]
+        _新549 = "def mul(a, b):\n    return a * b\n"
+        try:
+            _增量应用({"src/calc.py": _新549}, frozenset({"占位违规点"}),
+                      _副549, _交549, 主树=_主549)
+        except Exception as _e549:                    # noqa: BLE001
+            fails.append(f"【R549】★ 带 `主树=` 调用 `_增量应用` 抛异常："
+                         f"{type(_e549).__name__}: {_e549}")
+        else:
+            _主文549 = (_主549 / "src" / "calc.py").read_text(encoding="utf-8")
+            _副文549 = (_副549 / "src" / "calc.py").read_text(encoding="utf-8")
+            if "a * b" not in _主文549:
+                fails.append("【R549】★ 传了 `主树=` 却**没改主树**（改动落在副本上）"
+                             " ⇒ 增量裁决仍在判沙箱、主树一个字节没改（假进展）")
+            if "a * b" in _副文549:
+                fails.append("【R549】★ 传了 `主树=` 却**同时改了副本** ⇒ 两棵树都动，"
+                             "回滚会还原错的那棵")
+        # ── 结构（AST）：生产调用点必须把 `主树=` 传进去 ────────────────
+        _树549 = _ast549.parse(_P549(__file__).read_text(encoding="utf-8", errors="replace"))
+        _调549 = [n for n in _ast549.walk(_树549)
+                  if isinstance(n, _ast549.Call)
+                  and getattr(n.func, "id", "") == "_增量应用"]
+        if not _调549:
+            fails.append("【R549】★ 全仓**没有调用** `_增量应用` ⇒ 增量裁决失效")
+        else:
+            _文549 = [_ast549.unparse(n) for n in _调549]
+            if not any("主树=" in _w for _w in _文549):
+                fails.append("【R549】★ `_增量应用` 的调用**没传 `主树=`** ⇒ "
+                             f"主树工程仍会判副本（实参文本 {_文549[:1]}）")
+            elif not any("repo_scope" in _w for _w in _文549):
+                fails.append("【R549】★ `主树=` 传了但**没跟 `repo_scope` 绑定** ⇒ "
+                             "纯产物型任务也会去改主树")
+    except Exception as _e549b:                           # noqa: BLE001
+        fails.append("【R549】齿自身异常：%s: %s"
+                     % (type(_e549b).__name__, _e549b))
+
+
+def _detect_repo_scope(spec: dict, all_gates: list, 档案门=None, 交付物=None) -> bool:
+    """主树工程任务判定。
+
+    三路**任一成立**即主树工程：
+      ① 规约顶层 `repo: true`；
+      ② 任一（模型自撰的）判据门引用 `{repo}` 占位符；
+      ③ ★ R540/R547：**档案声明了项目验收门** 且 **至少一个交付物在主树里存在**。
+
+    ★ 为什么需要 ③（真读数，2026-11-20 06:04 部署 venv，同一句命令跑两趟）：
+      档案声明了 `gates: [gate_ok … cwd: "{repo}"]`，而第 1 趟模型自己派生的门
+      不含 `{repo}` ⇒ 只按 ①② 判出 `repo_scope=False` ⇒ 产物只落 `products/`、
+      判的是**副本** ⇒ **rc=0 `delivered` 而主树一个字节没改、项目门仍红**。
+      第 2 趟模型换了一套门（含 `{repo}`）⇒ 进了主树路径 ⇒ rc=1。
+      **同一句命令两趟两种行为，两趟都 rc=0/1 报得像回事** —— 这是「假成功」。
+
+    ★ 为什么 ③ 还要加「交付物在主树里存在」（R547，`--selftest` 抓出来的）：
+      只写「档案有门」太宽 —— 本包档案就声明了 3 条门 ⇒ **自检里每个目标**都被判成
+      主树任务，而大量齿验的是**非主树路径**行为 ⇒ 自检从「全绿 · 失败 0」变成「失败 2」。
+      判据要落在**可观测的东西**上（文件存不存在），不是落在**间接指标**上（档案有没有门）。
+      反例仍然覆盖：新建文件型目标若 `spec["repo"]=true` 或门含 `{repo}`，①② 照样判主树。
+    """
     if bool(spec.get("repo")):
         return True
-    return any("{repo}" in json.dumps(g, ensure_ascii=False) for g in all_gates)
+    if any("{repo}" in json.dumps(g, ensure_ascii=False) for g in all_gates):
+        return True
+    return _档案声明了主树门(档案门) and _交付物落在主树(交付物)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ★★★★★ R540 / R540b：**假成功**修复的齿（2026-11-20）
+#
+#   【真读数】部署 venv，同一句命令跑两趟（06:04 / 06:06）：
+#     第 1 趟 rc=0 `delivered`，主树 `src/calc.py` **一个字节没改**，项目门仍红；
+#     第 2 趟 rc=1。两趟都"报得像回事"，第一趟是**假成功**。
+#   根因：`_detect_repo_scope` 只看**模型自撰的门**里有没有 `{repo}`，
+#     而**档案早就声明了项目验收门**（跑在主树上）—— 独立来源没用上。
+#
+#   ★ R546：**提成可单独运行的函数**。原来它埋在 `--selftest` 里，
+#     改一行要等 40 分钟才知道红不红（真读数：2392~2764 s）——
+#     于是人就会开始"看着差不多就过"，那正是假绿的温床。
+#     口径：**一条齿必须能单独跑**：
+#       python -c "from agentscope_orchestrator.generic_goal import _齿_R540 as t; f=[]; t(f); print(f or '全绿')"
+# ═══════════════════════════════════════════════════════════════════
+def _齿_R540(fails: list) -> None:
+    """R540（主树判定）/ R540b（红门不许叫交付）的齿。**不抛异常**：异常也记成 fail。"""
+    try:
+        import ast as _ast540
+        from pathlib import Path as _P540
+        _源539 = _P540(__file__).read_text(encoding="utf-8", errors="replace")
+
+        # ── 【R540】① 档案声明了项目验收门 ⇒ 必须按主树工程处理 ─────────
+        _档门540 = [{"name": "gate_ok", "type": "compile",
+                     "cmd": ["python", "gate.py"], "cwd": "{repo}"}]
+        _在主树 = [{"path": str(_P540(__file__).resolve().relative_to(REPO_ROOT))}]
+        if not _detect_repo_scope({"gates": [{"cwd": "."}]}, [{"cwd": "."}],
+                                  _档门540, _在主树):
+            fails.append("【R540】★ 档案声明了项目验收门、交付物也在主树里，"
+                         "却仍判成**非主树任务** ⇒ 产物只落 products/、判副本 ⇒ "
+                         "rc=0 而主树没改（假成功）")
+        # ── 【R547】② 反向：档案有门但**交付物不在主树** ⇒ 必须 False ─────
+        #   ★ 只写「档案有门 ⇒ 主树」太宽：本包档案就声明了 3 条门 ⇒ 自检里
+        #     **每个目标**都成主树任务 ⇒ 大量验「非主树路径」的齿被拖红（失败 2）。
+        if _detect_repo_scope({"gates": [{"cwd": "."}]}, [{"cwd": "."}],
+                              _档门540, [{"path": "不存在的产物/报告.md"}]):
+            fails.append("【R547】★ 反向过头：档案有门、但交付物**不在主树**，"
+                         "却被判成主树任务（纯产物型目标会被拖去改仓）")
+        # ── 【R540】② 反向：档案没门 + 门不含 {repo} ⇒ 仍必须 False ─────
+        if _detect_repo_scope({"gates": [{"cwd": "."}]}, [{"cwd": "."}], []):
+            fails.append("【R540】★ 反向过头：档案没声明门、门里也没 {repo}，"
+                         "却被判成主树任务（纯产物型目标会被拖去改仓）")
+        # ── 【R540】③ 原有两路不得回退 ─────────────────────────────
+        if not _detect_repo_scope({"repo": True, "gates": []}, [{"type": "compile"}], []):
+            fails.append("【R540】★ 回退：规约 `repo: true` 不再判主树任务")
+        if not _detect_repo_scope({"gates": []}, [{"cwd": "{repo}"}], []):
+            fails.append("【R540】★ 回退：门里含 `{repo}` 不再判主树任务")
+        # ── 【R540】④ `_档案声明了主树门` 本身（空/None 都不算）────────
+        for _空540 in (None, (), [], {}):
+            if _档案声明了主树门(_空540):
+                fails.append(f"【R540】★ 空档案门 {_空540!r} 被判成「声明了门」")
+        if not _档案声明了主树门(_档门540):
+            fails.append("【R540】★ 非空档案门被判成「没声明门」")
+
+        # ── 【R540b】非主树交付路径：门红不许叫 delivered（**按 AST 判**）──
+        #   ★ 原来 `ok` 算出来了却没用：先无条件 emit `delivered`，
+        #     再 `return 0 if ok else 2` ⇒ 回执里出现 delivered 而门是红的。
+        #   ★ R546 修：原来用 `_源.find("if not ok:")` 找**第一个**命中 ——
+        #     而源码里第一个（主树路径）那个分支**不含** not_delivered ⇒ **齿假红**
+        #     （代码是对的）。要的是「**存在**一个这样的分支」，不是「第一个」。
+        #     又一次「不要猜，去量」：`find` 只给第一个。
+        _树540 = _ast540.parse(_源539)
+        _有not_delivered540 = False
+        _有挡住540 = False
+        for _n540 in _ast540.walk(_树540):
+            if isinstance(_n540, _ast540.Call):
+                if "'not_delivered'" in _ast540.dump(_n540, annotate_fields=False):
+                    _有not_delivered540 = True
+                continue
+            # 找 `if not ok:` 且 body 里既有 not_delivered 又有 return 2
+            if not isinstance(_n540, _ast540.If):
+                continue
+            _测540 = _ast540.dump(_n540.test, annotate_fields=False)
+            if "'ok'" not in _测540 or "Not" not in _测540:
+                continue
+            _体540 = "".join(_ast540.dump(_b, annotate_fields=False) for _b in _n540.body)
+            if "'not_delivered'" in _体540 and "Return" in _体540 and "'2'" not in _体540.replace("'not_delivered'", ""):
+                pass
+            if "'not_delivered'" in _体540 and any(
+                    isinstance(_b, _ast540.Return) and isinstance(_b.value, _ast540.Constant)
+                    and _b.value.value == 2 for _b in _ast540.walk(_n540)):
+                _有挡住540 = True
+        if not _有not_delivered540:
+            fails.append("【R540b】★ 非主树交付路径**没有** `not_delivered` 事件 ⇒ "
+                         "门红时仍会 emit delivered（回执事件名就是结论，红门不许叫交付）")
+        if not _有挡住540:
+            fails.append("【R540b】★ 没有 `if not ok:` 分支同时含 `not_delivered` 与 `return 2` "
+                         "⇒ 红门仍会被当交付")
+
+        # ── 【R540】⑤ 接线（AST）：调用必须真把档案门传进去 ─────────────
+        #   ★ 为什么用 AST：`"_detect_repo_scope(spec, all_gates, _档案门540)" not in _源`
+        #     这类**字符串自比**在这个项目里已经骗过我两次（R539 三条齿全存活、#51 一次）。
+        #     AST 看的是**真的 Call 节点有几个实参**，字面量在结构上骗不过去。
+        _调用540 = [n for n in _ast540.walk(_树540)
+                    if isinstance(n, _ast540.Call)
+                    and getattr(n.func, "id", "") == "_detect_repo_scope"]
+        if not _调用540:
+            fails.append("【R540】★ 全仓**没有调用** `_detect_repo_scope` ⇒ 开关失效")
+        else:
+            # 要看「实参里有没有把**档案门**和**交付物**都传进去」——
+            # ★ 用 ast.unparse 看**真的实参文本**，不看源码里有没有这句话（那会自比恒真）
+            _文们540 = [_ast540.unparse(n) for n in _调用540]
+            if not any(len(n.args) >= 3 for n in _调用540):
+                fails.append("【R540】★ `_detect_repo_scope` 的调用**没把档案门传进去**"
+                             f"（实参个数 {[len(n.args) for n in _调用540]}，应有一个 ≥3）"
+                             " ⇒ 函数改对了但没生效")
+            if not any("deliverables" in _w for _w in _文们540):
+                fails.append("【R547】★ `_detect_repo_scope` 的调用**没把交付物传进去**"
+                             f"（实参文本 {_文们540[:2]}）"
+                             " ⇒ R547 的收窄没生效（会退回「档案有门就一律主树」）")
+    except Exception as _e540:                       # noqa: BLE001
+        fails.append("【R540】主树判定/假成功 门自身异常：%s: %s"
+                     % (type(_e540).__name__, _e540))
 
 
 # ★ R234（2026-11-05 case01 真跑）：**模型自撰的门命令可能根本跑不起来**。
@@ -6241,7 +6597,16 @@ class GoalRunner:
             raise ValueError(f"接线守恒违例：{dwhy}")
         all_gates = [g for d in self.deliverables
                      for g in (d.get("gates") or spec["gates"])]
-        self.repo_scope = _detect_repo_scope(spec, all_gates)
+        # ★ R540：**把档案声明的项目验收门也作为判据**（独立来源 > 模型自撰门）。
+        _档案门540: list = []
+        try:
+            _档案门540 = [dict(g) for g in prof_mod.get_profile().gates]
+        except Exception:                    # noqa: BLE001 - 档案读不到不算违规
+            _档案门540 = []
+        if _档案门540:
+            _log(f"[generic] ★ R540 档案声明了 {len(_档案门540)} 条项目验收门"
+                 "（跑在主树上）⇒ 本目标按**主树工程**处理")
+        self.repo_scope = _detect_repo_scope(spec, all_gates, _档案门540, self.deliverables)
         repo_root = REPO_ROOT if self.repo_scope else None
         self.bound = bound_report(all_gates, spec, WORKDIR.resolve(),
                                   repo_root=repo_root, 逐件已覆盖=True)
@@ -7677,8 +8042,10 @@ class GoalRunner:
                     self._emit({"kind": "shrunken_candidate_rejected",
                                 "work": int(getattr(self, "_当前轮242", 0) or 0),
                                 "detail": _缩220[:6]})
+                # ★ R549：主树工程必须**在主树上**备份/应用/判门 —— 见 `_增量应用` 的 `主树` 注释。
                 results, round_red, _留43, _退43 = _增量应用(
-                    adopted, 基线, self.round_root, self.deliverables, 回退详情=_台177)
+                    adopted, 基线, self.round_root, self.deliverables, 回退详情=_台177,
+                    主树=(REPO_ROOT if self.repo_scope else None))
                 # ★ R177：本轮回退台账（每轮覆盖 ⇒ 模型看到的是「上一轮」）
                 # ★ R179：**跨轮累计**每个文件被退过几次 —— 整份重写已被证伪。
                 #   ★ 从返回值 `_退43` 数（不在 `_增量应用` 里改 self：那是模块级函数）。
@@ -10000,6 +10367,20 @@ class GoalRunner:
             return 0
         final, _ = _score_files(out, self.deliverables)
         ok = bool(final) and all(v is True for v in final.values())
+        # ★★★★★ R540b（2026-11-20）：**`ok` 算出来了就必须用它。**
+        #   原来这一行无条件 emit `delivered`，然后才 `return 0 if ok else 2`
+        #   ⇒ 回执里出现 `delivered` 而门是红的（读回执的人只会看到 delivered）。
+        #   口径：**回执的事件名就是结论**，红门不许叫交付。
+        if not ok:
+            self._emit({"kind": "not_delivered", "work": work, "final_gates": final,
+                        "alignment": alignment, "products": [
+                            str(out / d["path"]) for d in self.deliverables],
+                        "reason": "判据门未全绿 ⇒ 不叫交付（退出码 2）",
+                        "tokens_chars": self._tok_chars})
+            _log(f"[generic] ★★ 收敛判否 @轮{work}：门未全绿 ⇒ 不叫交付（退出码 2）")
+            _log("[generic]   final gates: " + " ".join(
+                f"{k}={v}" for k, v in final.items()))
+            return 2
         self._emit({"kind": "delivered", "work": work, "final_gates": final,
                     "alignment": alignment, "products": [
                         str(out / d["path"]) for d in self.deliverables],
@@ -16198,6 +16579,10 @@ def _selftest() -> int:
     except Exception as _e539:
         fails.append("【R539】落地/小文件/空读数 门自身异常：%s: %s"
                      % (type(_e539).__name__, _e539))
+
+    # ★★★★★ R540 / R540b：假成功修复的齿 —— R546 提成可单独运行的函数
+    #   （改一行不用等 40 分钟的整包自检；见 `_齿_R540` 的注释）
+    _齿_R540(fails)
 
     # ════════════════════════════════════════════════════════════════
     # ★★★★★ R52：同一文件的多个区域必须分得开（5 条）

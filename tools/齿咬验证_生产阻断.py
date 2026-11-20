@@ -52,6 +52,16 @@ PY = R / ".venv" / "Scripts" / "python.exe"
     ("R539c", "行为", "空读数判定恒返回 True（= 回到假达标）",
      "    if not results:\n        return False\n    return bool(达标本)",
      "    return True  # 变异：空读数也算达标"),
+    # ── R540 / R540b：2026-11-20 **假成功**修复（同一句命令两趟两种行为）──
+    ("R540", "接线", "调用 _detect_repo_scope 时不传档案门",
+     "_detect_repo_scope(spec, all_gates, _档案门540)",
+     "_detect_repo_scope(spec, all_gates)"),
+    ("R540", "行为", "档案门不再参与主树判定（= 回到只看模型自撰门）",
+     "    if _档案声明了主树门(档案门):\n        return True\n",
+     "    if False:\n        return True  # 变异\n"),
+    ("R540b", "行为", "非主树路径红门也 emit delivered（= 回到假交付）",
+     '        if not ok:\n            self._emit({"kind": "not_delivered"',
+     '        if False:\n            self._emit({"kind": "not_delivered"'),
 ]
 
 
@@ -68,8 +78,40 @@ def 跑自检(包根: pathlib.Path) -> str:
     return (r.stdout or "") + (r.stderr or "")
 
 
+def _跑基线() -> tuple[bool, str]:
+    """干净源码跑一遍自检。返回 (是否全绿, 摘要原文)。
+
+    ★ R545b：**基线绿是「变异→红」这个推理的前提**。R540 的齿自己崩了（恒红）⇒
+      每条变异都"咬住"、毫无信息量，而我第一眼看还当成了成功。
+      前提没验就下结论，等于没做实验。
+    """
+    包 = 根 / "_基线" / "包"
+    shutil.rmtree(包.parent, ignore_errors=True)
+    (包 / "tmp").mkdir(parents=True, exist_ok=True)
+    shutil.copytree(R / "src" / "agentscope_orchestrator",
+                    包 / "src" / "agentscope_orchestrator")
+    print("══ 先验基线：干净源码自检（基线不绿 ⇒ 不许开始咬）══", flush=True)
+    出 = 跑自检(包)
+    失败 = None
+    for ln in (出 or "").splitlines():
+        if "失败" in ln and "判据点" in ln:
+            失败 = ln.strip()
+    if 失败 is None:
+        return False, "（没找到摘要行）" + (出 or "")[-600:]
+    数字 = 失败.split("失败")[-1].strip().split()[0]
+    return 数字 in ("0", "0）", "0)"), 失败
+
+
 def main() -> int:
     shutil.rmtree(根, ignore_errors=True)
+    绿, 摘要 = _跑基线()
+    print(f"   基线：{摘要}", flush=True)
+    if not 绿:
+        print("\n   ✗ **基线不绿 ⇒ 拒跑**：干净源码上自检就有失败项，"
+              "此时任何「变异咬住」都不能归因于变异（齿可能恒红）。\n"
+              "   先修齿，再验咬合。", flush=True)
+        return 2
+    print("   ✓ 基线全绿 ⇒ 可以开始咬\n", flush=True)
     进程 = []
     for i, (cid, 族, 说明, 旧, 新) in enumerate(变异):
         包 = 根 / f"m{i}" / "包"
@@ -100,21 +142,44 @@ def main() -> int:
         print(f"   起 m{i}：{cid}/{族} —— {说明}", flush=True)
 
     存活 = []
+    齿坏 = []
     for 名, cid, 族, 说明, p in 进程:
         出, _ = p.communicate(timeout=4200)
         红 = [ln.strip() for ln in (出 or "").splitlines() if f"【{cid}" in ln]
-        if 红:
-            print(f"\n   ✓ {cid}/{族} 咬住（{len(红)} 条红）：{说明}")
+        # ★★★★★ R545c：**必须分清「咬住」与「齿自己崩」**。
+        #   原来只 grep `【R540` —— 而「门自身异常：NameError」那条 fail 也带这个前缀
+        #   ⇒ **齿崩了被记成咬住**（真读数：R540 齿恒红，输出却是 `✓ 咬住`）。
+        #   恒红的齿 = 假齿：变异删了接线它红，接线好好的它也红，一点信息量都没有。
+        真咬 = [ln for ln in 红 if "自身异常" not in ln]
+        if 真咬:
+            print(f"\n   ✓ {cid}/{族} 咬住（{len(真咬)} 条红）：{说明}")
+            print("     ", 真咬[0][:160])
+        elif 红:
+            print(f"\n   ✗ {cid}/{族} **齿自己崩了**（不是咬住！）：{说明}")
             print("     ", 红[0][:160])
+            齿坏.append(f"{cid}/{族}")
         else:
             print(f"\n   ✗ {cid}/{族} **没咬**（缺陷版本上自检仍绿）：{说明}")
             存活.append(f"{cid}/{族}")
 
     print()
+    # ★★★★★ R545d：汇总必须是**一个**判据。
+    #   上一版写成 `if 齿坏: 打印` + `if 存活: return 1` ⇒ 齿坏非空、存活为空时
+    #   **掉进成功分支**：先打一条 ✗，紧接着打「✓ 全部咬住 ⇒ 是真齿」并 return 0。
+    #   **最后一句才是人读的那句** —— 这是「假绿比红更坏」的又一次。
+    #   口径：加一个判据时必须同时问「它的否定分支会不会掉进成功出口」。
+    if 齿坏:
+        print("✗ **齿自己崩了**（恒红/异常，其「咬住」不可信）=", 齿坏)
     if 存活:
         print("✗ 存活（齿是装饰）=", 存活)
+    未达标 = list(存活) + list(齿坏)
+    if 未达标:
+        print(f"\n✗ 咬合验证未通过：{len(未达标)}/{len(变异)} 条不可信 "
+              f"（存活 {len(存活)} · 齿坏 {len(齿坏)}）")
         return 1
-    print(f"✓ {len(变异)}/{len(变异)} 全部咬住（接线族 3 + 行为族 3）⇒ 是真齿")
+    接线 = sum(1 for x in 变异 if x[1] == "接线")
+    行为 = sum(1 for x in 变异 if x[1] == "行为")
+    print(f"✓ {len(变异)}/{len(变异)} 全部咬住（接线族 {接线} + 行为族 {行为}）⇒ 是真齿")
     return 0
 
 
