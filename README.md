@@ -1,6 +1,6 @@
 # 通用工程开发多智能体编排器
 
-> **当前版本：0.13.21（2026-11-20）** —— **47 条验收判据全绿**；离线装实测 40.7 s；`orch-check` 自检 8/8；`tools/齿咬验证_生产阻断.py` 变异咬合 6/6。
+> **当前版本：0.13.21（2026-11-21）** —— **51 条验收判据全绿**；离线装实测 40.7 s；`orch-check` 自检 8/8；`tools/齿咬验证_生产阻断.py` 变异咬合 6/6。
 > 判据清单与逐条读数见 [交付章程.md](交付章程.md)，目标清单与「已达成/拿不到」的分界见 [目标与进度.md](目标与进度.md)，自验用 `python tools/交付验收.py`。
 
 **给它一句自然语言目标，它在你的真实工程里改代码、跑构建、跑测试，直到机器判据全绿。**
@@ -90,7 +90,7 @@ Windows 也可直接跑 `dist/orchestrator-0.13.21/install.ps1`（Linux/macOS �
 `orch-doctor` `orch-check` `orch-init` `orch-kb` `orch-goal` `orch-plan`
 `orch-run` `orch-gaps` `orch-log` `orch-tree` `orch-mcp`。
 
-**自验**：`python tools/交付验收.py`（43 条判据；退出码 0 = 全部达成）。
+**自验**：`python tools/交付验收.py`（51 条判据；退出码 0 = 全部达成）。
 
 ### 接上模型通道
 

@@ -208,7 +208,10 @@ def 组装(轮: Path) -> Path:
     for 源, 名 in ((根 / "packaging" / "install.ps1", "install.ps1"),
                    (根 / "packaging" / "install.sh", "install.sh"),
                    (根 / "orchestrator.profile.example.yml", "orchestrator.profile.example.yml"),
-                   (根 / "config" / "channels.yml", "channels.example.yml")):
+                   (根 / "config" / "channels.yml", "channels.example.yml"),
+                   # ★ R594：产品说明报告随包发 —— 用户在发布包里就能看到
+                   #   「它是什么 / 怎么用 / 特征与边界」，不用回仓找。
+                   (根 / "软件说明报告.md", "软件说明报告.md")):
         if 源.exists():
             shutil.copy2(源, 包 / 名)
             if 名.endswith(".ps1"):
